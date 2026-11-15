@@ -197,6 +197,7 @@ struct VulkanFns {
 VulkanFns g_fn;
 
 void clear_instance_and_device_fns() {
+  g_fn.destroyInstance = nullptr;
   g_fn.createAndroidSurface = nullptr;
   g_fn.destroySurface = nullptr;
   g_fn.surfaceSupport = nullptr;
@@ -298,7 +299,7 @@ bool load_loader() {
   apply_freedreno_env();
   const std::string desiredKey =
       g_customDriverDir + "|" + g_customDriverName;
-  if (g_fn.lib && g_fn.gipa && g_fn.createInstance && g_fn.destroyInstance &&
+  if (g_fn.lib && g_fn.gipa && g_fn.createInstance &&
       g_loadedDriverKey == desiredKey) {
 #if defined(LOOPGAMER_HAS_ADRENOTOOLS)
     adrenotools_set_turbo(g_adrenoTurbo);
@@ -364,18 +365,18 @@ bool load_loader() {
   }
   g_fn.createInstance = reinterpret_cast<PFN_vkCreateInstance>(
       g_fn.gipa(nullptr, "vkCreateInstance"));
-  g_fn.destroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(
-      g_fn.gipa(nullptr, "vkDestroyInstance"));
+  // vkDestroyInstance é comando de instância na especificação Vulkan; no loader
+  // Android vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkDestroyInstance") retorna null.
+  g_fn.destroyInstance = nullptr;
   g_fn.enumInstExt =
       reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
           g_fn.gipa(nullptr, "vkEnumerateInstanceExtensionProperties"));
   g_fn.enumInstVersion =
       reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
           g_fn.gipa(nullptr, "vkEnumerateInstanceVersion"));
-  if (!g_fn.createInstance || !g_fn.destroyInstance) {
-    VK_LOGW("Ponteiros essenciais Vulkan ausentes (createInstance=%p destroyInstance=%p)",
-            reinterpret_cast<void*>(g_fn.createInstance),
-            reinterpret_cast<void*>(g_fn.destroyInstance));
+  if (!g_fn.createInstance) {
+    VK_LOGW("Ponteiros essenciais Vulkan ausentes (createInstance=%p)",
+            reinterpret_cast<void*>(g_fn.createInstance));
     close_loader_lib();
     return false;
   }
@@ -484,6 +485,7 @@ bool load_instance_fns(VkInstance inst) {
     VK_LOGW("Falha ao carregar símbolo Vulkan de instância: %s", sym);       \
     return false;                                                            \
   }
+  LOADI(destroyInstance, "vkDestroyInstance")
   LOADI(createAndroidSurface, "vkCreateAndroidSurfaceKHR")
   LOADI(destroySurface, "vkDestroySurfaceKHR")
   LOADI(surfaceSupport, "vkGetPhysicalDeviceSurfaceSupportKHR")
@@ -621,7 +623,11 @@ bool do_probe() {
     }
   }
 
-  g_fn.destroyInstance(inst, nullptr);
+  auto destroyInst = reinterpret_cast<PFN_vkDestroyInstance>(
+      g_fn.gipa(inst, "vkDestroyInstance"));
+  if (destroyInst) {
+    destroyInst(inst, nullptr);
+  }
   g_fe.probed = true;
   g_fe.probeOk = ok;
   VK_LOGI("Probe Vulkan: %s", ok ? "OK" : "indisponível");
@@ -1775,8 +1781,15 @@ void shutdown_internal(bool force) {
   }
   fe.surface = VK_NULL_HANDLE;
 
-  if (fe.instance != VK_NULL_HANDLE && g_fn.destroyInstance) {
-    g_fn.destroyInstance(fe.instance, nullptr);
+  if (fe.instance != VK_NULL_HANDLE) {
+    auto destroyInst = g_fn.destroyInstance;
+    if (!destroyInst && g_fn.gipa) {
+      destroyInst = reinterpret_cast<PFN_vkDestroyInstance>(
+          g_fn.gipa(fe.instance, "vkDestroyInstance"));
+    }
+    if (destroyInst) {
+      destroyInst(fe.instance, nullptr);
+    }
   }
   fe.instance = VK_NULL_HANDLE;
   clear_instance_and_device_fns();

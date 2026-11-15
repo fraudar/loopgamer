@@ -59,6 +59,7 @@ class _SettingsScreenState extends State<SettingsScreen>
   bool _importingPs3Firmware = false;
   bool _removingPs3Firmware = false;
   bool _isCleaningStorage = false;
+  bool _isCleaningSavesAndCovers = false;
   int _selectedCategory = 0;
   int _focusedCategoryIndex = -1;
 
@@ -321,7 +322,10 @@ class _SettingsScreenState extends State<SettingsScreen>
   }
 
   Future<void> _handleCleanStorage() async {
-    if (_isCleaningStorage || _importingPs3Firmware || _removingPs3Firmware) {
+    if (_isCleaningStorage ||
+        _isCleaningSavesAndCovers ||
+        _importingPs3Firmware ||
+        _removingPs3Firmware) {
       return;
     }
     setState(() => _isCleaningStorage = true);
@@ -347,6 +351,108 @@ class _SettingsScreenState extends State<SettingsScreen>
     } finally {
       if (mounted) {
         setState(() => _isCleaningStorage = false);
+      }
+    }
+  }
+
+  Future<void> _handleCleanSavesAndCovers() async {
+    if (_isCleaningStorage ||
+        _isCleaningSavesAndCovers ||
+        _importingPs3Firmware ||
+        _removingPs3Firmware) {
+      return;
+    }
+
+    final savesBytes = _storageBreakdown.savesBytes;
+    final coversBytes = _storageBreakdown.coversBytes;
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: HydraTokens.bgNearBlack,
+        shape: HydraTokens.dialogShape,
+        title: Text(
+          'Limpar capas e saves?',
+          style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w700,
+              ),
+        ),
+        content: SingleChildScrollView(
+          child: Text(
+            'Espaço atual:\n'
+            '• Capas em cache: ${_formatStorage(coversBytes)}\n'
+            '• Saves & Save States: ${_formatStorage(savesBytes)}\n\n'
+            'Apagar saves remove o progresso salvo e save states dos jogos. Suas ROMs, firmware, drivers e configurações não serão apagados.',
+            style: const TextStyle(
+              fontFamily: 'Rubik',
+              fontSize: 12.5,
+              height: 1.45,
+              color: HydraTokens.textSecondary,
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            style: TextButton.styleFrom(minimumSize: const Size(48, 48)),
+            onPressed: () => Navigator.of(ctx).pop(null),
+            child: const Text('Cancelar'),
+          ),
+          if (coversBytes > 0 && savesBytes > 0)
+            OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                minimumSize: const Size(48, 48),
+                foregroundColor: HydraTokens.primaryAurora,
+                side: const BorderSide(color: HydraTokens.borderSubtle10),
+              ),
+              onPressed: () => Navigator.of(ctx).pop('covers'),
+              child: const Text('Só capas'),
+            ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop('all'),
+            style: FilledButton.styleFrom(
+              backgroundColor: savesBytes > 0
+                  ? HydraTokens.accentDanger
+                  : HydraTokens.primaryAurora,
+              foregroundColor: savesBytes > 0
+                  ? HydraTokens.textPrimary
+                  : HydraTokens.bgPureBlack,
+              minimumSize: const Size(48, 48),
+            ),
+            child: Text(
+              savesBytes > 0 ? 'Limpar tudo' : 'Limpar capas',
+            ),
+          ),
+        ],
+      ),
+    );
+    if (choice == null || !mounted) return;
+
+    setState(() => _isCleaningSavesAndCovers = true);
+    try {
+      final freedBytes = await widget.downloadService.cleanSavesAndCovers(
+        deleteSaves: choice == 'all',
+        deleteCovers: true,
+      );
+      if (!mounted) return;
+      await _refreshAllDiskState();
+      if (!mounted) return;
+      final message = freedBytes > 0
+          ? choice == 'covers'
+              ? 'Capas removidas: ${_formatStorage(freedBytes)} liberados.'
+              : 'Capas e saves removidos: ${_formatStorage(freedBytes)} liberados.'
+          : 'Nenhuma capa ou save encontrado para limpar.';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message)),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Não foi possível limpar capas e saves agora: $e'),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isCleaningSavesAndCovers = false);
       }
     }
   }
@@ -488,6 +594,8 @@ class _SettingsScreenState extends State<SettingsScreen>
         a.partialDownloadsBytes == b.partialDownloadsBytes &&
         a.systemAndCoresBytes == b.systemAndCoresBytes &&
         a.savesAndCoversBytes == b.savesAndCoversBytes &&
+        a.savesBytes == b.savesBytes &&
+        a.coversBytes == b.coversBytes &&
         a.tempCacheBytes == b.tempCacheBytes &&
         a.ps3FirmwareBytes == b.ps3FirmwareBytes &&
         a.orphanPartCount == b.orphanPartCount;
@@ -1236,15 +1344,20 @@ class _SettingsScreenState extends State<SettingsScreen>
                     _StorageBreakdownRow(
                       label: 'Sistema, Cores, Firmware & Drivers',
                       subtitle: _storageBreakdown.ps3FirmwareBytes > 0
-                          ? 'Inclui PS3UPDAT.PUP (${_formatStorage(_storageBreakdown.ps3FirmwareBytes)})'
+                          ? 'Inclui PS3UPDAT.PUP / flash (${_formatStorage(_storageBreakdown.ps3FirmwareBytes)})'
                           : null,
                       value: _formatStorage(
-                        _storageBreakdown.systemAndCoresBytes,
+                        _storageBreakdown.systemAndCoresBytes +
+                            _storageBreakdown.ps3FirmwareBytes,
                       ),
                     ),
                     const SizedBox(height: 8),
                     _StorageBreakdownRow(
                       label: 'Saves & Capas',
+                      subtitle: (_storageBreakdown.savesBytes > 0 ||
+                              _storageBreakdown.coversBytes > 0)
+                          ? 'Saves: ${_formatStorage(_storageBreakdown.savesBytes)} • Capas: ${_formatStorage(_storageBreakdown.coversBytes)}'
+                          : null,
                       value: _formatStorage(
                         _storageBreakdown.savesAndCoversBytes,
                       ),
@@ -1263,6 +1376,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                 width: double.infinity,
                 child: OutlinedButton.icon(
                   onPressed: (_isCleaningStorage ||
+                          _isCleaningSavesAndCovers ||
                           _importingPs3Firmware ||
                           _removingPs3Firmware)
                       ? null
@@ -1288,7 +1402,46 @@ class _SettingsScreenState extends State<SettingsScreen>
                   label: Text(
                     _isCleaningStorage
                         ? 'Limpando cache...'
-                        : 'Limpar cache e .part',
+                        : _storageBreakdown.tempCacheBytes > 0
+                            ? 'Limpar cache e .part (${_formatStorage(_storageBreakdown.tempCacheBytes)})'
+                            : 'Limpar cache e .part',
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: (_isCleaningStorage ||
+                          _isCleaningSavesAndCovers ||
+                          _importingPs3Firmware ||
+                          _removingPs3Firmware)
+                      ? null
+                      : () => unawaited(_handleCleanSavesAndCovers()),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: HydraTokens.textPrimary,
+                    minimumSize: const Size(48, 48),
+                    side: const BorderSide(color: HydraTokens.borderSubtle10),
+                  ),
+                  icon: _isCleaningSavesAndCovers
+                      ? const SizedBox(
+                          width: 15,
+                          height: 15,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: HydraTokens.primaryAurora,
+                          ),
+                        )
+                      : PhosphorIcon(
+                          PhosphorIcons.trash(PhosphorIconsStyle.bold),
+                          size: 17,
+                        ),
+                  label: Text(
+                    _isCleaningSavesAndCovers
+                        ? 'Limpando capas e saves...'
+                        : _storageBreakdown.savesAndCoversBytes > 0
+                            ? 'Limpar capas e saves (${_formatStorage(_storageBreakdown.savesAndCoversBytes)})'
+                            : 'Limpar capas e saves',
                   ),
                 ),
               ),

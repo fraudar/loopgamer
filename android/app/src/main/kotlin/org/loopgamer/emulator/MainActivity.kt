@@ -1,7 +1,11 @@
 package org.loopgamer.emulator
 
 import android.Manifest
+import android.app.Activity
+import android.content.ActivityNotFoundException
+import android.content.ContentUris
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.SurfaceTexture
@@ -11,12 +15,18 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
+import android.provider.DocumentsContract
+import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.provider.Settings
 import android.util.Log
 import android.view.InputDevice
 import android.view.InputEvent
@@ -69,6 +79,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         private const val RETRO_R3 = 1 shl 15
 
         private const val REQ_POST_NOTIFICATIONS = 4105
+        private const val REQ_READ_EXTERNAL_STORAGE = 4106
+        private const val REQ_MANAGE_ALL_FILES = 4107
+        private const val REQ_PICK_EXTERNAL_ROM = 4108
         private const val GAMEPAD_ACTIVE_THROTTLE_MS = 400L
         private const val UI_MOTION_REPEAT_MS = 180L
         private const val SELECT_HOLD_FAST_FORWARD_MS = 320L
@@ -97,6 +110,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     @Volatile private var surfaceEntry: TextureRegistry.SurfaceTextureEntry? = null
     @Volatile private var surfaceTexture: SurfaceTexture? = null
     @Volatile private var renderSurface: Surface? = null
+    @Volatile private var currentBufferWidth: Int = 320
+    @Volatile private var currentBufferHeight: Int = 240
+    @Volatile private var currentScreenScale: Int = 1
     @Volatile private var audioTrack: AudioTrack? = null
     private val audioLock = Any()
 
@@ -141,6 +157,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private val lastGamepadActiveEmitMs = AtomicLong(-GAMEPAD_ACTIVE_THROTTLE_MS)
     @Volatile private var lastReportedGamepadConnected: Boolean? = null
     private var notificationPermissionRequestedThisSession: Boolean = false
+    private var pendingStoragePermissionResult: MethodChannel.Result? = null
+    private var pendingPickRomResult: MethodChannel.Result? = null
 
     private var currentUiDirection: String? = null
     private var uiLeftTriggerPressed: Boolean = false
@@ -303,21 +321,33 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 val entry = engine.renderer.createSurfaceTexture()
                 val st = entry.surfaceTexture()
                 val romLower = romPath.lowercase()
+                val coreLower = corePath.lowercase()
                 val isPs1 = platform in setOf("ps", "ps1", "psx", "playstation")
+                val isPs3 = platform in setOf("ps3", "playstation3", "playstation-3") ||
+                    coreLower.contains("rpcs3")
                 val isPsp = platform == "psp" ||
                     (platform.isEmpty() && (romLower.endsWith(".cso") || romLower.endsWith(".pbp")))
 
+                // PS3 (RPCS3) inicia seu swapchain Vulkan e overlay de compilação de
+                // firmware/PPU direto no tamanho inicial da Surface: começar em 1280x720
+                // evita texto/texturas de carregamento pixeladas em 320x240 e reduz
+                // recriações de swapchain durante a transição para o jogo.
                 val initW = when {
+                    isPs3 -> 1280
                     isPsp -> (480 * screenScale).coerceIn(64, 4096)
                     isPs1 -> maxOf(320 * screenScale, 640).coerceIn(64, 4096)
                     else -> (320 * screenScale).coerceIn(64, 4096)
                 }
                 val initH = when {
+                    isPs3 -> 720
                     isPsp -> (272 * screenScale).coerceIn(64, 4096)
                     isPs1 -> maxOf(240 * screenScale, 480).coerceIn(64, 4096)
                     else -> (240 * screenScale).coerceIn(64, 4096)
                 }
                 st.setDefaultBufferSize(initW, initH)
+                currentBufferWidth = initW
+                currentBufferHeight = initH
+                currentScreenScale = screenScale
                 val surface = Surface(st)
 
                 val hookLibDir = applicationInfo.nativeLibraryDir + "/"
@@ -388,9 +418,19 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     }
 
                     if (!loaded) {
+                        val coreDetail = try {
+                            nativeGetLastCoreError()?.trim().orEmpty()
+                        } catch (_: Throwable) {
+                            ""
+                        }
                         stopLibretroLoopInternal()
                         mainHandler.post {
-                            result.error("CORE_LOAD_FAILED", "Falha ao carregar motor ou ROM.", null)
+                            val errMsg = if (coreDetail.isNotEmpty()) {
+                                coreDetail
+                            } else {
+                                "Falha ao carregar motor ou ROM."
+                            }
+                            result.error("CORE_LOAD_FAILED", errMsg, null)
                         }
                         return@execute
                     }
@@ -408,10 +448,23 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     // mínimo de 640x480 para telas entrelaçadas de boot/menu).
                     val baseW = nativeGetFrameWidth().coerceAtLeast(64)
                     val baseH = nativeGetFrameHeight().coerceAtLeast(64)
-                    val targetW = maxOf(baseW * screenScale, if (isPs1) 640 else 64).coerceAtMost(4096)
-                    val targetH = maxOf(baseH * screenScale, if (isPs1) 480 else 64).coerceAtMost(4096)
+                    val initialScale = if (baseW >= 800 || baseH >= 544 || isPs3) 1 else screenScale
+                    val minW = when {
+                        isPs3 -> 1280
+                        isPs1 -> 640
+                        else -> 64
+                    }
+                    val minH = when {
+                        isPs3 -> 720
+                        isPs1 -> 480
+                        else -> 64
+                    }
+                    val targetW = maxOf(baseW * initialScale, minW).coerceAtMost(4096)
+                    val targetH = maxOf(baseH * initialScale, minH).coerceAtMost(4096)
                     if (targetW != initW || targetH != initH) {
                         st.setDefaultBufferSize(targetW, targetH)
+                        currentBufferWidth = targetW
+                        currentBufferHeight = targetH
                     }
 
                     isPaused.set(userPaused.get() || lifecyclePaused.get() || !isActivityResumed.get())
@@ -647,6 +700,18 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                         "wifi" to hasWifi
                     )
                 )
+            }
+
+            "hasDirectStorageAccess" -> {
+                result.success(hasDirectStorageAccessInternal())
+            }
+
+            "requestDirectStorageAccess" -> {
+                requestDirectStorageAccessInternal(result)
+            }
+
+            "pickExternalRomFile" -> {
+                launchExternalRomPicker(result)
             }
 
             else -> result.notImplemented()
@@ -973,10 +1038,57 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     }
 
     private fun isPhysicalGamepadDevice(device: InputDevice?): Boolean {
-        if (device == null || device.isVirtual) return false
-        if (device.supportsSource(InputDevice.SOURCE_TOUCHSCREEN)) return false
-        return device.supportsSource(InputDevice.SOURCE_GAMEPAD) ||
-            device.supportsSource(InputDevice.SOURCE_JOYSTICK)
+        if (device == null || device.id <= 0 || device.isVirtual) return false
+        if (device.supportsSource(InputDevice.SOURCE_TOUCHSCREEN) ||
+            device.supportsSource(InputDevice.SOURCE_STYLUS)
+        ) {
+            return false
+        }
+        val nameLower = (device.name ?: "").lowercase()
+        if (nameLower.contains("fingerprint") ||
+            nameLower.contains("goodix") ||
+            nameLower.contains("fpc1") ||
+            nameLower.contains("fpc_") ||
+            nameLower.contains("uinput-fpc") ||
+            nameLower.contains("silead") ||
+            nameLower.contains("gpio-keys") ||
+            nameLower.contains("pmic_pwrkey") ||
+            nameLower.contains("qpnp_pon") ||
+            nameLower.contains("hall_sensor") ||
+            nameLower.contains("touchscreen")
+        ) {
+            return false
+        }
+        val supportsGamepad = device.supportsSource(InputDevice.SOURCE_GAMEPAD)
+        val supportsJoystick = device.supportsSource(InputDevice.SOURCE_JOYSTICK)
+        if (!supportsGamepad && !supportsJoystick) {
+            return false
+        }
+        val hasGamepadButtons = device.hasKeys(
+            KeyEvent.KEYCODE_BUTTON_A,
+            KeyEvent.KEYCODE_BUTTON_B,
+            KeyEvent.KEYCODE_BUTTON_X,
+            KeyEvent.KEYCODE_BUTTON_Y,
+            KeyEvent.KEYCODE_BUTTON_L1,
+            KeyEvent.KEYCODE_BUTTON_R1,
+            KeyEvent.KEYCODE_BUTTON_START,
+            KeyEvent.KEYCODE_BUTTON_1,
+            KeyEvent.KEYCODE_BUTTON_2
+        ).any { it }
+        if (hasGamepadButtons) {
+            return true
+        }
+        if (supportsJoystick) {
+            val hasX = findMotionRange(device, MotionEvent.AXIS_X, InputDevice.SOURCE_JOYSTICK) != null
+            val hasY = findMotionRange(device, MotionEvent.AXIS_Y, InputDevice.SOURCE_JOYSTICK) != null
+            val hasHatX = findMotionRange(device, MotionEvent.AXIS_HAT_X, InputDevice.SOURCE_JOYSTICK) != null
+            val hasHatY = findMotionRange(device, MotionEvent.AXIS_HAT_Y, InputDevice.SOURCE_JOYSTICK) != null
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                return device.isExternal && hasX && hasY && (hasHatX || hasHatY)
+            }
+            return hasX && hasY && (hasHatX || hasHatY)
+        }
+        return false
     }
 
     private fun hasConnectedPhysicalGamepad(): Boolean {
@@ -990,19 +1102,28 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     }
 
     private fun isPhysicalGamepadEvent(event: InputEvent?): Boolean {
-        if (event == null || event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN)) {
+        if (event == null ||
+            event.deviceId <= 0 ||
+            event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN) ||
+            event.isFromSource(InputDevice.SOURCE_STYLUS)
+        ) {
             return false
         }
-        if (event.device?.isVirtual == true) {
-            return false
+        val dev = event.device
+        if (dev != null) {
+            if (!isPhysicalGamepadDevice(dev)) {
+                return false
+            }
+            return event.isFromSource(InputDevice.SOURCE_GAMEPAD) ||
+                event.isFromSource(InputDevice.SOURCE_JOYSTICK) ||
+                event.isFromSource(InputDevice.SOURCE_DPAD)
         }
         return event.isFromSource(InputDevice.SOURCE_GAMEPAD) ||
-            event.isFromSource(InputDevice.SOURCE_JOYSTICK) ||
-            event.isFromSource(InputDevice.SOURCE_DPAD)
+            event.isFromSource(InputDevice.SOURCE_JOYSTICK)
     }
 
     private fun isDirectGamepadKeySource(event: KeyEvent?): Boolean {
-        if (event == null || event.deviceId <= 0 || event.device?.isVirtual == true) {
+        if (event == null || !isPhysicalGamepadEvent(event)) {
             return false
         }
         return event.isFromSource(InputDevice.SOURCE_GAMEPAD) ||
@@ -1105,14 +1226,22 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         }
     }
 
+    override fun dispatchTouchEvent(ev: MotionEvent?): Boolean {
+        if (ev?.actionMasked == MotionEvent.ACTION_DOWN) {
+            lastGamepadActiveEmitMs.set(0L)
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.keyCode == KeyEvent.KEYCODE_BUTTON_MODE &&
             !event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN) &&
+            !event.isFromSource(InputDevice.SOURCE_STYLUS) &&
             event.device?.isVirtual != true
         ) {
             if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
                 emitGamepadUiAction("guide")
-                notifyHardwareGamepadActive()
+                notifyHardwareGamepadActive(force = true)
             }
             return true
         }
@@ -1169,118 +1298,128 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         return super.onKeyUp(keyCode, event)
     }
 
-    override fun onGenericMotionEvent(event: MotionEvent?): Boolean {
-        if (event != null && isPhysicalGamepadEvent(event)) {
-            if (event.action == MotionEvent.ACTION_CANCEL) {
-                if (isRunning.get() && !isPaused.get()) {
-                    hardwareLeftStickX.set(0)
-                    hardwareLeftStickY.set(0)
-                    hardwareRightStickX.set(0)
-                    hardwareRightStickY.set(0)
-                    hardwareAxisMask.set(0)
-                    pushCombinedInputToNative()
-                } else {
-                    resetUiGamepadMotionState()
+    override fun dispatchGenericMotionEvent(ev: MotionEvent?): Boolean {
+        if (ev != null && handlePhysicalMotionEvent(ev)) {
+            return true
+        }
+        return super.dispatchGenericMotionEvent(ev)
+    }
+
+    private fun handlePhysicalMotionEvent(event: MotionEvent): Boolean {
+        if (!isPhysicalGamepadEvent(event)) {
+            return false
+        }
+        if (event.action == MotionEvent.ACTION_CANCEL) {
+            if (isRunning.get() && !isPaused.get()) {
+                hardwareLeftStickX.set(0)
+                hardwareLeftStickY.set(0)
+                hardwareRightStickX.set(0)
+                hardwareRightStickY.set(0)
+                hardwareAxisMask.set(0)
+                pushCombinedInputToNative()
+            } else {
+                resetUiGamepadMotionState()
+            }
+            return false
+        }
+
+        if (event.action == MotionEvent.ACTION_MOVE) {
+            val (lTrig, rTrig) = readAnalogTriggers(event)
+            val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
+            val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
+            val rawLx = event.getAxisValue(MotionEvent.AXIS_X)
+            val rawLy = event.getAxisValue(MotionEvent.AXIS_Y)
+
+            if (isRunning.get() && !isPaused.get()) {
+                val lx = applyStickDeadzone(rawLx)
+                val ly = applyStickDeadzone(rawLy)
+                val (rawRx, rawRy) = readRightStickAxes(event)
+                val rx = applyStickDeadzone(rawRx)
+                val ry = applyStickDeadzone(rawRy)
+
+                var axisBits = 0
+                if (lTrig >= 0.30f) axisBits = axisBits or RETRO_L2
+                if (rTrig >= 0.30f) axisBits = axisBits or RETRO_R2
+                if (hatX <= -0.5f) axisBits = axisBits or RETRO_LEFT
+                if (hatX >= 0.5f) axisBits = axisBits or RETRO_RIGHT
+                if (hatY <= -0.5f) axisBits = axisBits or RETRO_UP
+                if (hatY >= 0.5f) axisBits = axisBits or RETRO_DOWN
+
+                hardwareLeftStickX.set(lx.toInt())
+                hardwareLeftStickY.set(ly.toInt())
+                hardwareRightStickX.set(rx.toInt())
+                hardwareRightStickY.set(ry.toInt())
+                hardwareAxisMask.set(axisBits)
+                pushCombinedInputToNative()
+
+                if (kotlin.math.abs(lx.toInt()) > 2500 ||
+                    kotlin.math.abs(ly.toInt()) > 2500 ||
+                    kotlin.math.abs(rx.toInt()) > 2500 ||
+                    kotlin.math.abs(ry.toInt()) > 2500 ||
+                    lTrig >= 0.25f ||
+                    rTrig >= 0.25f ||
+                    axisBits != 0
+                ) {
+                    notifyHardwareGamepadActive()
                 }
-                return super.onGenericMotionEvent(event)
+                return true
             }
 
-            if (event.action == MotionEvent.ACTION_MOVE) {
-                val (lTrig, rTrig) = readAnalogTriggers(event)
-                val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
-                val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
-                val rawLx = event.getAxisValue(MotionEvent.AXIS_X)
-                val rawLy = event.getAxisValue(MotionEvent.AXIS_Y)
-
-                if (isRunning.get() && !isPaused.get()) {
-                    val lx = applyStickDeadzone(rawLx)
-                    val ly = applyStickDeadzone(rawLy)
-                    val (rawRx, rawRy) = readRightStickAxes(event)
-                    val rx = applyStickDeadzone(rawRx)
-                    val ry = applyStickDeadzone(rawRy)
-
-                    var axisBits = 0
-                    if (lTrig >= 0.30f) axisBits = axisBits or RETRO_L2
-                    if (rTrig >= 0.30f) axisBits = axisBits or RETRO_R2
-                    if (hatX <= -0.5f) axisBits = axisBits or RETRO_LEFT
-                    if (hatX >= 0.5f) axisBits = axisBits or RETRO_RIGHT
-                    if (hatY <= -0.5f) axisBits = axisBits or RETRO_UP
-                    if (hatY >= 0.5f) axisBits = axisBits or RETRO_DOWN
-
-                    hardwareLeftStickX.set(lx.toInt())
-                    hardwareLeftStickY.set(ly.toInt())
-                    hardwareRightStickX.set(rx.toInt())
-                    hardwareRightStickY.set(ry.toInt())
-                    hardwareAxisMask.set(axisBits)
-                    pushCombinedInputToNative()
-
-                    if (kotlin.math.abs(lx.toInt()) > 3000 ||
-                        kotlin.math.abs(ly.toInt()) > 3000 ||
-                        kotlin.math.abs(rx.toInt()) > 3000 ||
-                        kotlin.math.abs(ry.toInt()) > 3000 ||
-                        axisBits != 0
-                    ) {
-                        notifyHardwareGamepadActive()
-                    }
-                    return true
-                }
-
-                // Modo UI (menu ou emulação pausada): direciona HAT/analógico esquerdo + L2/R2
-                val direction: String? = when {
-                    kotlin.math.abs(hatX) >= 0.55f || kotlin.math.abs(hatY) >= 0.55f -> {
-                        if (kotlin.math.abs(hatX) >= kotlin.math.abs(hatY)) {
-                            if (hatX < 0f) "dpadLeft" else "dpadRight"
-                        } else {
-                            if (hatY < 0f) "dpadUp" else "dpadDown"
-                        }
-                    }
-                    kotlin.math.abs(rawLx) >= 0.60f || kotlin.math.abs(rawLy) >= 0.60f -> {
-                        if (kotlin.math.abs(rawLx) >= kotlin.math.abs(rawLy)) {
-                            if (rawLx < 0f) "dpadLeft" else "dpadRight"
-                        } else {
-                            if (rawLy < 0f) "dpadUp" else "dpadDown"
-                        }
-                    }
-                    else -> null
-                }
-
-                val directionChanged = direction != currentUiDirection
-                if (directionChanged) {
-                    mainHandler.removeCallbacks(uiDirectionRepeatRunnable)
-                    currentUiDirection = direction
-                    if (direction != null) {
-                        emitGamepadUiAction(direction)
-                        notifyHardwareGamepadActive()
-                        mainHandler.postDelayed(uiDirectionRepeatRunnable, UI_MOTION_REPEAT_MS)
+            // Modo UI (menu ou emulação pausada): direciona HAT/analógico esquerdo + L2/R2
+            val direction: String? = when {
+                kotlin.math.abs(hatX) >= 0.55f || kotlin.math.abs(hatY) >= 0.55f -> {
+                    if (kotlin.math.abs(hatX) >= kotlin.math.abs(hatY)) {
+                        if (hatX < 0f) "dpadLeft" else "dpadRight"
+                    } else {
+                        if (hatY < 0f) "dpadUp" else "dpadDown"
                     }
                 }
+                kotlin.math.abs(rawLx) >= 0.60f || kotlin.math.abs(rawLy) >= 0.60f -> {
+                    if (kotlin.math.abs(rawLx) >= kotlin.math.abs(rawLy)) {
+                        if (rawLx < 0f) "dpadLeft" else "dpadRight"
+                    } else {
+                        if (rawLy < 0f) "dpadUp" else "dpadDown"
+                    }
+                }
+                else -> null
+            }
 
-                val lPressed = if (uiLeftTriggerPressed) lTrig >= 0.40f else lTrig >= 0.55f
-                val rPressed = if (uiRightTriggerPressed) rTrig >= 0.40f else rTrig >= 0.55f
-                val triggerChanged = (lPressed != uiLeftTriggerPressed) || (rPressed != uiRightTriggerPressed)
-                if (lPressed && !uiLeftTriggerPressed) {
-                    emitGamepadUiAction("l2")
+            val directionChanged = direction != currentUiDirection
+            if (directionChanged) {
+                mainHandler.removeCallbacks(uiDirectionRepeatRunnable)
+                currentUiDirection = direction
+                if (direction != null) {
+                    emitGamepadUiAction(direction)
                     notifyHardwareGamepadActive()
+                    mainHandler.postDelayed(uiDirectionRepeatRunnable, UI_MOTION_REPEAT_MS)
                 }
-                if (rPressed && !uiRightTriggerPressed) {
-                    emitGamepadUiAction("r2")
-                    notifyHardwareGamepadActive()
-                }
-                uiLeftTriggerPressed = lPressed
-                uiRightTriggerPressed = rPressed
+            }
 
-                if (directionChanged ||
-                    triggerChanged ||
-                    direction != null ||
-                    lPressed ||
-                    rPressed ||
-                    event.isFromSource(InputDevice.SOURCE_JOYSTICK)
-                ) {
-                    return true
-                }
+            val lPressed = if (uiLeftTriggerPressed) lTrig >= 0.40f else lTrig >= 0.55f
+            val rPressed = if (uiRightTriggerPressed) rTrig >= 0.40f else rTrig >= 0.55f
+            val triggerChanged = (lPressed != uiLeftTriggerPressed) || (rPressed != uiRightTriggerPressed)
+            if (lPressed && !uiLeftTriggerPressed) {
+                emitGamepadUiAction("l2")
+                notifyHardwareGamepadActive()
+            }
+            if (rPressed && !uiRightTriggerPressed) {
+                emitGamepadUiAction("r2")
+                notifyHardwareGamepadActive()
+            }
+            uiLeftTriggerPressed = lPressed
+            uiRightTriggerPressed = rPressed
+
+            if (directionChanged ||
+                triggerChanged ||
+                direction != null ||
+                lPressed ||
+                rPressed ||
+                event.isFromSource(InputDevice.SOURCE_JOYSTICK)
+            ) {
+                return true
             }
         }
-        return super.onGenericMotionEvent(event)
+        return false
     }
 
     private fun mapGenericHidKeyToUiAction(keyCode: Int): String? {
@@ -1372,6 +1511,29 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                         val frameTimeMs = if (fps > 0.5) 1000.0 / fps else 16.6
                         val w = nativeGetFrameWidth()
                         val h = nativeGetFrameHeight()
+                        if (w > 0 && h > 0) {
+                            // Núcleos HW em HD (>=800px ou >=544px) já renderizam em 2x+ nativo;
+                            // manter buffer 1:1 evita supersampling redundante e shimmer de downscale.
+                            val effectiveScale =
+                                if (w >= 800 || h >= 544) 1 else currentScreenScale.coerceIn(1, 4)
+                            val desiredW = (w * effectiveScale).coerceIn(64, 4096)
+                            val desiredH = (h * effectiveScale).coerceIn(64, 4096)
+                            if (desiredW > currentBufferWidth || desiredH > currentBufferHeight) {
+                                val nextW = maxOf(currentBufferWidth, desiredW)
+                                val nextH = maxOf(currentBufferHeight, desiredH)
+                                currentBufferWidth = nextW
+                                currentBufferHeight = nextH
+                                surfaceTexture?.setDefaultBufferSize(nextW, nextH)
+                            }
+                        }
+                        val hasRendered = try { nativeHasRenderedFrame() } catch (_: Throwable) { true }
+                        val coreShutdown = try { nativeIsCoreShutdownRequested() } catch (_: Throwable) { false }
+                        val coreFatal = try { nativeIsCoreErrorFatal() } catch (_: Throwable) { false }
+                        val coreErr = if (coreFatal || coreShutdown || !hasRendered) {
+                            try { nativeGetLastCoreError()?.trim() ?: "" } catch (_: Throwable) { "" }
+                        } else {
+                            ""
+                        }
                         frames = 0
                         lastFpsTimestamp = now
 
@@ -1383,7 +1545,11 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                                         "frameTimeMs" to frameTimeMs,
                                         "width" to w,
                                         "height" to h,
-                                        "coreName" to coreFileName
+                                        "coreName" to coreFileName,
+                                        "hasRenderedFrame" to hasRendered,
+                                        "coreShutdown" to coreShutdown,
+                                        "coreFatal" to coreFatal,
+                                        if (coreErr.isNotEmpty()) "coreError" to coreErr else "coreError" to null
                                     )
                                 )
                             } catch (_: Throwable) {
@@ -1483,6 +1649,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         isActivityResumed.set(true)
         lifecyclePaused.set(false)
         syncPauseAndServiceState()
+        emitHardwareGamepadState(
+            connected = hasConnectedPhysicalGamepad(),
+            forceEmit = true
+        )
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -1546,6 +1716,542 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         super.onDestroy()
     }
 
+    private fun hasDirectStorageAccessInternal(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.READ_EXTERNAL_STORAGE
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun requestDirectStorageAccessInternal(result: MethodChannel.Result) {
+        if (hasDirectStorageAccessInternal()) {
+            result.success(true)
+            return
+        }
+        pendingStoragePermissionResult?.let { previous ->
+            try {
+                previous.success(false)
+            } catch (_: Throwable) {
+            }
+            pendingStoragePermissionResult = null
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            pendingStoragePermissionResult = result
+            val appSettingsIntent = Intent(
+                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                Uri.parse("package:$packageName")
+            )
+            try {
+                startActivityForResult(appSettingsIntent, REQ_MANAGE_ALL_FILES)
+            } catch (_: ActivityNotFoundException) {
+                try {
+                    startActivityForResult(
+                        Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+                        REQ_MANAGE_ALL_FILES
+                    )
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Falha ao abrir tela de acesso total ao armazenamento: ${t.message}")
+                    pendingStoragePermissionResult = null
+                    result.success(false)
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Falha ao solicitar MANAGE_EXTERNAL_STORAGE: ${t.message}")
+                pendingStoragePermissionResult = null
+                result.success(false)
+            }
+        } else {
+            pendingStoragePermissionResult = result
+            try {
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE),
+                    REQ_READ_EXTERNAL_STORAGE
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "Falha ao solicitar READ_EXTERNAL_STORAGE: ${t.message}")
+                pendingStoragePermissionResult = null
+                result.success(false)
+            }
+        }
+    }
+
+    private fun launchExternalRomPicker(result: MethodChannel.Result) {
+        pendingPickRomResult?.let { previous ->
+            try {
+                previous.success(null)
+            } catch (_: Throwable) {
+            }
+            pendingPickRomResult = null
+        }
+        pendingPickRomResult = result
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_LOCAL_ONLY, true)
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            )
+        }
+        try {
+            startActivityForResult(intent, REQ_PICK_EXTERNAL_ROM)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Falha ao abrir seletor nativo de ROM/ISO: ${t.message}")
+            pendingPickRomResult = null
+            result.success(null)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_READ_EXTERNAL_STORAGE) {
+            val pending = pendingStoragePermissionResult
+            pendingStoragePermissionResult = null
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            pending?.success(granted || hasDirectStorageAccessInternal())
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        when (requestCode) {
+            REQ_MANAGE_ALL_FILES -> {
+                val pending = pendingStoragePermissionResult
+                pendingStoragePermissionResult = null
+                pending?.success(hasDirectStorageAccessInternal())
+            }
+
+            REQ_PICK_EXTERNAL_ROM -> {
+                val pending = pendingPickRomResult
+                pendingPickRomResult = null
+                if (pending == null) return
+                val uri = if (resultCode == Activity.RESULT_OK) data?.data else null
+                if (uri == null) {
+                    pending.success(null)
+                    return
+                }
+                nativeExecutor.execute {
+                    val resolvedMap = resolvePickedExternalRomPayload(uri)
+                    mainHandler.post {
+                        pending.success(resolvedMap)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun resolvePickedExternalRomPayload(uri: Uri): Map<String, Any> {
+        try {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        } catch (_: Throwable) {
+        }
+
+        val (displayName, reportedSize) = queryOpenableMetadata(uri)
+        val directPath = resolveDirectFilePathFromUri(uri, displayName, reportedSize)
+        val directFile = directPath?.let(::File)?.takeIf {
+            it.exists() && it.isFile && it.canRead()
+        }
+        val finalSize = when {
+            directFile != null -> directFile.length()
+            reportedSize > 0L -> reportedSize
+            else -> 0L
+        }
+        val finalName = when {
+            !displayName.isNullOrBlank() -> displayName
+            directFile != null -> directFile.name
+            else -> uri.lastPathSegment ?: "rom"
+        }
+
+        return mapOf(
+            "path" to (directFile?.absolutePath ?: ""),
+            "uri" to uri.toString(),
+            "name" to finalName,
+            "sizeBytes" to finalSize,
+            "isDirect" to (directFile != null)
+        )
+    }
+
+    private fun queryOpenableMetadata(uri: Uri): Pair<String?, Long> {
+        var name: String? = null
+        var size = -1L
+        try {
+            contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (nameIdx >= 0 && !cursor.isNull(nameIdx)) {
+                        name = cursor.getString(nameIdx)
+                    }
+                    val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+                        size = cursor.getLong(sizeIdx)
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return name to size
+    }
+
+    private fun isValidDirectCandidate(
+        candidate: File?,
+        expectedName: String?,
+        expectedSize: Long
+    ): Boolean {
+        if (candidate == null || !candidate.exists() || !candidate.isFile || !candidate.canRead()) {
+            return false
+        }
+        if (expectedSize > 0L && candidate.length() != expectedSize) {
+            return false
+        }
+        if (!expectedName.isNullOrBlank() && candidate.name != expectedName) {
+            if (expectedSize <= 0L) return false
+        }
+        return true
+    }
+
+    private fun mountedExternalRoots(): List<File> {
+        val roots = LinkedHashSet<File>()
+        @Suppress("DEPRECATION")
+        roots.add(Environment.getExternalStorageDirectory())
+        try {
+            for (appDir in getExternalFilesDirs(null)) {
+                if (appDir == null) continue
+                val abs = appDir.absolutePath
+                val marker = "/Android/data/"
+                val idx = abs.indexOf(marker)
+                if (idx > 0) {
+                    roots.add(File(abs.substring(0, idx)))
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return roots.toList()
+    }
+
+    private fun resolveDirectFilePathFromUri(
+        uri: Uri,
+        expectedName: String?,
+        expectedSize: Long
+    ): String? {
+        if ("file".equals(uri.scheme, ignoreCase = true)) {
+            val f = uri.path?.let(::File)
+            if (isValidDirectCandidate(f, null, expectedSize)) {
+                return f!!.absolutePath
+            }
+            return null
+        }
+
+        val authority = uri.authority ?: ""
+
+        if (DocumentsContract.isDocumentUri(this, uri)) {
+            val docId = DocumentsContract.getDocumentId(uri)
+            when (authority) {
+                "com.android.externalstorage.documents" -> {
+                    val splitIdx = docId.indexOf(':')
+                    val type = if (splitIdx >= 0) docId.substring(0, splitIdx) else docId
+                    val relPath = if (splitIdx >= 0) docId.substring(splitIdx + 1) else ""
+                    if ("primary".equals(type, ignoreCase = true)) {
+                        @Suppress("DEPRECATION")
+                        val primary = File(Environment.getExternalStorageDirectory(), relPath)
+                        if (isValidDirectCandidate(primary, null, expectedSize)) {
+                            return primary.absolutePath
+                        }
+                    } else if ("home".equals(type, ignoreCase = true)) {
+                        @Suppress("DEPRECATION")
+                        val docsDir = Environment.getExternalStoragePublicDirectory(
+                            Environment.DIRECTORY_DOCUMENTS
+                        )
+                        val homeFile = File(docsDir, relPath)
+                        if (isValidDirectCandidate(homeFile, null, expectedSize)) {
+                            return homeFile.absolutePath
+                        }
+                    } else if (type.isNotBlank()) {
+                        val storageFile = File("/storage/$type/$relPath")
+                        if (isValidDirectCandidate(storageFile, null, expectedSize)) {
+                            return storageFile.absolutePath
+                        }
+                        for (root in mountedExternalRoots()) {
+                            val alt = File(root, relPath)
+                            if (isValidDirectCandidate(alt, null, expectedSize)) {
+                                return alt.absolutePath
+                            }
+                        }
+                    }
+                }
+
+                "com.android.providers.downloads.documents" -> {
+                    if (docId.startsWith("raw:")) {
+                        val rawFile = File(docId.removePrefix("raw:"))
+                        if (isValidDirectCandidate(rawFile, null, expectedSize)) {
+                            return rawFile.absolutePath
+                        }
+                    }
+                    val numericId = docId.substringAfter("msf:").toLongOrNull() ?: docId.toLongOrNull()
+                    if (numericId != null) {
+                        for (base in arrayOf(
+                            "content://downloads/public_downloads",
+                            "content://downloads/my_downloads",
+                            "content://downloads/all_downloads"
+                        )) {
+                            val downloadUri = ContentUris.withAppendedId(Uri.parse(base), numericId)
+                            queryDataColumnPath(downloadUri, null, null)?.let { p ->
+                                val f = File(p)
+                                if (isValidDirectCandidate(f, null, expectedSize)) {
+                                    return f.absolutePath
+                                }
+                            }
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            queryMediaStorePathById(
+                                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                                numericId,
+                                expectedName,
+                                expectedSize
+                            )?.let { return it }
+                        }
+                        queryMediaStorePathById(
+                            MediaStore.Files.getContentUri("external"),
+                            numericId,
+                            expectedName,
+                            expectedSize
+                        )?.let { return it }
+                    }
+                    findByNameAndSizeInPublicDownloads(expectedName, expectedSize)?.let {
+                        return it
+                    }
+                }
+
+                "com.android.providers.media.documents" -> {
+                    val splitIdx = docId.indexOf(':')
+                    val mediaType = if (splitIdx >= 0) docId.substring(0, splitIdx) else ""
+                    val idStr = if (splitIdx >= 0) docId.substring(splitIdx + 1) else docId
+                    val contentUri = when (mediaType) {
+                        "image" -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                        "video" -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                        "audio" -> MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                        else -> MediaStore.Files.getContentUri("external")
+                    }
+                    val numericId = idStr.toLongOrNull()
+                    if (numericId != null) {
+                        queryMediaStorePathById(
+                            contentUri,
+                            numericId,
+                            expectedName,
+                            expectedSize
+                        )?.let { return it }
+                    }
+                }
+            }
+        }
+
+        queryDataColumnPath(uri, null, null)?.let { p ->
+            val f = File(p)
+            if (isValidDirectCandidate(f, null, expectedSize)) {
+                return f.absolutePath
+            }
+        }
+
+        val uriPath = uri.path
+        if (!uriPath.isNullOrBlank()) {
+            val directPathFile = File(uriPath)
+            if (isValidDirectCandidate(directPathFile, null, expectedSize)) {
+                return directPathFile.absolutePath
+            }
+            for (prefix in arrayOf(
+                "/external_files/",
+                "/external_storage_root/",
+                "/root/",
+                "/files/",
+                "/raw/"
+            )) {
+                val idx = uriPath.indexOf(prefix)
+                if (idx >= 0) {
+                    val rel = uriPath.substring(idx + prefix.length).trimStart('/')
+                    for (root in mountedExternalRoots()) {
+                        val candidate = if (rel.startsWith("storage/")) {
+                            File("/$rel")
+                        } else {
+                            File(root, rel)
+                        }
+                        if (isValidDirectCandidate(candidate, null, expectedSize)) {
+                            return candidate.absolutePath
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!expectedName.isNullOrBlank()) {
+            queryMediaStoreByNameAndSize(expectedName, expectedSize)?.let { return it }
+            findByNameAndSizeInPublicDownloads(expectedName, expectedSize)?.let { return it }
+        }
+        return null
+    }
+
+    @Suppress("DEPRECATION")
+    private fun queryDataColumnPath(
+        uri: Uri,
+        selection: String?,
+        selectionArgs: Array<String>?
+    ): String? {
+        return try {
+            contentResolver.query(
+                uri,
+                arrayOf(MediaStore.MediaColumns.DATA),
+                selection,
+                selectionArgs,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                    if (idx >= 0 && !cursor.isNull(idx)) cursor.getString(idx) else null
+                } else {
+                    null
+                }
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun queryMediaStorePathById(
+        collectionUri: Uri,
+        id: Long,
+        expectedName: String?,
+        expectedSize: Long
+    ): String? {
+        val projection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            arrayOf(
+                MediaStore.MediaColumns.DATA,
+                MediaStore.MediaColumns.RELATIVE_PATH,
+                MediaStore.MediaColumns.DISPLAY_NAME
+            )
+        } else {
+            arrayOf(MediaStore.MediaColumns.DATA, MediaStore.MediaColumns.DISPLAY_NAME)
+        }
+        return try {
+            contentResolver.query(
+                collectionUri,
+                projection,
+                "${MediaStore.MediaColumns._ID}=?",
+                arrayOf(id.toString()),
+                null
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) return null
+                val dataIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                val dataPath = if (dataIdx >= 0 && !cursor.isNull(dataIdx)) cursor.getString(dataIdx) else null
+                if (!dataPath.isNullOrBlank()) {
+                    val f = File(dataPath)
+                    if (isValidDirectCandidate(f, null, expectedSize)) {
+                        return f.absolutePath
+                    }
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val relIdx = cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+                    val nameIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+                    val rel = if (relIdx >= 0 && !cursor.isNull(relIdx)) cursor.getString(relIdx) else null
+                    val disp = (if (nameIdx >= 0 && !cursor.isNull(nameIdx)) cursor.getString(nameIdx) else null)
+                        ?: expectedName
+                    if (!rel.isNullOrBlank() && !disp.isNullOrBlank()) {
+                        for (root in mountedExternalRoots()) {
+                            val candidate = File(File(root, rel), disp)
+                            if (isValidDirectCandidate(candidate, expectedName, expectedSize)) {
+                                return candidate.absolutePath
+                            }
+                        }
+                    }
+                }
+                null
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun queryMediaStoreByNameAndSize(
+        expectedName: String,
+        expectedSize: Long
+    ): String? {
+        val collectionUri = MediaStore.Files.getContentUri("external")
+        val selection = if (expectedSize > 0L) {
+            "${MediaStore.MediaColumns.DISPLAY_NAME}=? AND ${MediaStore.MediaColumns.SIZE}=?"
+        } else {
+            "${MediaStore.MediaColumns.DISPLAY_NAME}=?"
+        }
+        val args = if (expectedSize > 0L) {
+            arrayOf(expectedName, expectedSize.toString())
+        } else {
+            arrayOf(expectedName)
+        }
+        return try {
+            contentResolver.query(
+                collectionUri,
+                arrayOf(MediaStore.MediaColumns.DATA),
+                selection,
+                args,
+                null
+            )?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val idx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                    val path = if (idx >= 0 && !cursor.isNull(idx)) cursor.getString(idx) else null
+                    val f = path?.let(::File)
+                    if (isValidDirectCandidate(f, expectedName, expectedSize)) {
+                        return f!!.absolutePath
+                    }
+                }
+                null
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun findByNameAndSizeInPublicDownloads(
+        expectedName: String?,
+        expectedSize: Long
+    ): String? {
+        if (expectedName.isNullOrBlank()) return null
+        @Suppress("DEPRECATION")
+        val downloadDir = Environment.getExternalStoragePublicDirectory(
+            Environment.DIRECTORY_DOWNLOADS
+        )
+        val direct = File(downloadDir, expectedName)
+        if (isValidDirectCandidate(direct, expectedName, expectedSize)) {
+            return direct.absolutePath
+        }
+        for (root in mountedExternalRoots()) {
+            for (sub in arrayOf("Download", "Downloads", "ROMs", "ISOs", "Games")) {
+                val candidate = File(File(root, sub), expectedName)
+                if (isValidDirectCandidate(candidate, expectedName, expectedSize)) {
+                    return candidate.absolutePath
+                }
+            }
+        }
+        return null
+    }
+
     private external fun nativeLoadCoreAndRom(
         corePath: String,
         romPath: String,
@@ -1585,5 +2291,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private external fun nativeLoadState(path: String): Boolean
     private external fun nativeGetFrameWidth(): Int
     private external fun nativeGetFrameHeight(): Int
+    private external fun nativeGetLastCoreError(): String?
+    private external fun nativeIsCoreErrorFatal(): Boolean
+    private external fun nativeIsCoreShutdownRequested(): Boolean
+    private external fun nativeHasRenderedFrame(): Boolean
     private external fun nativeUnloadCore()
 }

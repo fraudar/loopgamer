@@ -69,6 +69,10 @@ class LibretroTelemetryEvent {
     required this.frameWidth,
     required this.frameHeight,
     required this.coreName,
+    this.coreError,
+    this.coreFatal = false,
+    this.coreShutdown = false,
+    this.hasRenderedFrame = true,
   });
 
   final double fps;
@@ -76,17 +80,26 @@ class LibretroTelemetryEvent {
   final int frameWidth;
   final int frameHeight;
   final String coreName;
+  final String? coreError;
+  final bool coreFatal;
+  final bool coreShutdown;
+  final bool hasRenderedFrame;
 
   factory LibretroTelemetryEvent.fromMap(Map<dynamic, dynamic> map) {
     final fpsVal = (map['fps'] as num?)?.toDouble() ?? 60.0;
     final ftVal = (map['frameTimeMs'] as num?)?.toDouble() ??
         (fpsVal > 0 ? 1000.0 / fpsVal : 16.6);
+    final rawError = (map['coreError'] as String?)?.trim();
     return LibretroTelemetryEvent(
       fps: fpsVal,
       frameTimeMs: ftVal,
       frameWidth: (map['width'] as num?)?.toInt() ?? 480,
       frameHeight: (map['height'] as num?)?.toInt() ?? 272,
       coreName: (map['coreName'] as String?) ?? 'Libretro',
+      coreError: (rawError != null && rawError.isNotEmpty) ? rawError : null,
+      coreFatal: map['coreFatal'] == true,
+      coreShutdown: map['coreShutdown'] == true,
+      hasRenderedFrame: map['hasRenderedFrame'] != false,
     );
   }
 }
@@ -672,14 +685,102 @@ class EmulatorService {
     }
   }
 
+  static const int _minPs3FirmwareBytes = 1024 * 1024;
+
+  Future<File?> _findExistingPs3Pup(Directory dir) async {
+    if (!await dir.exists()) return null;
+    try {
+      await for (final entry in dir.list(followLinks: false)) {
+        if (entry is! File) continue;
+        final name = entry.uri.pathSegments.isEmpty
+            ? ''
+            : entry.uri.pathSegments.last.toLowerCase();
+        if (name == 'ps3updat.pup' &&
+            await entry.length() > _minPs3FirmwareBytes) {
+          return entry;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Garante que o firmware PS3UPDAT.PUP esteja no caminho exato esperado pelo
+  /// core libretro RPCS3 (`<system_dir>/rpcs3/firmware/PS3UPDAT.PUP`),
+  /// migrando instalações antigas de `system/` ou `system/rpcs3/` sem manter
+  /// cópias duplicadas no armazenamento.
+  Future<bool> _ensureCanonicalPs3FirmwareLayout(Directory systemDir) async {
+    final firmwareDir = Directory('${systemDir.path}/rpcs3/firmware');
+    final canonicalPup = File('${firmwareDir.path}/PS3UPDAT.PUP');
+
+    if (await canonicalPup.exists() &&
+        await canonicalPup.length() > _minPs3FirmwareBytes) {
+      await _deleteIfExists(File('${systemDir.path}/PS3UPDAT.PUP'));
+      await _deleteIfExists(File('${systemDir.path}/rpcs3/PS3UPDAT.PUP'));
+      return true;
+    }
+
+    final existingLowerInFirmware = await _findExistingPs3Pup(firmwareDir);
+    if (existingLowerInFirmware != null) {
+      if (existingLowerInFirmware.path != canonicalPup.path) {
+        await existingLowerInFirmware.rename(canonicalPup.path);
+      }
+      await _deleteIfExists(File('${systemDir.path}/PS3UPDAT.PUP'));
+      await _deleteIfExists(File('${systemDir.path}/rpcs3/PS3UPDAT.PUP'));
+      return true;
+    }
+
+    final legacyCandidates = [
+      File('${systemDir.path}/rpcs3/PS3UPDAT.PUP'),
+      File('${systemDir.path}/PS3UPDAT.PUP'),
+      await _findExistingPs3Pup(Directory('${systemDir.path}/rpcs3')),
+      await _findExistingPs3Pup(systemDir),
+    ];
+
+    for (final candidate in legacyCandidates) {
+      if (candidate == null || !await candidate.exists()) continue;
+      if (await candidate.length() <= _minPs3FirmwareBytes) continue;
+      if (!await firmwareDir.exists()) {
+        await firmwareDir.create(recursive: true);
+      }
+      try {
+        await candidate.rename(canonicalPup.path);
+      } catch (_) {
+        await candidate.copy(canonicalPup.path);
+        await _deleteIfExists(candidate);
+      }
+      await _deleteIfExists(File('${systemDir.path}/PS3UPDAT.PUP'));
+      await _deleteIfExists(File('${systemDir.path}/rpcs3/PS3UPDAT.PUP'));
+      return true;
+    }
+    return false;
+  }
+
+  Future<void> _deleteIfExists(File file) async {
+    try {
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (_) {}
+  }
+
   Future<bool> hasPs3Firmware() async {
     final systemDir = await getApplicationSupportDirectory();
+    final canonicalPup = File('${systemDir.path}/rpcs3/firmware/PS3UPDAT.PUP');
+    if (await canonicalPup.exists() &&
+        await canonicalPup.length() > _minPs3FirmwareBytes) {
+      return true;
+    }
     final rootPup = File('${systemDir.path}/PS3UPDAT.PUP');
-    if (await rootPup.exists() && await rootPup.length() > 1024 * 1024) {
+    if (await rootPup.exists() && await rootPup.length() > _minPs3FirmwareBytes) {
       return true;
     }
     final rpcs3Pup = File('${systemDir.path}/rpcs3/PS3UPDAT.PUP');
-    if (await rpcs3Pup.exists() && await rpcs3Pup.length() > 1024 * 1024) {
+    if (await rpcs3Pup.exists() &&
+        await rpcs3Pup.length() > _minPs3FirmwareBytes) {
+      return true;
+    }
+    if (await _findExistingPs3Pup(Directory('${systemDir.path}/rpcs3/firmware')) !=
+        null) {
       return true;
     }
     final devFlashSys = Directory('${systemDir.path}/rpcs3/dev_flash/sys');
@@ -690,25 +791,93 @@ class EmulatorService {
     return false;
   }
 
+  Future<bool> ensureCanonicalPs3FirmwareLayout([Directory? customDir]) async {
+    final systemDir = customDir ?? await getApplicationSupportDirectory();
+    if (await _ensureCanonicalPs3FirmwareLayout(systemDir)) {
+      return true;
+    }
+    final devFlashSys = Directory('${systemDir.path}/rpcs3/dev_flash/sys');
+    if (await devFlashSys.exists()) {
+      final entries = await devFlashSys.list().toList();
+      if (entries.isNotEmpty) return true;
+    }
+    return false;
+  }
+
+  Future<bool> _hasPs3SaveFiles(Directory rpcs3Dir) async {
+    final homeDir = Directory('${rpcs3Dir.path}/dev_hdd0/home');
+    try {
+      if (!await homeDir.exists()) return false;
+      await for (final entity
+          in homeDir.list(recursive: true, followLinks: false)) {
+        if (entity is! File) continue;
+        final normalized = entity.path.replaceAll('\\', '/').toLowerCase();
+        if (normalized.contains('/savedata/')) {
+          return true;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
   Future<bool> removePs3Firmware() async {
     try {
       final systemDir = await getApplicationSupportDirectory();
+      final rpcs3Dir = Directory('${systemDir.path}/rpcs3');
+
       final filesToDelete = [
         File('${systemDir.path}/PS3UPDAT.PUP'),
-        File('${systemDir.path}/rpcs3/PS3UPDAT.PUP'),
+        File('${rpcs3Dir.path}/PS3UPDAT.PUP'),
+        File('${rpcs3Dir.path}/firmware/PS3UPDAT.PUP'),
       ];
       for (final f in filesToDelete) {
-        if (await f.exists()) {
-          await f.delete();
-        }
+        await _deleteIfExists(f);
       }
+      for (final dir in [systemDir, rpcs3Dir]) {
+        try {
+          if (!await dir.exists()) continue;
+          await for (final entity in dir.list(followLinks: false)) {
+            if (entity is File && entity.path.toLowerCase().endsWith('.pup')) {
+              await _deleteIfExists(entity);
+            }
+          }
+        } catch (_) {}
+      }
+
+      // Remove firmware, flash extra (dev_flash3), caches JIT/shader (cache/dev_hdd1)
+      // e dados de instalação/configuração (dev_hdd0/game, config, tmp, logs).
       final dirsToDelete = [
-        Directory('${systemDir.path}/rpcs3/dev_flash'),
-        Directory('${systemDir.path}/rpcs3/dev_flash2'),
+        Directory('${rpcs3Dir.path}/firmware'),
+        Directory('${rpcs3Dir.path}/dev_flash'),
+        Directory('${rpcs3Dir.path}/dev_flash2'),
+        Directory('${rpcs3Dir.path}/dev_flash3'),
+        Directory('${rpcs3Dir.path}/dev_hdd1'),
+        Directory('${rpcs3Dir.path}/cache'),
+        Directory('${rpcs3Dir.path}/tmp'),
+        Directory('${rpcs3Dir.path}/config'),
+        Directory('${rpcs3Dir.path}/logs'),
+        Directory('${rpcs3Dir.path}/Icons'),
+        Directory('${rpcs3Dir.path}/captures'),
+        Directory('${rpcs3Dir.path}/dev_hdd0/game'),
+        Directory('${rpcs3Dir.path}/dev_hdd0/tmp'),
       ];
       for (final d in dirsToDelete) {
         if (await d.exists()) {
           await d.delete(recursive: true);
+        }
+      }
+
+      // Se não restarem saves de jogos PS3 em dev_hdd0/home/*/savedata/,
+      // remove toda a pasta rpcs3/ para não deixar resíduos ocultos.
+      if (await rpcs3Dir.exists()) {
+        if (!await _hasPs3SaveFiles(rpcs3Dir)) {
+          await rpcs3Dir.delete(recursive: true);
+        } else {
+          await for (final entity in rpcs3Dir.list(followLinks: false)) {
+            if (entity is File) {
+              await _deleteIfExists(entity);
+            }
+          }
         }
       }
       return true;
@@ -730,22 +899,23 @@ class EmulatorService {
       final sourceFile = File(pickedPath);
       if (!await sourceFile.exists()) return null;
       final len = await sourceFile.length();
-      if (len < 1024 * 1024) {
+      if (len < _minPs3FirmwareBytes) {
         throw StateError(
           'Arquivo inválido para PS3UPDAT.PUP (tamanho inferior a 1 MB). Selecione o firmware oficial PS3UPDAT.PUP.',
         );
       }
 
       final systemDir = await getApplicationSupportDirectory();
-      final rpcs3Dir = Directory('${systemDir.path}/rpcs3');
-      if (!await rpcs3Dir.exists()) {
-        await rpcs3Dir.create(recursive: true);
+      final firmwareDir = Directory('${systemDir.path}/rpcs3/firmware');
+      if (!await firmwareDir.exists()) {
+        await firmwareDir.create(recursive: true);
       }
-      final targetRoot = File('${systemDir.path}/PS3UPDAT.PUP');
-      final targetRpcs3 = File('${rpcs3Dir.path}/PS3UPDAT.PUP');
-      await sourceFile.copy(targetRoot.path);
-      await sourceFile.copy(targetRpcs3.path);
-      return targetRoot.path;
+      final canonicalPup = File('${firmwareDir.path}/PS3UPDAT.PUP');
+      await sourceFile.copy(canonicalPup.path);
+      // Remove possíveis cópias legadas para evitar uso dobrado de armazenamento
+      await _deleteIfExists(File('${systemDir.path}/PS3UPDAT.PUP'));
+      await _deleteIfExists(File('${systemDir.path}/rpcs3/PS3UPDAT.PUP'));
+      return canonicalPup.path;
     } finally {
       await cleanFilePickerTempCache(pickedPath: pickedPath);
     }
@@ -778,7 +948,8 @@ class EmulatorService {
     final lowerPlatform = platformSlug.toLowerCase();
 
     if (coreSoName == 'rpcs3_libretro_android.so' || lowerPlatform == 'ps3') {
-      final hasPup = await hasPs3Firmware();
+      final hasPup = await _ensureCanonicalPs3FirmwareLayout(systemDir) ||
+          await hasPs3Firmware();
       if (!hasPup) {
         throw StateError(
           'Firmware de PS3 (PS3UPDAT.PUP) não encontrada. Vá em Configurações > Drivers, Firmware & Saves e importe o arquivo PS3UPDAT.PUP antes de iniciar.',
@@ -823,7 +994,7 @@ CPUCore = 1
 SeparateSASThread = True
 SeparateIOThread = True
 IOTimingMethod = 0
-FastMemory = False
+FastMemory = True
 LockedCPUSpeed = 0
 
 [Graphics]
@@ -858,31 +1029,41 @@ SoundSpeedHack = True
       }
     }
 
-    final textureId = await _methodChannel.invokeMethod<int>(
-      'startLibretroSession',
-      {
-        'platform': platformSlug,
-        'corePath': coreAbsolutePath,
-        'romPath': romPath,
-        'systemDir': systemDir.path,
-        'savesDir': savesDir.path,
-        'resolutionScale': resolutionScale,
-        'frameSkip': frameSkip,
-        'vsyncEnabled': vsyncEnabled,
-        'audioEnabled': audioEnabled,
-        'masterVolume': masterVolume,
-        'softwareRendering': softwareRendering,
-        'gpuBackend': gpuBackend,
-        'screenScale': screenScale,
-        'frameDup': frameDup,
-        'customDriverDir': customDriverDir,
-        'customDriverName': customDriverName,
-        'adrenoTurbo': adrenoTurbo,
-        'freedrenoPreset': freedrenoPreset,
-        if (singleTrigger != null) 'singleTrigger': singleTrigger,
-        'coreOptions': serializedCoreOptions,
-      },
-    );
+    final int? textureId;
+    try {
+      textureId = await _methodChannel.invokeMethod<int>(
+        'startLibretroSession',
+        {
+          'platform': platformSlug,
+          'corePath': coreAbsolutePath,
+          'romPath': romPath,
+          'systemDir': systemDir.path,
+          'savesDir': savesDir.path,
+          'resolutionScale': resolutionScale,
+          'frameSkip': frameSkip,
+          'vsyncEnabled': vsyncEnabled,
+          'audioEnabled': audioEnabled,
+          'masterVolume': masterVolume,
+          'softwareRendering': softwareRendering,
+          'gpuBackend': gpuBackend,
+          'screenScale': screenScale,
+          'frameDup': frameDup,
+          'customDriverDir': customDriverDir,
+          'customDriverName': customDriverName,
+          'adrenoTurbo': adrenoTurbo,
+          'freedrenoPreset': freedrenoPreset,
+          if (singleTrigger != null) 'singleTrigger': singleTrigger,
+          'coreOptions': serializedCoreOptions,
+        },
+      );
+    } on PlatformException catch (e) {
+      final msg = e.message?.trim();
+      throw StateError(
+        (msg != null && msg.isNotEmpty)
+            ? msg
+            : 'Falha ao carregar motor ou ROM no núcleo selecionado.',
+      );
+    }
 
     if (textureId == null) {
       throw StateError('Falha ao alocar Texture para a sessão do emulador.');
@@ -1160,6 +1341,68 @@ SoundSpeedHack = True
         '[EmulatorService] MethodChannel "requestNotificationPermission" falhou: $e',
       );
       return false;
+    }
+  }
+
+  /// Verifica se o app possui permissão de acesso direto a arquivos locais
+  /// (`MANAGE_EXTERNAL_STORAGE` no Android 11+ ou `READ_EXTERNAL_STORAGE` até Android 10).
+  static Future<bool> hasDirectStorageAccess() async {
+    try {
+      final granted = await _methodChannel.invokeMethod<bool>(
+        'hasDirectStorageAccess',
+      );
+      return granted ?? false;
+    } on MissingPluginException {
+      return true;
+    } catch (e) {
+      debugPrint(
+        '[EmulatorService] MethodChannel "hasDirectStorageAccess" falhou: $e',
+      );
+      return false;
+    }
+  }
+
+  /// Solicita acesso direto aos arquivos locais para rodar ISOs sem copiar/duplicar.
+  static Future<bool> requestDirectStorageAccess() async {
+    try {
+      final granted = await _methodChannel.invokeMethod<bool>(
+        'requestDirectStorageAccess',
+      );
+      return granted ?? false;
+    } on MissingPluginException {
+      return true;
+    } catch (e) {
+      debugPrint(
+        '[EmulatorService] MethodChannel "requestDirectStorageAccess" falhou: $e',
+      );
+      return false;
+    }
+  }
+
+  /// Seleciona uma ROM/ISO via seletor nativo do sistema (`ACTION_OPEN_DOCUMENT`)
+  /// resolvendo o caminho direto no armazenamento, sem copiar para o cache do app.
+  static Future<
+      ({String path, String uri, String name, int sizeBytes, bool isDirect})?>
+      pickExternalRomDirect() async {
+    try {
+      final res = await _methodChannel.invokeMapMethod<String, dynamic>(
+        'pickExternalRomFile',
+      );
+      if (res == null) return null;
+      return (
+        path: (res['path'] as String? ?? '').trim(),
+        uri: (res['uri'] as String? ?? '').trim(),
+        name: (res['name'] as String? ?? '').trim(),
+        sizeBytes: (res['sizeBytes'] as num?)?.toInt() ?? 0,
+        isDirect: res['isDirect'] as bool? ?? false,
+      );
+    } on MissingPluginException {
+      return null;
+    } catch (e) {
+      debugPrint(
+        '[EmulatorService] MethodChannel "pickExternalRomFile" falhou: $e',
+      );
+      return null;
     }
   }
 

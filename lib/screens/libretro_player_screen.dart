@@ -440,6 +440,26 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
     }
   }
 
+  static bool _isGamepadLogicalKey(LogicalKeyboardKey key) =>
+      key == LogicalKeyboardKey.gameButtonA ||
+      key == LogicalKeyboardKey.gameButtonB ||
+      key == LogicalKeyboardKey.gameButtonX ||
+      key == LogicalKeyboardKey.gameButtonY ||
+      key == LogicalKeyboardKey.gameButtonC ||
+      key == LogicalKeyboardKey.gameButtonZ ||
+      key == LogicalKeyboardKey.gameButtonLeft1 ||
+      key == LogicalKeyboardKey.gameButtonLeft2 ||
+      key == LogicalKeyboardKey.gameButtonRight1 ||
+      key == LogicalKeyboardKey.gameButtonRight2 ||
+      key == LogicalKeyboardKey.gameButtonStart ||
+      key == LogicalKeyboardKey.gameButtonSelect ||
+      key == LogicalKeyboardKey.gameButtonThumbLeft ||
+      key == LogicalKeyboardKey.gameButtonThumbRight ||
+      key == LogicalKeyboardKey.gameButton1 ||
+      key == LogicalKeyboardKey.gameButton2 ||
+      key == LogicalKeyboardKey.gameButton3 ||
+      key == LogicalKeyboardKey.gameButton4;
+
   KeyEventResult _handlePlayerKeyEvent(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
       return KeyEventResult.ignored;
@@ -450,6 +470,12 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
         _handleNativeGamepadUiAction(const {'action': 'guide'});
       }
       return KeyEventResult.handled;
+    }
+    if (!_isSidebarOpen && !_isExitDialogOpen && _isGamepadLogicalKey(key)) {
+      if (!_hardwareGamepadNotifier.value) {
+        _hardwareGamepadNotifier.value = true;
+      }
+      return KeyEventResult.ignored;
     }
     if (!_isSidebarOpen || _isExitDialogOpen) {
       return KeyEventResult.ignored;
@@ -555,7 +581,17 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
     if (!mounted) return;
 
     _telemetrySub = widget.emulatorService.telemetryStream.listen((evt) {
-      if (!mounted || _isSidebarOpen) return;
+      if (!mounted) return;
+      if (!evt.hasRenderedFrame && (evt.coreFatal || evt.coreShutdown)) {
+        final msg = evt.coreError?.trim();
+        setState(() {
+          _errorMessage = (msg != null && msg.isNotEmpty)
+              ? msg
+              : 'O núcleo encerrou a execução antes de exibir vídeo.';
+        });
+        return;
+      }
+      if (_isSidebarOpen) return;
       _telemetryNotifier.value = evt;
       if (evt.frameWidth > 0 && evt.frameHeight > 0) {
         final nextRatio = evt.frameWidth / evt.frameHeight;
@@ -586,9 +622,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
         adrenoTurbo: _settings.adrenoTurboMode,
         freedrenoPreset: _settings.freedrenoPreset.envValue,
         singleTrigger: _shouldUseSingleShoulderTriggers(_settings),
-        coreOptions: widget.game.platformSlug.toLowerCase() == 'psp'
-            ? _settings.libretroCoreOptions
-            : null,
+        coreOptions: _settings.libretroCoreOptions,
         onCoreDownloadProgress: (p) {
           if (mounted) {
             _coreDownloadProgressNotifier.value = p;
@@ -688,6 +722,82 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
     }
   }
 
+  static const Set<String> _smoothed3dPlatforms = {
+    'ps2',
+    'ps3',
+    'playstation3',
+    'playstation-3',
+    'psp',
+    'dc',
+    'dreamcast',
+    'gc',
+    'gamecube',
+    'wii',
+    '3ds',
+  };
+
+  FilterQuality _resolveTextureFilterQuality(AppSettings settings) {
+    if (settings.videoFilter == VideoFilterPreset.smoothBilinear) {
+      return FilterQuality.medium;
+    }
+    final slug = widget.game.platformSlug.trim().toLowerCase();
+    if (settings.videoFilter == VideoFilterPreset.sharpPixels &&
+        _smoothed3dPlatforms.contains(slug)) {
+      return FilterQuality.medium;
+    }
+    return FilterQuality.none;
+  }
+
+  Widget _buildExitDialogAction({
+    required String label,
+    required IconData icon,
+    required Color accentColor,
+    required Color backgroundColor,
+    required Color borderColor,
+    required VoidCallback onTap,
+  }) {
+    return Semantics(
+      button: true,
+      label: label,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(9),
+          onTap: onTap,
+          child: Ink(
+            height: 38,
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            decoration: BoxDecoration(
+              color: backgroundColor,
+              borderRadius: BorderRadius.circular(9),
+              border: Border.all(color: borderColor, width: 1),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(icon, size: 15, color: accentColor),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                      color: accentColor,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Future<void> _confirmExitPlayer() async {
     if (_isExitDialogOpen || !mounted) return;
     _isExitDialogOpen = true;
@@ -701,6 +811,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
       choice = await showDialog<String>(
         context: context,
         barrierDismissible: true,
+        barrierColor: Colors.black.withOpacity(0.62),
         builder: (ctx) {
           _exitDialogContext = ctx;
           return Focus(
@@ -709,105 +820,124 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
               event,
               onBack: () => Navigator.of(ctx).maybePop('cancel'),
             ),
-            child: AlertDialog(
-            backgroundColor: HydraTokens.bgNearBlack,
-            shape: HydraTokens.dialogShape,
-            title: const Text(
-              'Encerrar partida?',
-              style: TextStyle(
-                fontFamily: 'ReadexPro',
-                fontSize: 16,
-                fontWeight: FontWeight.w700,
-                color: HydraTokens.textPrimary,
+            child: Dialog(
+              backgroundColor: HydraTokens.bgNearBlack,
+              elevation: 0,
+              insetPadding: const EdgeInsets.symmetric(
+                horizontal: 20,
+                vertical: 12,
               ),
-            ),
-            content: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 420),
-              child: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Deseja salvar no Quick Save antes de voltar para a biblioteca?',
-                      style: TextStyle(
-                        fontFamily: 'Rubik',
-                        fontSize: 13,
-                        height: 1.4,
-                        color: HydraTokens.textSecondary,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+                side: const BorderSide(
+                  color: HydraTokens.borderSubtle10,
+                  width: 1,
+                ),
+              ),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 296),
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(14, 13, 14, 10),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Row(
+                        children: [
+                          Icon(
+                            Icons.power_settings_new_rounded,
+                            size: 16,
+                            color: HydraTokens.textSecondary,
+                          ),
+                          SizedBox(width: 7),
+                          Expanded(
+                            child: Text(
+                              'Encerrar partida?',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontFamily: 'ReadexPro',
+                                fontSize: 14.5,
+                                fontWeight: FontWeight.w700,
+                                color: HydraTokens.textPrimary,
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
-                    ),
-                    if (_settings.autoSaveOnExit) ...[
-                      const SizedBox(height: 10),
+                      const SizedBox(height: 5),
                       const Text(
-                        'Auto-save ao sair está ativado nas configurações.',
+                        'Deseja salvar no Quick Save antes de voltar para a biblioteca?',
                         style: TextStyle(
                           fontFamily: 'Rubik',
                           fontSize: 11.5,
+                          height: 1.35,
                           color: HydraTokens.textSecondary,
                         ),
                       ),
+                      if (_settings.autoSaveOnExit) ...[
+                        const SizedBox(height: 4),
+                        const Text(
+                          'Auto-save ao sair ativado.',
+                          style: TextStyle(
+                            fontFamily: 'Rubik',
+                            fontSize: 10.5,
+                            color: HydraTokens.primaryAurora,
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 12),
+                      _buildExitDialogAction(
+                        label: 'Salvar rápido e sair',
+                        icon: Icons.save_outlined,
+                        accentColor: HydraTokens.primaryAurora,
+                        backgroundColor:
+                            HydraTokens.primaryAurora.withOpacity(0.14),
+                        borderColor:
+                            HydraTokens.primaryAurora.withOpacity(0.45),
+                        onTap: () => Navigator.of(ctx).pop('save_and_exit'),
+                      ),
+                      const SizedBox(height: 6),
+                      _buildExitDialogAction(
+                        label: 'Sair sem salvar',
+                        icon: Icons.logout_rounded,
+                        accentColor: HydraTokens.accentDanger,
+                        backgroundColor:
+                            HydraTokens.accentDanger.withOpacity(0.10),
+                        borderColor:
+                            HydraTokens.accentDanger.withOpacity(0.35),
+                        onTap: () => Navigator.of(ctx).pop('exit_only'),
+                      ),
+                      const SizedBox(height: 4),
+                      Semantics(
+                        button: true,
+                        label: 'Cancelar',
+                        child: Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(8),
+                            onTap: () => Navigator.of(ctx).pop('cancel'),
+                            child: const SizedBox(
+                              height: 34,
+                              child: Center(
+                                child: Text(
+                                  'Cancelar',
+                                  style: TextStyle(
+                                    fontFamily: 'ReadexPro',
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    color: HydraTokens.textSecondary,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
                     ],
-                  ],
+                  ),
                 ),
               ),
-            ),
-            actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
-            actions: [
-              Wrap(
-                alignment: WrapAlignment.end,
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  TextButton(
-                    style: TextButton.styleFrom(
-                      minimumSize: const Size(48, 48),
-                      foregroundColor: HydraTokens.textSecondary,
-                    ),
-                    onPressed: () => Navigator.of(ctx).pop('cancel'),
-                    child: const Text(
-                      'Cancelar',
-                      style: TextStyle(
-                        fontFamily: 'ReadexPro',
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                  OutlinedButton(
-                    style: OutlinedButton.styleFrom(
-                      minimumSize: const Size(48, 48),
-                      foregroundColor: HydraTokens.accentDanger,
-                      side: BorderSide(
-                        color: HydraTokens.accentDanger.withOpacity(0.55),
-                      ),
-                    ),
-                    onPressed: () => Navigator.of(ctx).pop('exit_only'),
-                    child: const Text(
-                      'Sair sem salvar',
-                      style: TextStyle(
-                        fontFamily: 'ReadexPro',
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                  FilledButton(
-                    style: FilledButton.styleFrom(
-                      minimumSize: const Size(48, 48),
-                      backgroundColor: HydraTokens.primaryAurora,
-                      foregroundColor: HydraTokens.bgPureBlack,
-                    ),
-                    onPressed: () => Navigator.of(ctx).pop('save_and_exit'),
-                    child: const Text(
-                      'Salvar rápido e sair',
-                      style: TextStyle(
-                        fontFamily: 'ReadexPro',
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ],
             ),
           );
         },
@@ -990,10 +1120,8 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                     child: ValueListenableBuilder<AppSettings>(
                       valueListenable: _settingsNotifier,
                       builder: (_, settings, __) {
-                        final filterQuality = settings.videoFilter ==
-                                VideoFilterPreset.smoothBilinear
-                            ? FilterQuality.medium
-                            : FilterQuality.none;
+                        final filterQuality =
+                            _resolveTextureFilterQuality(settings);
                         return ValueListenableBuilder<double>(
                           valueListenable: _consoleAspectNotifier,
                           builder: (_, consoleAspect, __) {
@@ -1037,12 +1165,37 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                                     : Stack(
                                         fit: StackFit.expand,
                                         children: [
-                                          if (_textureId != null)
+                                          if (_textureId != null) ...[
                                             Texture(
                                               textureId: _textureId!,
                                               filterQuality: filterQuality,
-                                            )
-                                          else
+                                            ),
+                                            if (_errorMessage == null &&
+                                                !_isSidebarOpen)
+                                              ValueListenableBuilder<
+                                                  LibretroTelemetryEvent>(
+                                                valueListenable:
+                                                    _telemetryNotifier,
+                                                builder: (_, telemetry, __) {
+                                                  if (telemetry
+                                                      .hasRenderedFrame) {
+                                                    return const SizedBox
+                                                        .shrink();
+                                                  }
+                                                  return _CoreBootLoadingOverlay(
+                                                    platformName: widget
+                                                        .game.platformName,
+                                                    isPs3: widget.game
+                                                            .libretroCoreSoName ==
+                                                        'rpcs3_libretro_android.so',
+                                                    statusMessage:
+                                                        telemetry.coreError,
+                                                    startedAt:
+                                                        _sessionStartTime,
+                                                  );
+                                                },
+                                              ),
+                                          ] else
                                             _FallbackGameplayPreview(
                                               game: widget.game,
                                               resolutionLabel:
@@ -1085,14 +1238,24 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                         return ValueListenableBuilder<AppSettings>(
                           valueListenable: _settingsNotifier,
                           builder: (_, settings, __) {
-                            if (!_shouldShowTouchOverlayFor(
-                              settings,
-                              hardwareActive,
-                            )) {
+                            if (!_isDraggingGamepad &&
+                                !_shouldShowTouchOverlayFor(
+                                  settings,
+                                  hardwareActive,
+                                )) {
                               return const SizedBox.shrink();
                             }
                             final singleShoulders =
                                 _shouldUseSingleShoulderTriggers(settings);
+                            final shoulderVisualStyle =
+                                settings.effectiveShoulderStyle;
+                            final dpadVisualStyle = settings.effectiveDpadStyle;
+                            final stickVisualStyle =
+                                settings.effectiveStickStyle;
+                            final actionVisualStyle =
+                                settings.effectiveActionStyle;
+                            final selectStartVisualStyle =
+                                settings.effectiveSelectStartStyle;
                             return Stack(
                               fit: StackFit.expand,
                               children: [
@@ -1118,7 +1281,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                                     child: _ShoulderTriggerCluster(
                                       isLeft: true,
                                       style: settings.shoulderStyle,
-                                      buttonStyle: settings.buttonStyle,
+                                      buttonStyle: shoulderVisualStyle,
                                       spacing: settings.shoulderSpacing,
                                       singleTriggerOnly: singleShoulders,
                                       joypadMaskListenable: _joypadMaskNotifier,
@@ -1154,7 +1317,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                                     child: _ShoulderTriggerCluster(
                                       isLeft: false,
                                       style: settings.shoulderStyle,
-                                      buttonStyle: settings.buttonStyle,
+                                      buttonStyle: shoulderVisualStyle,
                                       spacing: settings.shoulderSpacing,
                                       singleTriggerOnly: singleShoulders,
                                       joypadMaskListenable: _joypadMaskNotifier,
@@ -1189,7 +1352,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                                     child: _DpadClusterWidget(
                                       joypadMaskListenable: _joypadMaskNotifier,
                                       spacing: settings.dpadSpacing,
-                                      buttonStyle: settings.buttonStyle,
+                                      buttonStyle: dpadVisualStyle,
                                       onDpadBitsChanged: _updateDpadBits,
                                     ),
                                   ),
@@ -1215,6 +1378,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                                     ),
                                     child: _VirtualAnalogStick(
                                       stickListenable: _stickVectorNotifier,
+                                      style: stickVisualStyle,
                                       enabled:
                                           !_isDraggingGamepad && !_isSidebarOpen,
                                       onStickChanged: _updateAnalogVector,
@@ -1243,7 +1407,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                                     child: _ActionButtonsClusterWidget(
                                       joypadMaskListenable: _joypadMaskNotifier,
                                       spacing: settings.actionSpacing,
-                                      buttonStyle: settings.buttonStyle,
+                                      buttonStyle: actionVisualStyle,
                                       onBitChanged: _updateButtonBit,
                                     ),
                                   ),
@@ -1275,7 +1439,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                                             watchMask: RetroJoypadMask.select,
                                             builder: (_, slice) =>
                                                 _SelectPillButton(
-                                              style: settings.buttonStyle,
+                                              style: selectStartVisualStyle,
                                               active: slice != 0,
                                               onChanged: (v) =>
                                                   _updateButtonBit(
@@ -1294,7 +1458,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                                             builder: (_, slice) =>
                                                 _PillGamepadButton(
                                               label: 'START',
-                                              style: settings.buttonStyle,
+                                              style: selectStartVisualStyle,
                                               active: slice != 0,
                                               onChanged: (v) =>
                                                   _updateButtonBit(
@@ -3066,69 +3230,112 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                               ),
                             ),
                         ],
-                        // Se for Shoulders, D-pad ou Ações: Estilo Visual dos Botões
-                        if (target == _GamepadEditTarget.shoulders ||
-                            target == _GamepadEditTarget.dpad ||
-                            target == _GamepadEditTarget.actions) ...[
-                          const SizedBox(height: 8),
-                          const Text(
-                            'Estilo dos Botões:',
-                            style: TextStyle(
-                              fontFamily: 'ReadexPro',
-                              fontSize: 11,
-                              fontWeight: FontWeight.w700,
-                              color: Colors.white,
-                            ),
+                        // Estilo Visual por Grupo (muda apenas este elemento; "global" redefine todos)
+                        const SizedBox(height: 8),
+                        Text(
+                          target == _GamepadEditTarget.global
+                              ? 'Estilo Geral dos Botões (todos os grupos):'
+                              : 'Estilo dos Botões (apenas este grupo):',
+                          style: const TextStyle(
+                            fontFamily: 'ReadexPro',
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
                           ),
-                          const SizedBox(height: 6),
-                          Wrap(
-                            spacing: 6,
-                            runSpacing: 6,
-                            children: GamepadButtonStyle.values.map((bs) {
-                              final active = settings.buttonStyle == bs;
-                              return Semantics(
-                                button: true,
-                                selected: active,
-                                label: 'Estilo ${bs.label}',
-                                child: Material(
-                                  color: active ? Colors.white : Colors.white12,
-                                  borderRadius: BorderRadius.circular(8),
-                                  child: InkWell(
+                        ),
+                        const SizedBox(height: 6),
+                        Builder(
+                          builder: (_) {
+                            final currentGroupStyle = switch (target) {
+                              _GamepadEditTarget.global => settings.buttonStyle,
+                              _GamepadEditTarget.shoulders =>
+                                settings.effectiveShoulderStyle,
+                              _GamepadEditTarget.dpad =>
+                                settings.effectiveDpadStyle,
+                              _GamepadEditTarget.stick =>
+                                settings.effectiveStickStyle,
+                              _GamepadEditTarget.actions =>
+                                settings.effectiveActionStyle,
+                              _GamepadEditTarget.selectStart =>
+                                settings.effectiveSelectStartStyle,
+                            };
+                            return Wrap(
+                              spacing: 6,
+                              runSpacing: 6,
+                              children: GamepadButtonStyle.values.map((bs) {
+                                final active = currentGroupStyle == bs;
+                                return Semantics(
+                                  button: true,
+                                  selected: active,
+                                  label: 'Estilo ${bs.label}',
+                                  child: Material(
+                                    color:
+                                        active ? Colors.white : Colors.white12,
                                     borderRadius: BorderRadius.circular(8),
-                                    onTap: () => _applyAndSaveSettings(
-                                      settings.copyWith(buttonStyle: bs),
-                                    ),
-                                    child: ConstrainedBox(
-                                      constraints: const BoxConstraints(
-                                        minWidth: 48,
-                                        minHeight: 48,
-                                      ),
-                                      child: Padding(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 12,
+                                    child: InkWell(
+                                      borderRadius: BorderRadius.circular(8),
+                                      onTap: () {
+                                        final next = switch (target) {
+                                          _GamepadEditTarget.global =>
+                                            settings.copyWith(
+                                              buttonStyle: bs,
+                                              clearElementButtonStyles: true,
+                                            ),
+                                          _GamepadEditTarget.shoulders =>
+                                            settings.copyWith(
+                                              shoulderButtonStyle: bs,
+                                            ),
+                                          _GamepadEditTarget.dpad =>
+                                            settings.copyWith(
+                                              dpadButtonStyle: bs,
+                                            ),
+                                          _GamepadEditTarget.stick =>
+                                            settings.copyWith(
+                                              stickButtonStyle: bs,
+                                            ),
+                                          _GamepadEditTarget.actions =>
+                                            settings.copyWith(
+                                              actionButtonStyle: bs,
+                                            ),
+                                          _GamepadEditTarget.selectStart =>
+                                            settings.copyWith(
+                                              selectStartButtonStyle: bs,
+                                            ),
+                                        };
+                                        _applyAndSaveSettings(next);
+                                      },
+                                      child: ConstrainedBox(
+                                        constraints: const BoxConstraints(
+                                          minWidth: 48,
+                                          minHeight: 48,
                                         ),
-                                        child: Center(
-                                          widthFactor: 1.0,
-                                          child: Text(
-                                            bs.label,
-                                            style: TextStyle(
-                                              fontFamily: 'ReadexPro',
-                                              fontSize: 10.5,
-                                              fontWeight: FontWeight.w700,
-                                              color: active
-                                                  ? Colors.black
-                                                  : Colors.white,
+                                        child: Padding(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 12,
+                                          ),
+                                          child: Center(
+                                            widthFactor: 1.0,
+                                            child: Text(
+                                              bs.label,
+                                              style: TextStyle(
+                                                fontFamily: 'ReadexPro',
+                                                fontSize: 10.5,
+                                                fontWeight: FontWeight.w700,
+                                                color: active
+                                                    ? Colors.black
+                                                    : Colors.white,
+                                              ),
                                             ),
                                           ),
                                         ),
                                       ),
                                     ),
                                   ),
-                                ),
-                              );
-                            }).toList(),
-                          ),
-                        ],
+                                );
+                              }).toList(),
+                            );
+                          },
+                        ),
                       ],
                     );
                   },
@@ -3738,11 +3945,41 @@ class _ShoulderTriggerCluster extends StatelessWidget {
           final secondActive = isLeft ? secondaryActive : primaryActive;
           final secondCb = isLeft ? onSecondaryChanged : onPrimaryChanged;
 
+          final isGlass = buttonStyle == GamepadButtonStyle.gamehubGlass;
+          final isMinimal = buttonStyle == GamepadButtonStyle.minimalOutline;
+
           return Container(
             decoration: BoxDecoration(
-              color: HydraTokens.bgNearBlack.withOpacity(0.76),
+              color: isGlass
+                  ? null
+                  : isMinimal
+                      ? Colors.transparent
+                      : HydraTokens.bgNearBlack.withOpacity(0.76),
+              gradient: isGlass
+                  ? const LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [Color(0xBD213452), Color(0xDC0B121F)],
+                    )
+                  : null,
               borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: Colors.white.withOpacity(0.22)),
+              border: Border.all(
+                color: isGlass
+                    ? HydraTokens.primaryAurora.withOpacity(0.58)
+                    : isMinimal
+                        ? Colors.white.withOpacity(0.58)
+                        : Colors.white.withOpacity(0.22),
+                width: isGlass || isMinimal ? 1.3 : 1.0,
+              ),
+              boxShadow: isGlass
+                  ? [
+                      BoxShadow(
+                        color: HydraTokens.primaryAurora.withOpacity(0.16),
+                        blurRadius: 8,
+                        offset: const Offset(0, 2),
+                      ),
+                    ]
+                  : null,
             ),
             padding: EdgeInsets.all(spacing.clamp(1.0, 8.0)),
             child: Row(
@@ -3750,6 +3987,7 @@ class _ShoulderTriggerCluster extends StatelessWidget {
               children: [
                 _CompactBumperSegment(
                   label: firstLabel,
+                  buttonStyle: buttonStyle,
                   active: firstActive,
                   isLeftSegment: true,
                   onChanged: firstCb,
@@ -3760,10 +3998,15 @@ class _ShoulderTriggerCluster extends StatelessWidget {
                   margin: EdgeInsets.symmetric(
                     horizontal: spacing.clamp(1.0, 8.0),
                   ),
-                  color: Colors.white.withOpacity(0.18),
+                  color: isGlass
+                      ? HydraTokens.primaryAurora.withOpacity(0.38)
+                      : isMinimal
+                          ? Colors.white.withOpacity(0.42)
+                          : Colors.white.withOpacity(0.18),
                 ),
                 _CompactBumperSegment(
                   label: secondLabel,
+                  buttonStyle: buttonStyle,
                   active: secondActive,
                   isLeftSegment: false,
                   onChanged: secondCb,
@@ -3820,20 +4063,26 @@ class _ShoulderTriggerCluster extends StatelessWidget {
 class _CompactBumperSegment extends StatelessWidget {
   const _CompactBumperSegment({
     required this.label,
+    required this.buttonStyle,
     required this.active,
     required this.isLeftSegment,
     required this.onChanged,
   });
 
   final String label;
+  final GamepadButtonStyle buttonStyle;
   final bool active;
   final bool isLeftSegment;
   final ValueChanged<bool> onChanged;
 
   @override
   Widget build(BuildContext context) {
+    final isGlass = buttonStyle == GamepadButtonStyle.gamehubGlass;
+    final isMinimal = buttonStyle == GamepadButtonStyle.minimalOutline;
+
     return Semantics(
       button: true,
+      excludeSemantics: true,
       label: 'Botão $label',
       child: Listener(
         onPointerDown: (_) => onChanged(true),
@@ -3843,7 +4092,17 @@ class _CompactBumperSegment extends StatelessWidget {
           duration: const Duration(milliseconds: 70),
           padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 9),
           decoration: BoxDecoration(
-            color: active ? Colors.white : Colors.white.withOpacity(0.06),
+            color: active
+                ? (isGlass
+                    ? HydraTokens.primaryAurora
+                    : isMinimal
+                        ? Colors.white.withOpacity(0.88)
+                        : Colors.white)
+                : isGlass
+                    ? HydraTokens.primaryAurora.withOpacity(0.08)
+                    : isMinimal
+                        ? Colors.transparent
+                        : Colors.white.withOpacity(0.06),
             borderRadius: BorderRadius.horizontal(
               left: Radius.circular(isLeftSegment ? 11 : 5),
               right: Radius.circular(isLeftSegment ? 5 : 11),
@@ -3854,7 +4113,7 @@ class _CompactBumperSegment extends StatelessWidget {
             style: TextStyle(
               fontFamily: 'ReadexPro',
               fontSize: 12,
-              fontWeight: FontWeight.w700,
+              fontWeight: isMinimal ? FontWeight.w500 : FontWeight.w700,
               color: active ? HydraTokens.bgPureBlack : HydraTokens.textPrimary,
             ),
           ),
@@ -3953,27 +4212,39 @@ class _DpadClusterWidgetState extends State<_DpadClusterWidget> {
             final isLeft = (slice & RetroJoypadMask.left) != 0;
             final isRight = (slice & RetroJoypadMask.right) != 0;
 
+            final isMinimal = widget.buttonStyle == GamepadButtonStyle.minimalOutline;
+            final isGlass = widget.buttonStyle == GamepadButtonStyle.gamehubGlass;
+
             return Stack(
               children: [
-                Center(
-                  child: Container(
-                    width: 44,
-                    height: 44,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: Colors.white.withOpacity(0.04),
-                      border: Border.all(
-                        color: Colors.white.withOpacity(0.12),
+                if (!isMinimal)
+                  Center(
+                    child: Container(
+                      width: isGlass ? 36 : 44,
+                      height: isGlass ? 36 : 44,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: isGlass
+                            ? HydraTokens.primaryAurora.withOpacity(0.08)
+                            : Colors.white.withOpacity(0.04),
+                        border: Border.all(
+                          color: isGlass
+                              ? HydraTokens.primaryAurora.withOpacity(0.32)
+                              : Colors.white.withOpacity(0.12),
+                        ),
                       ),
                     ),
                   ),
-                ),
                 Align(
                   alignment: Alignment.topCenter,
                   child: _TouchCircleButton(
                     semanticLabel: 'Direcional Cima',
                     icon: PhosphorIcons.caretUp(
-                      isUp ? PhosphorIconsStyle.fill : PhosphorIconsStyle.bold,
+                      isUp
+                          ? PhosphorIconsStyle.fill
+                          : isMinimal
+                              ? PhosphorIconsStyle.regular
+                              : PhosphorIconsStyle.bold,
                     ),
                     style: widget.buttonStyle,
                     active: isUp,
@@ -3987,7 +4258,9 @@ class _DpadClusterWidgetState extends State<_DpadClusterWidget> {
                     icon: PhosphorIcons.caretDown(
                       isDown
                           ? PhosphorIconsStyle.fill
-                          : PhosphorIconsStyle.bold,
+                          : isMinimal
+                              ? PhosphorIconsStyle.regular
+                              : PhosphorIconsStyle.bold,
                     ),
                     style: widget.buttonStyle,
                     active: isDown,
@@ -4001,7 +4274,9 @@ class _DpadClusterWidgetState extends State<_DpadClusterWidget> {
                     icon: PhosphorIcons.caretLeft(
                       isLeft
                           ? PhosphorIconsStyle.fill
-                          : PhosphorIconsStyle.bold,
+                          : isMinimal
+                              ? PhosphorIconsStyle.regular
+                              : PhosphorIconsStyle.bold,
                     ),
                     style: widget.buttonStyle,
                     active: isLeft,
@@ -4015,7 +4290,9 @@ class _DpadClusterWidgetState extends State<_DpadClusterWidget> {
                     icon: PhosphorIcons.caretRight(
                       isRight
                           ? PhosphorIconsStyle.fill
-                          : PhosphorIconsStyle.bold,
+                          : isMinimal
+                              ? PhosphorIconsStyle.regular
+                              : PhosphorIconsStyle.bold,
                     ),
                     style: widget.buttonStyle,
                     active: isRight,
@@ -4047,7 +4324,8 @@ class _ActionButtonsClusterWidget extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final dim = 148.0 + spacing * 1.6;
-    final useAbxyLabels = buttonStyle == GamepadButtonStyle.xboxAbxy;
+    final useAbxyLabels = buttonStyle != GamepadButtonStyle.playstation;
+    final isGlass = buttonStyle == GamepadButtonStyle.gamehubGlass;
 
     return SizedBox(
       width: dim,
@@ -4064,6 +4342,7 @@ class _ActionButtonsClusterWidget extends StatelessWidget {
                 return _TouchCircleButton(
                   semanticLabel: useAbxyLabels ? 'Botão Y' : 'Botão Triângulo',
                   textLabel: useAbxyLabels ? 'Y' : null,
+                  accentColor: isGlass ? const Color(0xFFFBBF24) : null,
                   icon: PhosphorIcons.triangle(
                     active ? PhosphorIconsStyle.fill : PhosphorIconsStyle.bold,
                   ),
@@ -4084,6 +4363,7 @@ class _ActionButtonsClusterWidget extends StatelessWidget {
                 return _TouchCircleButton(
                   semanticLabel: useAbxyLabels ? 'Botão A' : 'Botão Cruz',
                   textLabel: useAbxyLabels ? 'A' : null,
+                  accentColor: isGlass ? const Color(0xFF2DD4BF) : null,
                   icon: PhosphorIcons.x(PhosphorIconsStyle.bold),
                   style: buttonStyle,
                   active: active,
@@ -4102,6 +4382,7 @@ class _ActionButtonsClusterWidget extends StatelessWidget {
                 return _TouchCircleButton(
                   semanticLabel: useAbxyLabels ? 'Botão X' : 'Botão Quadrado',
                   textLabel: useAbxyLabels ? 'X' : null,
+                  accentColor: isGlass ? const Color(0xFF60A5FA) : null,
                   icon: PhosphorIcons.square(
                     active ? PhosphorIconsStyle.fill : PhosphorIconsStyle.bold,
                   ),
@@ -4122,6 +4403,7 @@ class _ActionButtonsClusterWidget extends StatelessWidget {
                 return _TouchCircleButton(
                   semanticLabel: useAbxyLabels ? 'Botão B' : 'Botão Círculo',
                   textLabel: useAbxyLabels ? 'B' : null,
+                  accentColor: isGlass ? const Color(0xFFF87171) : null,
                   icon: PhosphorIcons.circle(
                     active ? PhosphorIconsStyle.fill : PhosphorIconsStyle.bold,
                   ),
@@ -4297,14 +4579,97 @@ class _LcdGridPainter extends CustomPainter {
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
+BoxDecoration _gamepadSurfaceDecoration({
+  required GamepadButtonStyle style,
+  required bool active,
+  Color? accentColor,
+  double? roundedRadius,
+  double defaultDarkOpacity = 0.75,
+}) {
+  final accent = accentColor ?? HydraTokens.primaryAurora;
+  switch (style) {
+    case GamepadButtonStyle.gamehubGlass:
+      return BoxDecoration(
+        shape: roundedRadius == null ? BoxShape.circle : BoxShape.rectangle,
+        borderRadius:
+            roundedRadius != null ? BorderRadius.circular(roundedRadius) : null,
+        gradient: active
+            ? LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [accent, Color.lerp(accent, Colors.white, 0.25)!],
+              )
+            : const LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [Color(0xBD213452), Color(0xDC0B121F)],
+              ),
+        border: Border.all(
+          color: active ? Colors.white : accent.withOpacity(0.58),
+          width: active ? 1.5 : 1.35,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: accent.withOpacity(active ? 0.52 : 0.16),
+            blurRadius: active ? 14 : 8,
+            spreadRadius: active ? 1 : 0,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      );
+    case GamepadButtonStyle.minimalOutline:
+      return BoxDecoration(
+        shape: roundedRadius == null ? BoxShape.circle : BoxShape.rectangle,
+        borderRadius:
+            roundedRadius != null ? BorderRadius.circular(roundedRadius) : null,
+        color: active ? Colors.white.withOpacity(0.88) : Colors.transparent,
+        border: Border.all(
+          color: active ? Colors.white : Colors.white.withOpacity(0.58),
+          width: active ? 1.4 : 1.25,
+        ),
+      );
+    case GamepadButtonStyle.playstation:
+    case GamepadButtonStyle.xboxAbxy:
+      return BoxDecoration(
+        shape: roundedRadius == null ? BoxShape.circle : BoxShape.rectangle,
+        borderRadius:
+            roundedRadius != null ? BorderRadius.circular(roundedRadius) : null,
+        color: active
+            ? Colors.white
+            : HydraTokens.bgNearBlack.withOpacity(defaultDarkOpacity),
+        border: Border.all(
+          color: active ? Colors.white : Colors.white.withOpacity(0.22),
+        ),
+      );
+  }
+}
+
+Color _gamepadForegroundColor({
+  required GamepadButtonStyle style,
+  required bool active,
+  Color? accentColor,
+  Color fallbackIdle = HydraTokens.textPrimary,
+}) {
+  if (active) return HydraTokens.bgPureBlack;
+  if (style == GamepadButtonStyle.gamehubGlass && accentColor != null) {
+    return accentColor;
+  }
+  if (style == GamepadButtonStyle.minimalOutline) {
+    return Colors.white.withOpacity(0.90);
+  }
+  return fallbackIdle;
+}
+
 class _VirtualAnalogStick extends StatelessWidget {
   const _VirtualAnalogStick({
     required this.stickListenable,
+    this.style = GamepadButtonStyle.gamehubGlass,
     required this.enabled,
     required this.onStickChanged,
   });
 
   final ValueListenable<Offset> stickListenable;
+  final GamepadButtonStyle style;
   final bool enabled;
   final void Function(double x, double y) onStickChanged;
 
@@ -4312,6 +4677,8 @@ class _VirtualAnalogStick extends StatelessWidget {
   Widget build(BuildContext context) {
     const double size = 102.0;
     const double maxRadius = 33.0;
+    final isMinimal = style == GamepadButtonStyle.minimalOutline;
+    final isGlass = style == GamepadButtonStyle.gamehubGlass;
 
     return Semantics(
       label: 'Alavanca analógica virtual',
@@ -4334,8 +4701,32 @@ class _VirtualAnalogStick extends StatelessWidget {
           height: size,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
-            color: HydraTokens.bgNearBlack.withOpacity(0.68),
-            border: Border.all(color: Colors.white.withOpacity(0.22)),
+            color: isGlass
+                ? null
+                : isMinimal
+                    ? Colors.transparent
+                    : HydraTokens.bgNearBlack.withOpacity(0.68),
+            gradient: isGlass
+                ? const RadialGradient(
+                    colors: [Color(0x991E304A), Color(0xCC0B121F)],
+                  )
+                : null,
+            border: Border.all(
+              color: isGlass
+                  ? HydraTokens.primaryAurora.withOpacity(0.52)
+                  : isMinimal
+                      ? Colors.white.withOpacity(0.48)
+                      : Colors.white.withOpacity(0.22),
+              width: isGlass || isMinimal ? 1.25 : 1.0,
+            ),
+            boxShadow: isGlass
+                ? [
+                    BoxShadow(
+                      color: HydraTokens.primaryAurora.withOpacity(0.14),
+                      blurRadius: 10,
+                    ),
+                  ]
+                : null,
           ),
           child: Center(
             child: RepaintBoundary(
@@ -4353,11 +4744,72 @@ class _VirtualAnalogStick extends StatelessWidget {
                       height: 42,
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
-                        color: active ? Colors.white : HydraTokens.surfaceElevated2,
+                        color: isGlass
+                            ? null
+                            : isMinimal
+                                ? (active
+                                    ? Colors.white.withOpacity(0.88)
+                                    : Colors.transparent)
+                                : (active
+                                    ? Colors.white
+                                    : HydraTokens.surfaceElevated2),
+                        gradient: isGlass
+                            ? LinearGradient(
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                                colors: active
+                                    ? [
+                                        HydraTokens.primaryAurora,
+                                        Colors.white,
+                                      ]
+                                    : const [
+                                        Color(0xCC31486C),
+                                        Color(0xE6131D2F),
+                                      ],
+                              )
+                            : null,
                         border: Border.all(
-                          color: Colors.white.withOpacity(0.55),
+                          color: isGlass
+                              ? (active
+                                  ? Colors.white
+                                  : HydraTokens.primaryAurora.withOpacity(0.85))
+                              : isMinimal
+                                  ? Colors.white.withOpacity(active ? 1.0 : 0.72)
+                                  : Colors.white.withOpacity(0.55),
+                          width: isMinimal ? 1.4 : 1.15,
                         ),
                       ),
+                      child: isMinimal
+                          ? Center(
+                              child: Container(
+                                width: 6,
+                                height: 6,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: active
+                                      ? HydraTokens.bgPureBlack
+                                      : Colors.white.withOpacity(0.75),
+                                ),
+                              ),
+                            )
+                          : isGlass
+                              ? Center(
+                                  child: Container(
+                                    width: 14,
+                                    height: 14,
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      border: Border.all(
+                                        color: active
+                                            ? HydraTokens.bgPureBlack
+                                            : HydraTokens.primaryAurora
+                                                .withOpacity(0.75),
+                                        width: 1.4,
+                                      ),
+                                    ),
+                                  ),
+                                )
+                              : null,
                     ),
                   );
                 },
@@ -4377,6 +4829,7 @@ class _TouchCircleButton extends StatelessWidget {
     required this.active,
     required this.onChanged,
     this.textLabel,
+    this.accentColor,
     this.semanticLabel,
   });
 
@@ -4385,14 +4838,22 @@ class _TouchCircleButton extends StatelessWidget {
   final bool active;
   final ValueChanged<bool> onChanged;
   final String? textLabel;
+  final Color? accentColor;
   final String? semanticLabel;
 
   @override
   Widget build(BuildContext context) {
     final isMinimal = style == GamepadButtonStyle.minimalOutline;
+    final isGlass = style == GamepadButtonStyle.gamehubGlass;
+    final fg = _gamepadForegroundColor(
+      style: style,
+      active: active,
+      accentColor: accentColor,
+    );
 
     return Semantics(
       button: true,
+      excludeSemantics: true,
       label: semanticLabel ?? textLabel ?? 'Botão de controle',
       child: Listener(
         onPointerDown: (_) => onChanged(true),
@@ -4402,19 +4863,12 @@ class _TouchCircleButton extends StatelessWidget {
           duration: const Duration(milliseconds: 70),
           width: 50,
           height: 50,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: active
-                ? Colors.white
-                : isMinimal
-                    ? Colors.black.withOpacity(0.25)
-                    : HydraTokens.bgNearBlack.withOpacity(0.75),
-            border: Border.all(
-              color: active
-                  ? Colors.white
-                  : Colors.white.withOpacity(isMinimal ? 0.42 : 0.22),
-              width: isMinimal ? 1.4 : 1.0,
-            ),
+          decoration: _gamepadSurfaceDecoration(
+            style: style,
+            active: active,
+            accentColor: accentColor,
+            roundedRadius: isGlass ? 15.0 : null,
+            defaultDarkOpacity: 0.75,
           ),
           child: Center(
             child: textLabel != null
@@ -4422,19 +4876,16 @@ class _TouchCircleButton extends StatelessWidget {
                     textLabel!,
                     style: TextStyle(
                       fontFamily: 'ReadexPro',
-                      fontSize: 16,
-                      fontWeight: FontWeight.w700,
-                      color: active
-                          ? HydraTokens.bgPureBlack
-                          : HydraTokens.textPrimary,
+                      fontSize: isMinimal ? 14.5 : 16,
+                      fontWeight:
+                          isMinimal ? FontWeight.w500 : FontWeight.w700,
+                      color: fg,
                     ),
                   )
                 : PhosphorIcon(
                     icon,
-                    size: 19,
-                    color: active
-                        ? HydraTokens.bgPureBlack
-                        : HydraTokens.textPrimary,
+                    size: isMinimal ? 18 : 19,
+                    color: fg,
                   ),
           ),
         ),
@@ -4461,9 +4912,11 @@ class _PillGamepadButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isMinimal = style == GamepadButtonStyle.minimalOutline;
+    final fg = _gamepadForegroundColor(style: style, active: active);
 
     return Semantics(
       button: true,
+      excludeSemantics: true,
       label: 'Botão $label',
       child: Listener(
         onPointerDown: (_) => onChanged(true),
@@ -4475,25 +4928,20 @@ class _PillGamepadButton extends StatelessWidget {
             horizontal: largeSingleTrigger ? 22 : 13,
             vertical: largeSingleTrigger ? 10 : 6.5,
           ),
-          decoration: BoxDecoration(
-            color: active
-                ? Colors.white
-                : isMinimal
-                    ? Colors.black.withOpacity(0.25)
-                    : HydraTokens.bgNearBlack.withOpacity(0.72),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(
-              color: active ? Colors.white : Colors.white.withOpacity(0.22),
-            ),
+          decoration: _gamepadSurfaceDecoration(
+            style: style,
+            active: active,
+            roundedRadius: 16.0,
+            defaultDarkOpacity: 0.72,
           ),
           child: Text(
             label,
             style: TextStyle(
               fontFamily: 'ReadexPro',
               fontSize: largeSingleTrigger ? 13 : 10.5,
-              fontWeight: FontWeight.w700,
+              fontWeight: isMinimal ? FontWeight.w500 : FontWeight.w700,
               letterSpacing: 0.6,
-              color: active ? HydraTokens.bgPureBlack : HydraTokens.textPrimary,
+              color: fg,
             ),
           ),
         ),
@@ -4552,9 +5000,16 @@ class _SelectPillButtonState extends State<_SelectPillButton> {
   @override
   Widget build(BuildContext context) {
     final isMinimal = widget.style == GamepadButtonStyle.minimalOutline;
+    final pressed = widget.active || _isFastForwarding;
+    final fg = _gamepadForegroundColor(
+      style: widget.style,
+      active: pressed,
+      fallbackIdle: Colors.white,
+    );
 
     return Semantics(
       button: true,
+      excludeSemantics: true,
       label: 'Botão SELECT (segure para avanço rápido 2x)',
       child: Listener(
         onPointerDown: (_) => _onPointerDown(),
@@ -4563,38 +5018,121 @@ class _SelectPillButtonState extends State<_SelectPillButton> {
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 70),
           padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 6.5),
-          decoration: BoxDecoration(
-            color: _isFastForwarding
-                ? Colors.white
-                : widget.active
-                    ? Colors.white
-                    : isMinimal
-                        ? Colors.black.withOpacity(0.25)
-                        : HydraTokens.bgNearBlack.withOpacity(0.72),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(
-              color: _isFastForwarding
-                  ? Colors.white
-                  : widget.active
-                      ? Colors.white
-                      : isMinimal
-                          ? Colors.white.withOpacity(0.65)
-                          : Colors.white.withOpacity(0.22),
-              width: isMinimal || _isFastForwarding ? 1.5 : 1.0,
-            ),
+          decoration: _gamepadSurfaceDecoration(
+            style: widget.style,
+            active: pressed,
+            roundedRadius: 16.0,
+            defaultDarkOpacity: 0.72,
           ),
           child: Text(
             _isFastForwarding ? '2x FF' : 'SELECT',
             style: TextStyle(
               fontFamily: 'ReadexPro',
               fontSize: 10,
-              fontWeight: FontWeight.w700,
-              color: _isFastForwarding
-                  ? Colors.black
-                  : widget.active
-                      ? HydraTokens.bgPureBlack
-                      : Colors.white,
+              fontWeight: isMinimal ? FontWeight.w500 : FontWeight.w700,
+              color: fg,
             ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CoreBootLoadingOverlay extends StatelessWidget {
+  const _CoreBootLoadingOverlay({
+    required this.platformName,
+    required this.isPs3,
+    required this.startedAt,
+    this.statusMessage,
+  });
+
+  final String platformName;
+  final bool isPs3;
+  final DateTime startedAt;
+  final String? statusMessage;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: Center(
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 360),
+          margin: const EdgeInsets.symmetric(horizontal: 24),
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
+          decoration: BoxDecoration(
+            color: HydraTokens.bgNearBlack.withOpacity(0.86),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: HydraTokens.borderSubtle10,
+              width: 1,
+            ),
+          ),
+          child: StreamBuilder<int>(
+            stream: Stream<int>.periodic(
+              const Duration(seconds: 1),
+              (count) => count,
+            ),
+            builder: (context, _) {
+              final secs =
+                  DateTime.now().difference(startedAt).inSeconds.clamp(0, 9999);
+              final mm = (secs ~/ 60).toString().padLeft(2, '0');
+              final ss = (secs % 60).toString().padLeft(2, '0');
+              final detail = statusMessage?.trim();
+
+              return Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const SizedBox(
+                    width: 26,
+                    height: 26,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2.5,
+                      color: HydraTokens.primaryAurora,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    isPs3
+                        ? 'Compilando módulos e shaders do PS3 ($mm:$ss)'
+                        : 'Carregando $platformName ($mm:$ss)',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w600,
+                      color: HydraTokens.textPrimary,
+                    ),
+                  ),
+                  if (detail != null && detail.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      detail,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        fontFamily: 'JetBrainsMono',
+                        fontSize: 10.5,
+                        color: HydraTokens.primaryAurora,
+                      ),
+                    ),
+                  ] else if (isPs3) ...[
+                    const SizedBox(height: 6),
+                    const Text(
+                      'Na 1ª execução (ou após limpar cache), o RPCS3 compila LLVM PPU/SPU para ARM64 e pode levar 1–2 min. Próximas aberturas usam o cache.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontFamily: 'Rubik',
+                        fontSize: 11.5,
+                        height: 1.35,
+                        color: HydraTokens.textSecondary,
+                      ),
+                    ),
+                  ],
+                ],
+              );
+            },
           ),
         ),
       ),
