@@ -1407,7 +1407,9 @@ class _GameDetailSheetState extends State<GameDetailSheet> {
                                                 : game.directRomUrl
                                                         .startsWith('external://')
                                                     ? 'Importar Arquivo Local'
-                                                    : 'Baixar (${game.formattedSize})',
+                                                    : game.hasKnownSize
+                                                        ? 'Baixar (${game.formattedSize})'
+                                                        : 'Baixar ROM',
                                         style: const TextStyle(
                                           fontFamily: 'ReadexPro',
                                           fontSize: 13.5,

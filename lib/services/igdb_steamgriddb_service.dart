@@ -9,6 +9,7 @@
 import 'dart:io';
 import 'package:dio/dio.dart';
 import '../models/emulation_game.dart';
+import 'rom_download_service.dart';
 
 class IgdbSteamGridService {
   IgdbSteamGridService({
@@ -16,7 +17,8 @@ class IgdbSteamGridService {
     this.igdbClientId = const String.fromEnvironment('IGDB_CLIENT_ID'),
     this.igdbClientSecret = const String.fromEnvironment('IGDB_CLIENT_SECRET'),
     this.steamGridDbApiKey = const String.fromEnvironment('SGDB_API_KEY'),
-  }) : _dio = dio ??
+  })  : _hasCustomDio = dio != null,
+        _dio = dio ??
             Dio(
               BaseOptions(
                 connectTimeout: const Duration(seconds: 10),
@@ -24,6 +26,7 @@ class IgdbSteamGridService {
               ),
             );
 
+  final bool _hasCustomDio;
   final Dio _dio;
   final String igdbClientId;
   final String igdbClientSecret;
@@ -34,6 +37,9 @@ class IgdbSteamGridService {
 
   /// Cache em memória das respostas da RetroAPI (retroapi.konsumer.workers.dev)
   static final Map<String, List<EmulationGame>> _retroApiCache = {};
+
+  /// Limpa o cache em memória da RetroAPI (útil para isolamento em testes).
+  static void clearCacheForTesting() => _retroApiCache.clear();
 
   static const Set<String> _validRomExtensions = {
     '.gba',
@@ -92,7 +98,7 @@ class IgdbSteamGridService {
     int maxPerPlatform = 36,
     int offset = 0,
   }) async {
-    if (Platform.environment.containsKey('FLUTTER_TEST')) {
+    if (Platform.environment.containsKey('FLUTTER_TEST') && !_hasCustomDio) {
       return const [];
     }
     final slug = platformSlug.toLowerCase();
@@ -111,10 +117,9 @@ class IgdbSteamGridService {
       final data = res.data;
       if (data is! List) return const [];
 
-      final List<EmulationGame> preferred = [];
-      final List<EmulationGame> secondary = [];
-      final Set<String> seenBaseTitles = {};
-      const int maxCachePerPlatform = 800;
+      final Map<String, ({int score, bool preferred, EmulationGame item})>
+          bestByKey = {};
+      final minValidBytes = RomDownloadService.minBytesForPlatform(slug);
 
       for (final group in data) {
         if (group is! List) continue;
@@ -128,6 +133,10 @@ class IgdbSteamGridService {
               lowerName.contains('(demo') ||
               lowerName.contains('(sample') ||
               lowerName.contains('(pirate') ||
+              lowerName.contains('(trial') ||
+              lowerName.contains('(kiosk') ||
+              lowerName.contains('(taikenban') ||
+              lowerName.contains('(preview') ||
               lowerName.contains('[b]')) {
             continue;
           }
@@ -144,10 +153,34 @@ class IgdbSteamGridService {
           if (cleanDisplayTitle.isEmpty) continue;
 
           final dedupeKey = '${slug}_${cleanDisplayTitle.toLowerCase()}';
-          if (!seenBaseTitles.add(dedupeKey)) continue;
-
           final romName = (raw['rom_name'] as String?) ?? '$rawName.rom';
-          final sizeBytes = (raw['size'] as num?)?.toInt() ?? 4194304;
+          final rawSize = (raw['size'] as num?)?.toInt() ?? 0;
+          final sizeBytes = rawSize > 0 ? rawSize : 0;
+
+          final lowerRom = romName.toLowerCase();
+          final isCue = lowerRom.endsWith('.cue');
+          int score = 0;
+          if (sizeBytes >= minValidBytes && !isCue) {
+            score += 10000;
+          } else if (sizeBytes > 0 && !isCue) {
+            score += 2000;
+          }
+          if (rawName.contains('(USA')) {
+            score += 500;
+          } else if (rawName.contains('(World')) {
+            score += 400;
+          } else if (rawName.contains('(Europe')) {
+            score += 300;
+          } else if (!rawName.contains('(')) {
+            score += 200;
+          }
+          if (!isCue) score += 50;
+
+          final existing = bestByKey[dedupeKey];
+          if (existing != null && score <= existing.score) {
+            continue;
+          }
+
           final crc = ((raw['crc'] as String?) ?? '').toUpperCase();
           final developer = (raw['developer'] as String?) ??
               (raw['publisher'] as String?) ??
@@ -185,20 +218,19 @@ class IgdbSteamGridService {
                 'retroapi://$slug/${Uri.encodeComponent(romName)}',
           );
 
-          if (isPreferredRegion) {
-            preferred.add(item);
-            if (preferred.length >= maxCachePerPlatform) break;
-          } else if (secondary.length < maxCachePerPlatform ~/ 2) {
-            secondary.add(item);
-          }
+          bestByKey[dedupeKey] = (
+            score: score,
+            preferred: isPreferredRegion,
+            item: item,
+          );
         }
-        if (preferred.length >= maxCachePerPlatform) break;
       }
 
-      final remaining = (maxCachePerPlatform - preferred.length).clamp(0, maxCachePerPlatform);
-      final parsed = [
-        ...preferred,
-        ...secondary.take(remaining),
+      final parsed = <EmulationGame>[
+        for (final entry in bestByKey.values)
+          if (entry.preferred) entry.item,
+        for (final entry in bestByKey.values)
+          if (!entry.preferred) entry.item,
       ];
 
       _retroApiCache[slug] = parsed;
@@ -615,6 +647,100 @@ class IgdbSteamGridService {
     return _cachedIgdbAccessToken!;
   }
 
+  static String _canonicalPlatformSlug(String raw) {
+    final s = raw.trim().toLowerCase();
+    switch (s) {
+      case 'psx':
+        return 'ps1';
+      case 'genesis':
+        return 'md';
+      case 'arcade':
+        return 'mame';
+      default:
+        return s;
+    }
+  }
+
+  static bool _matchesPlatformFilter(EmulationGame g, String? platformFilter) {
+    if (platformFilter == null || platformFilter.toUpperCase() == 'TODOS') {
+      return true;
+    }
+    final target = _canonicalPlatformSlug(platformFilter);
+    return g.platformName.toUpperCase() == platformFilter.toUpperCase() ||
+        _canonicalPlatformSlug(g.platformSlug) == target;
+  }
+
+  static String _baseComparableTitle(String raw) {
+    final stripped = raw
+        .replaceAll(
+          RegExp(
+            r'^(?:ps[123]|psx|psp|wii|gc|gamecube|nds|3ds|gba|snes|nes|n64|dreamcast|saturn)\s*[-:|]\s*',
+            caseSensitive: false,
+          ),
+          '',
+        )
+        .replaceAll(RegExp(r'\([^)]*\)'), ' ')
+        .replaceAll(RegExp(r'\[[^\]]*\]'), ' ');
+    return EmulationGame.normalizeSearchText(stripped);
+  }
+
+  static bool _containsAllTokens(String haystack, List<String> tokens) {
+    if (haystack.isEmpty || tokens.isEmpty) return false;
+    final words = haystack.split(' ');
+    for (final t in tokens) {
+      final found = words.any((w) => w == t || w.startsWith(t)) ||
+          haystack.contains(t);
+      if (!found) return false;
+    }
+    return true;
+  }
+
+  static int _searchRelevanceScore(
+    EmulationGame g,
+    String normQuery,
+    List<String> queryTokens, {
+    int sourceBonus = 0,
+  }) {
+    if (normQuery.isEmpty) {
+      return 1 + sourceBonus + (g.hasKnownSize ? 10 : 0);
+    }
+    final normTitle = EmulationGame.normalizeSearchText(g.name);
+    final baseTitle = _baseComparableTitle(g.name);
+    final normCanonical = EmulationGame.normalizeSearchText(
+      g.canonicalNoIntroName,
+    );
+
+    int score = 0;
+    if (normTitle == normQuery || baseTitle == normQuery) {
+      score = 1000;
+    } else if (normTitle.startsWith(normQuery) ||
+        baseTitle.startsWith(normQuery)) {
+      score = 850;
+    } else if (normTitle.contains(normQuery) ||
+        baseTitle.contains(normQuery) ||
+        normCanonical.contains(normQuery)) {
+      score = 700;
+    } else if (queryTokens.isNotEmpty &&
+        (_containsAllTokens(normTitle, queryTokens) ||
+            _containsAllTokens(normCanonical, queryTokens))) {
+      score = 500;
+    } else {
+      final metaHaystack = EmulationGame.normalizeSearchText(
+        '${g.developer} ${g.platformName} ${g.fullConsoleName} ${g.genres.join(" ")}',
+      );
+      if (metaHaystack.contains(normQuery) ||
+          _containsAllTokens(metaHaystack, queryTokens)) {
+        score = 250;
+      }
+    }
+
+    if (score == 0) return 0;
+    score += sourceBonus;
+    if (g.hasKnownSize) score += 30;
+    if (g.region == 'USA') score += 10;
+    return score;
+  }
+
   /// Busca jogos combinando RomM Server, Catálogo Integrado Multi-Console,
   /// RetroAPI (`retroapi.konsumer.workers.dev`) e Internet Archive.
   Future<List<EmulationGame>> searchGames(
@@ -624,7 +750,45 @@ class IgdbSteamGridService {
     String rommApiToken = '',
   }) async {
     final sanitized = query.replaceAll('"', '').trim();
-    final List<EmulationGame> results = [];
+    final normQuery = EmulationGame.normalizeSearchText(sanitized);
+    final queryTokens =
+        normQuery.split(' ').where((t) => t.isNotEmpty).toList();
+
+    final Map<String, ({EmulationGame game, int score})> byKey = {};
+
+    void addOrMerge(EmulationGame candidate, {int sourceBonus = 0}) {
+      if (!_matchesPlatformFilter(candidate, platformFilter)) return;
+      final score = _searchRelevanceScore(
+        candidate,
+        normQuery,
+        queryTokens,
+        sourceBonus: sourceBonus,
+      );
+      if (score <= 0) return;
+
+      final baseTitle = _baseComparableTitle(candidate.name);
+      final key =
+          '${_canonicalPlatformSlug(candidate.platformSlug)}|${baseTitle.isNotEmpty ? baseTitle : EmulationGame.normalizeSearchText(candidate.name)}';
+
+      final existing = byKey[key];
+      if (existing == null) {
+        byKey[key] = (game: candidate, score: score);
+        return;
+      }
+
+      var merged = existing.game;
+      var bestScore = existing.score;
+      if (!merged.hasKnownSize && candidate.hasKnownSize) {
+        merged = merged.copyWith(
+          estimatedSizeBytes: candidate.estimatedSizeBytes,
+        );
+      } else if (score > existing.score &&
+          (candidate.hasKnownSize || !merged.hasKnownSize)) {
+        merged = candidate;
+        bestScore = score;
+      }
+      byKey[key] = (game: merged, score: bestScore);
+    }
 
     // 1. Servidor RomM próprio (se configurado)
     if (rommServerUrl.trim().isNotEmpty) {
@@ -634,64 +798,37 @@ class IgdbSteamGridService {
         platformSlug: platformFilter,
         searchTerm: sanitized,
       );
-      results.addAll(fromRomm);
-    }
-
-    // 2. Catálogo local + cache da RetroAPI
-    final q = sanitized.toLowerCase();
-    final allCached = <EmulationGame>[
-      ...kVerifiedRealGamesCatalog,
-      for (final list in _retroApiCache.values) ...list,
-    ];
-
-    for (final g in allCached) {
-      final matchesPlatform = platformFilter == null ||
-          platformFilter.toUpperCase() == 'TODOS' ||
-          g.platformName.toUpperCase() == platformFilter.toUpperCase() ||
-          g.platformSlug.toUpperCase() == platformFilter.toUpperCase();
-      if (!matchesPlatform) continue;
-      if (q.isNotEmpty) {
-        final matchesQuery = g.name.toLowerCase().contains(q) ||
-            g.developer.toLowerCase().contains(q) ||
-            g.platformName.toLowerCase().contains(q) ||
-            g.fullConsoleName.toLowerCase().contains(q) ||
-            g.genres.any((genre) => genre.toLowerCase().contains(q));
-        if (!matchesQuery) continue;
-      }
-      if (!results.any(
-        (r) =>
-            r.name.toLowerCase() == g.name.toLowerCase() &&
-            r.platformSlug == g.platformSlug,
-      )) {
-        results.add(g);
+      for (final g in fromRomm) {
+        addOrMerge(g, sourceBonus: 120);
       }
     }
 
-    // 3. Se uma plataforma específica estiver selecionada, busca mais jogos na RetroAPI ao vivo
-    if (platformFilter != null &&
-        platformFilter.toLowerCase() != 'todos' &&
-        !_retroApiCache.containsKey(platformFilter.toLowerCase())) {
-      final retroPlatformGames = await fetchFromRetroApiPlatform(
-        platformFilter.toLowerCase(),
-        maxPerPlatform: 48,
-      );
-      for (final g in retroPlatformGames) {
-        if (q.isEmpty ||
-            g.name.toLowerCase().contains(q) ||
-            g.developer.toLowerCase().contains(q)) {
-          if (!results.any(
-            (r) =>
-                r.name.toLowerCase() == g.name.toLowerCase() &&
-                r.platformSlug == g.platformSlug,
-          )) {
-            results.add(g);
-          }
-        }
+    // 2. Catálogo local + cache completo da RetroAPI
+    for (final g in kVerifiedRealGamesCatalog) {
+      addOrMerge(g, sourceBonus: 100);
+    }
+    for (final list in _retroApiCache.values) {
+      for (final g in list) {
+        addOrMerge(g, sourceBonus: 80);
+      }
+    }
+
+    // 3. Se uma plataforma específica estiver selecionada e ainda não estiver no cache,
+    // carrega toda a plataforma na RetroAPI e busca em todo o catálogo em cache
+    if (platformFilter != null && platformFilter.toLowerCase() != 'todos') {
+      final slug = platformFilter.toLowerCase();
+      if (!_retroApiCache.containsKey(slug)) {
+        await fetchFromRetroApiPlatform(slug, maxPerPlatform: 260);
+      }
+      final cachedPlatformGames = _retroApiCache[slug] ?? const [];
+      for (final g in cachedPlatformGames) {
+        addOrMerge(g, sourceBonus: 80);
       }
     }
 
     // 4. Se houver termo de busca, consulta também o Internet Archive desbloqueado
-    if (sanitized.isNotEmpty) {
+    if (sanitized.isNotEmpty &&
+        (!Platform.environment.containsKey('FLUTTER_TEST') || _hasCustomDio)) {
       if (igdbClientId.isNotEmpty && igdbClientSecret.isNotEmpty) {
         try {
           await _getIgdbBearerToken();
@@ -702,13 +839,21 @@ class IgdbSteamGridService {
         platformFilter: platformFilter,
       );
       for (final m in archiveMatches) {
-        if (!results.any((r) => r.name.toLowerCase() == m.name.toLowerCase())) {
-          results.add(m);
-        }
+        addOrMerge(m, sourceBonus: 0);
       }
     }
 
-    return Future.wait(results.map(enrichWithSteamGridDbArt));
+    final ranked = byKey.values.toList()
+      ..sort((a, b) {
+        final scoreCmp = b.score.compareTo(a.score);
+        if (scoreCmp != 0) return scoreCmp;
+        if (a.game.hasKnownSize != b.game.hasKnownSize) {
+          return a.game.hasKnownSize ? -1 : 1;
+        }
+        return a.game.name.compareTo(b.game.name);
+      });
+
+    return Future.wait(ranked.map((e) => enrichWithSteamGridDbArt(e.game)));
   }
 
   String? _archiveSearchHint(String? platformFilter) {
@@ -749,6 +894,9 @@ class IgdbSteamGridService {
     String query, {
     String? platformFilter,
   }) async {
+    if (Platform.environment.containsKey('FLUTTER_TEST') && !_hasCustomDio) {
+      return const [];
+    }
     try {
       final hint = _archiveSearchHint(platformFilter);
       final qStr = hint == null
@@ -794,54 +942,93 @@ class IgdbSteamGridService {
         }),
       );
 
+      final hasSpecificFilter =
+          platformFilter != null && platformFilter.toUpperCase() != 'TODOS';
+      final filterSlug =
+          hasSpecificFilter ? _canonicalPlatformSlug(platformFilter) : '';
+      final normQuery = EmulationGame.normalizeSearchText(query);
+      final queryTokens =
+          normQuery.split(' ').where((t) => t.isNotEmpty).toList();
+
       final List<EmulationGame> found = [];
       for (final entry in metaResponses) {
         if (entry == null) continue;
-        final files = (entry.data?['files'] as List<dynamic>?) ?? const [];
-
-        for (final f in files.whereType<Map<String, dynamic>>()) {
-          final fileName = (f['name'] as String?) ?? '';
-          final lower = fileName.toLowerCase();
-          final hasRomExt = _validRomExtensions.any(lower.endsWith);
-          if (!hasRomExt) continue;
-
-          final plat = _detectPlatformFromFileName(lower, entry.id);
-          if (platformFilter != null &&
-              platformFilter.toUpperCase() != 'TODOS' &&
-              plat.name.toUpperCase() != platformFilter.toUpperCase() &&
-              plat.slug.toUpperCase() != platformFilter.toUpperCase()) {
-            continue;
-          }
-
-          final sizeBytes = int.tryParse('${f['size'] ?? '0'}') ?? 0;
-          final crc = (f['crc32'] as String?)?.toUpperCase() ?? '';
-          final directUrl =
-              'https://archive.org/download/${entry.id}/${Uri.encodeComponent(fileName)}';
-
-          final cleanTitle = (entry.doc['title'] as String?) ??
-              fileName.replaceAll(RegExp(r'\.[a-zA-Z0-9]+$'), '');
-
-          found.add(
-            EmulationGame(
-              igdbId: entry.id.hashCode.abs(),
-              name: cleanTitle,
-              canonicalNoIntroName:
-                  fileName.replaceAll(RegExp(r'\.[a-zA-Z0-9]+$'), ''),
-              summary: (entry.doc['description']?.toString()) ??
-                  'Edição preservada compatível com o catálogo (${plat.name}).',
-              genres: const ['Retro', 'Console'],
-              developer: 'Lançamento Original',
-              releaseYear: int.tryParse('${entry.doc['year'] ?? ''}'),
-              rating: 88,
-              platformName: plat.name,
-              platformSlug: plat.slug,
-              directRomUrl: directUrl,
-              crc32: crc,
-              estimatedSizeBytes: sizeBytes,
-            ),
-          );
-          break;
+        final itemTitle = (entry.doc['title'] as String?)?.trim() ?? '';
+        if (RomDownloadService.isNonFullGameRelease(
+              itemTitle,
+              gameTitle: query,
+            ) ||
+            RomDownloadService.isNonFullGameRelease(
+              entry.id,
+              gameTitle: query,
+            )) {
+          continue;
         }
+
+        final fileMaps =
+            ((entry.data?['files'] as List<dynamic>?) ?? const [])
+                .whereType<Map<String, dynamic>>()
+                .toList();
+        if (fileMaps.isEmpty) continue;
+
+        final picked = _pickBestSearchFileForArchiveItem(
+          files: fileMaps,
+          entryId: entry.id,
+          itemTitle: itemTitle,
+          query: query,
+          normQuery: normQuery,
+          queryTokens: queryTokens,
+          filterSlug: hasSpecificFilter ? filterSlug : null,
+        );
+        if (picked == null) continue;
+
+        final encodedPath = picked.fileName
+            .split('/')
+            .map(Uri.encodeComponent)
+            .join('/');
+        final directUrl =
+            'https://archive.org/download/${entry.id}/$encodedPath';
+
+        final fileTitleClean = picked.fileName
+            .split('/')
+            .last
+            .replaceAll(RegExp(r'\.[^.]+$'), '')
+            .replaceAll(RegExp(r'\s*\([^)]*\)'), '')
+            .replaceAll(RegExp(r'\s*\[[^\]]*\]'), '')
+            .replaceAll('_', ' ')
+            .trim();
+
+        final looksLikeSeriesPack = RegExp(
+          r'\b(series|complete|romset|anthology|packs?)\b',
+          caseSensitive: false,
+        ).hasMatch(itemTitle);
+        final cleanTitle =
+            (looksLikeSeriesPack || itemTitle.isEmpty) &&
+                    fileTitleClean.isNotEmpty
+                ? fileTitleClean
+                : itemTitle;
+
+        found.add(
+          EmulationGame(
+            igdbId: entry.id.hashCode.abs(),
+            name: cleanTitle,
+            canonicalNoIntroName: picked.fileName
+                .split('/')
+                .last
+                .replaceAll(RegExp(r'\.[a-zA-Z0-9]+$'), ''),
+            summary: (entry.doc['description']?.toString()) ??
+                'Edição preservada compatível com o catálogo (${picked.platform.name}).',
+            genres: const ['Retro', 'Console'],
+            developer: 'Lançamento Original',
+            releaseYear: int.tryParse('${entry.doc['year'] ?? ''}'),
+            rating: 88,
+            platformName: picked.platform.name,
+            platformSlug: picked.platform.slug,
+            directRomUrl: directUrl,
+            crc32: picked.crc32,
+            estimatedSizeBytes: picked.sizeBytes,
+          ),
+        );
       }
       return found;
     } catch (_) {
@@ -849,11 +1036,178 @@ class IgdbSteamGridService {
     }
   }
 
-  ({String name, String slug}) _detectPlatformFromFileName(
+  ({
+    String fileName,
+    int sizeBytes,
+    String crc32,
+    ({String name, String slug}) platform,
+  })? _pickBestSearchFileForArchiveItem({
+    required List<Map<String, dynamic>> files,
+    required String entryId,
+    required String itemTitle,
+    required String query,
+    required String normQuery,
+    required List<String> queryTokens,
+    String? filterSlug,
+  }) {
+    if (filterSlug != null) {
+      final picked = RomDownloadService.pickBestArchiveFileEntry(
+        files: files,
+        platformSlug: filterSlug,
+        gameTitle: query,
+        requireTitleMatch: false,
+        requireNonZeroSize: true,
+        allowRawBinFallback: filterSlug == 'ps1' || filterSlug == 'saturn',
+        rejectBetaAndProto: true,
+        extraFileFilter: (fileName, sizeBytes) {
+          final detected = _detectPlatformFromFileName(
+            fileName.toLowerCase(),
+            entryId,
+            itemTitle: itemTitle,
+            sizeBytes: sizeBytes,
+          );
+          if (detected != null && detected.slug != filterSlug) {
+            return false;
+          }
+          return true;
+        },
+      );
+      if (picked == null) return null;
+      final spec = kRommPlatforms.cast<RommPlatformSpec?>().firstWhere(
+            (p) => _canonicalPlatformSlug(p!.slug) == filterSlug,
+            orElse: () => null,
+          );
+      final plat = spec != null
+          ? (name: spec.shortName, slug: spec.slug)
+          : _detectPlatformFromFileName(
+                picked.name.toLowerCase(),
+                entryId,
+                itemTitle: itemTitle,
+                sizeBytes: picked.sizeBytes,
+              );
+      if (plat == null) return null;
+      return (
+        fileName: picked.name,
+        sizeBytes: picked.sizeBytes,
+        crc32: picked.crc32,
+        platform: plat,
+      );
+    }
+
+    ({
+      String fileName,
+      int sizeBytes,
+      String crc32,
+      ({String name, String slug}) platform,
+    })? best;
+    int bestScore = -999999;
+
+    const discPlatforms = {
+      'ps1',
+      'psp',
+      'ps2',
+      'ps3',
+      'gamecube',
+      'wii',
+      'dreamcast',
+      'saturn',
+    };
+
+    for (final f in files) {
+      final fileName = (f['name'] as String?) ?? '';
+      if (fileName.isEmpty) continue;
+      final isPrivate = f['private'] == 'true' || f['private'] == true;
+      if (isPrivate) continue;
+      if (RomDownloadService.isJunkArchiveEntry(fileName, gameTitle: query) ||
+          RomDownloadService.isNonFullGameRelease(
+            fileName,
+            gameTitle: query,
+          )) {
+        continue;
+      }
+
+      final lower = fileName.toLowerCase();
+      if (!_validRomExtensions.any(lower.endsWith)) continue;
+
+      final sizeBytes = int.tryParse('${f['size'] ?? ''}') ?? 0;
+      if (sizeBytes <= 0) continue;
+
+      final plat = _detectPlatformFromFileName(
+        lower,
+        entryId,
+        itemTitle: itemTitle,
+        sizeBytes: sizeBytes,
+      );
+      if (plat == null) continue;
+
+      final minBytes = RomDownloadService.minBytesForPlatform(plat.slug);
+      if (sizeBytes < minBytes) continue;
+
+      final allowed = RomDownloadService.allowedExtensionsForPlatform(plat.slug);
+      final extAllowed = allowed.any(lower.endsWith) ||
+          ((plat.slug == 'ps1' || plat.slug == 'saturn') &&
+              lower.endsWith('.bin'));
+      if (!extAllowed) continue;
+
+      int score = 0;
+      final normFile = _baseComparableTitle(fileName.split('/').last);
+      if (normQuery.isNotEmpty && normFile.contains(normQuery)) {
+        score += 300;
+      } else if (queryTokens.isNotEmpty &&
+          _containsAllTokens(normFile, queryTokens)) {
+        score += 180;
+      }
+
+      if (lower.endsWith('.zip')) {
+        score += 50;
+      } else if (lower.endsWith('.bin')) {
+        score += 20;
+      } else {
+        score += 150;
+      }
+
+      if (lower.contains('(usa)') || lower.contains('(world)')) {
+        score += 120;
+      } else if (lower.contains('(europe)')) {
+        score += 90;
+      } else if (lower.contains('(japan)') &&
+          !query.toLowerCase().contains('japan')) {
+        score -= 150;
+      }
+
+      if (lower.contains('[t-') || lower.contains('hack')) {
+        score -= 120;
+      }
+
+      if (discPlatforms.contains(plat.slug) &&
+          sizeBytes >= 100 * 1024 * 1024) {
+        score += 100;
+      }
+      score += (sizeBytes / (100 * 1024 * 1024)).clamp(0, 30).round();
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = (
+          fileName: fileName,
+          sizeBytes: sizeBytes,
+          crc32: ((f['crc32'] as String?) ?? '').toUpperCase(),
+          platform: plat,
+        );
+      }
+    }
+    return best;
+  }
+
+  ({String name, String slug})? _detectPlatformFromFileName(
     String lowerFile,
-    String identifier,
-  ) {
-    final combined = '$lowerFile $identifier'.toLowerCase();
+    String identifier, {
+    String itemTitle = '',
+    int sizeBytes = 0,
+  }) {
+    final fileAndId = '$lowerFile $identifier'.toLowerCase();
+    final combined = '$fileAndId $itemTitle'.toLowerCase();
+    final allowHandheldSize = sizeBytes <= 0 || sizeBytes <= 32 * 1024 * 1024;
+
     if (lowerFile.endsWith('.nsp') ||
         lowerFile.endsWith('.xci') ||
         lowerFile.endsWith('.nsz') ||
@@ -863,26 +1217,6 @@ class IgdbSteamGridService {
         combined.contains('nintendo switch') ||
         RegExp(r'\bswitch\b').hasMatch(combined)) {
       return (name: 'SWITCH', slug: 'switch');
-    }
-    if (lowerFile.endsWith('.gbc') || combined.contains('game boy color')) {
-      return (name: 'GBC', slug: 'gbc');
-    }
-    if (lowerFile.endsWith('.gba') || RegExp(r'\bgba\b').hasMatch(combined)) {
-      return (name: 'GBA', slug: 'gba');
-    }
-    if (lowerFile.endsWith('.gb') ||
-        (RegExp(r'\bgame[\s_-]?boy\b').hasMatch(combined) &&
-            !combined.contains('advance') &&
-            !combined.contains('color'))) {
-      return (name: 'GAME BOY', slug: 'gb');
-    }
-    if (lowerFile.endsWith('.sms') ||
-        combined.contains('master system') ||
-        combined.contains('mastersystem')) {
-      return (name: 'MASTER SYSTEM', slug: 'mastersystem');
-    }
-    if (lowerFile.endsWith('.gg') || combined.contains('game gear')) {
-      return (name: 'GAME GEAR', slug: 'gamegear');
     }
     if (lowerFile.endsWith('.3ds') ||
         lowerFile.endsWith('.cci') ||
@@ -900,14 +1234,6 @@ class IgdbSteamGridService {
     if (lowerFile.endsWith('.wbfs') || RegExp(r'\bwii\b').hasMatch(combined)) {
       return (name: 'WII', slug: 'wii');
     }
-    if (lowerFile.endsWith('.pce') ||
-        combined.contains('pc engine') ||
-        combined.contains('turbografx')) {
-      return (name: 'PC ENGINE', slug: 'pce');
-    }
-    if (combined.contains('saturn')) {
-      return (name: 'SATURN', slug: 'saturn');
-    }
     if (lowerFile.endsWith('.pkg') ||
         combined.contains('ps3') ||
         combined.contains('playstation 3')) {
@@ -916,19 +1242,56 @@ class IgdbSteamGridService {
     if (combined.contains('ps2') || combined.contains('playstation 2')) {
       return (name: 'PS2', slug: 'ps2');
     }
-    if (lowerFile.endsWith('.sfc') ||
-        lowerFile.endsWith('.smc') ||
-        combined.contains('snes')) {
-      return (name: 'SNES', slug: 'snes');
+    if (combined.contains('psp') ||
+        lowerFile.endsWith('.cso') ||
+        lowerFile.endsWith('.pbp')) {
+      return (name: 'PSP', slug: 'psp');
     }
-    if (lowerFile.endsWith('.nes') || RegExp(r'\bnes\b').hasMatch(combined)) {
-      return (name: 'NES', slug: 'nes');
+    if (combined.contains('saturn')) {
+      return (name: 'SATURN', slug: 'saturn');
+    }
+    if (combined.contains('dreamcast')) {
+      return (name: 'DREAMCAST', slug: 'dreamcast');
+    }
+    if (combined.contains('psx') ||
+        combined.contains('ps1') ||
+        combined.contains('playstation 1')) {
+      return (name: 'PS1', slug: 'ps1');
+    }
+    if (lowerFile.endsWith('.nds') || RegExp(r'\bnds\b').hasMatch(combined)) {
+      return (name: 'NDS', slug: 'nds');
     }
     if (lowerFile.endsWith('.z64') ||
         lowerFile.endsWith('.n64') ||
         lowerFile.endsWith('.v64') ||
         combined.contains('n64')) {
       return (name: 'N64', slug: 'n64');
+    }
+    if (lowerFile.endsWith('.gba') ||
+        (allowHandheldSize &&
+            (RegExp(r'\bgba\b').hasMatch(fileAndId) ||
+                combined.contains('game boy advance')))) {
+      return (name: 'GBA', slug: 'gba');
+    }
+    if (lowerFile.endsWith('.gbc') ||
+        (allowHandheldSize && combined.contains('game boy color'))) {
+      return (name: 'GBC', slug: 'gbc');
+    }
+    if (lowerFile.endsWith('.gb') ||
+        (allowHandheldSize &&
+            RegExp(r'\bgame[\s_-]?boy\b').hasMatch(combined) &&
+            !combined.contains('advance') &&
+            !combined.contains('color'))) {
+      return (name: 'GAME BOY', slug: 'gb');
+    }
+    if (lowerFile.endsWith('.sfc') ||
+        lowerFile.endsWith('.smc') ||
+        combined.contains('snes')) {
+      return (name: 'SNES', slug: 'snes');
+    }
+    if (lowerFile.endsWith('.nes') ||
+        (allowHandheldSize && RegExp(r'\bnes\b').hasMatch(combined))) {
+      return (name: 'NES', slug: 'nes');
     }
     if (lowerFile.endsWith('.md') ||
         lowerFile.endsWith('.gen') ||
@@ -937,23 +1300,36 @@ class IgdbSteamGridService {
         combined.contains('mega drive')) {
       return (name: 'MEGA DRIVE', slug: 'md');
     }
-    if (lowerFile.endsWith('.nds') || RegExp(r'\bnds\b').hasMatch(combined)) {
-      return (name: 'NDS', slug: 'nds');
+    if (lowerFile.endsWith('.sms') ||
+        combined.contains('master system') ||
+        combined.contains('mastersystem')) {
+      return (name: 'MASTER SYSTEM', slug: 'mastersystem');
     }
-    if (combined.contains('psp') ||
-        lowerFile.endsWith('.cso') ||
-        lowerFile.endsWith('.pbp')) {
-      return (name: 'PSP', slug: 'psp');
+    if (lowerFile.endsWith('.gg') || combined.contains('game gear')) {
+      return (name: 'GAME GEAR', slug: 'gamegear');
     }
-    if (combined.contains('dreamcast')) {
-      return (name: 'DREAMCAST', slug: 'dreamcast');
+    if (lowerFile.endsWith('.pce') ||
+        combined.contains('pc engine') ||
+        combined.contains('turbografx')) {
+      return (name: 'PC ENGINE', slug: 'pce');
     }
-    if (combined.contains('psx') ||
-        combined.contains('ps1') ||
-        lowerFile.endsWith('.chd')) {
+    if (lowerFile.endsWith('.chd')) {
+      return sizeBytes > 900 * 1024 * 1024
+          ? (name: 'PS2', slug: 'ps2')
+          : (name: 'PS1', slug: 'ps1');
+    }
+    if (lowerFile.endsWith('.iso')) {
+      if (sizeBytes > 900 * 1024 * 1024) {
+        return (name: 'PS2', slug: 'ps2');
+      }
+      if (sizeBytes >= 80 * 1024 * 1024) {
+        return (name: 'PS1', slug: 'ps1');
+      }
+    }
+    if (lowerFile.endsWith('.bin') && sizeBytes >= 64 * 1024 * 1024) {
       return (name: 'PS1', slug: 'ps1');
     }
-    return (name: 'GBA', slug: 'gba');
+    return null;
   }
 
   Future<EmulationGame> enrichWithSteamGridDbArt(EmulationGame game) async {

@@ -1,6 +1,8 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:archive/archive_io.dart';
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -9,6 +11,36 @@ import 'package:loopgamer/models/emulation_game.dart';
 import 'package:loopgamer/screens/settings_screen.dart';
 import 'package:loopgamer/services/igdb_steamgriddb_service.dart';
 import 'package:loopgamer/services/rom_download_service.dart';
+
+typedef _RouteResponder = ResponseBody Function(RequestOptions options);
+
+class _FakeHttpAdapter implements HttpClientAdapter {
+  _FakeHttpAdapter(this._responder);
+
+  final _RouteResponder _responder;
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    return _responder(options);
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
+
+ResponseBody _jsonBody(Object data, {int statusCode = 200}) {
+  return ResponseBody.fromString(
+    jsonEncode(data),
+    statusCode,
+    headers: {
+      Headers.contentTypeHeader: ['application/json; charset=utf-8'],
+    },
+  );
+}
 
 void main() {
   group('RomDownloadService validation & Archive selection', () {
@@ -394,5 +426,279 @@ void main() {
         expect(find.byType(ChoiceChip), findsNothing);
       },
     );
+  });
+
+  group('Game Size & Search Accuracy regressions', () {
+    setUp(IgdbSteamGridService.clearCacheForTesting);
+    tearDown(IgdbSteamGridService.clearCacheForTesting);
+
+    test('formattedSize never emits fake 4.2 MB when estimatedSizeBytes <= 0', () {
+      const unknownGame = EmulationGame(
+        igdbId: 1,
+        name: 'Castlevania: Lords of Shadow',
+        canonicalNoIntroName: 'Castlevania: Lords of Shadow (USA)',
+        summary: 'Action adventure',
+        genres: ['Action'],
+        developer: 'Konami',
+        releaseYear: 2010,
+        rating: 88,
+        platformName: 'PS3',
+        platformSlug: 'ps3',
+        directRomUrl: 'retroapi://ps3/Castlevania.iso',
+        estimatedSizeBytes: 0,
+      );
+      expect(unknownGame.hasKnownSize, isFalse);
+      expect(unknownGame.formattedSize, 'Tam. n/d');
+
+      const gigGame = EmulationGame(
+        igdbId: 2,
+        name: 'Naruto Shippuden: Kizuna Drive',
+        canonicalNoIntroName: 'Naruto Shippuden - Kizuna Drive (USA)',
+        summary: 'Action',
+        genres: ['Action'],
+        developer: 'Bandai Namco',
+        releaseYear: 2011,
+        rating: 86,
+        platformName: 'PSP',
+        platformSlug: 'psp',
+        directRomUrl: 'retroapi://psp/Naruto.iso',
+        estimatedSizeBytes: 1177255936,
+      );
+      expect(gigGame.hasKnownSize, isTrue);
+      expect(gigGame.formattedSize, '1.10 GB');
+    });
+
+    test('RetroAPI prefers valid size over .cue null, keeps >800 titles, and omits fake 4.0 MB default', () async {
+      final ps2Filler = List<Map<String, dynamic>>.generate(
+        850,
+        (i) => {
+          'name': 'Filler Game $i (USA)',
+          'rom_name': 'Filler Game $i (USA).iso',
+          'size': 1500000000,
+        },
+      );
+      final dio = Dio();
+      dio.httpClientAdapter = _FakeHttpAdapter((options) {
+        final uri = options.uri.toString();
+        if (uri.contains('/api/psp/')) {
+          return _jsonBody([
+            [
+              {
+                'name': 'Naruto Shippuden - Kizuna Drive (USA) (En,Fr,Es)',
+                'rom_name':
+                    'Naruto Shippuden - Kizuna Drive (USA) (En,Fr,Es).iso',
+                'size': 1177255936,
+              },
+            ],
+          ]);
+        }
+        if (uri.contains('/api/ps2/')) {
+          return _jsonBody([
+            ps2Filler,
+            [
+              {
+                'name': 'Castlevania - Lament of Innocence (USA)',
+                'rom_name': 'Castlevania - Lament of Innocence (USA).cue',
+                'size': null,
+              },
+              {
+                'name': 'Castlevania - Lament of Innocence (USA)',
+                'rom_name': 'Castlevania - Lament of Innocence (USA).iso',
+                'size': 3027009536,
+              },
+              {
+                'name': 'Castlevania (Korea) (En,Ko)',
+                'rom_name': 'Castlevania (Korea) (En,Ko).iso',
+                'size': 3082682368,
+              },
+            ],
+          ]);
+        }
+        if (uri.contains('/api/gamecube/')) {
+          return _jsonBody([
+            [
+              {
+                'name': 'Naruto Clash of Ninja 2 (USA)',
+                'rom_name': 'Naruto Clash of Ninja 2 (USA).iso',
+                'size': null,
+              },
+            ],
+          ]);
+        }
+        return _jsonBody({'response': {'docs': []}});
+      });
+
+      final service = IgdbSteamGridService(dio: dio);
+
+      final pspGames = await service.fetchFromRetroApiPlatform('psp');
+      expect(pspGames.single.name, 'Naruto Shippuden: Kizuna Drive');
+      expect(pspGames.single.formattedSize, '1.10 GB');
+
+      final ps2All = await service.fetchFromRetroApiPlatform(
+        'ps2',
+        maxPerPlatform: 1000,
+      );
+      expect(ps2All.length, 852);
+      final lament = ps2All.firstWhere(
+        (g) => g.name == 'Castlevania: Lament of Innocence',
+      );
+      expect(lament.estimatedSizeBytes, 3027009536);
+      expect(lament.formattedSize, '2.82 GB');
+
+      final castlevaniaPs2 = ps2All.firstWhere((g) => g.name == 'Castlevania');
+      expect(castlevaniaPs2.estimatedSizeBytes, 3082682368);
+      expect(castlevaniaPs2.formattedSize, '2.87 GB');
+
+      final gcGames = await service.fetchFromRetroApiPlatform('gamecube');
+      expect(gcGames.single.estimatedSizeBytes, 0);
+      expect(gcGames.single.formattedSize, 'Tam. n/d');
+
+      // Searching without ':' matches RetroAPI PSP title & skips Archive demo
+      final searchNaruto = await service.searchGames(
+        'naruto shippuden kizuna drive',
+        platformFilter: 'PSP',
+      );
+      expect(searchNaruto, isNotEmpty);
+      expect(searchNaruto.first.name, 'Naruto Shippuden: Kizuna Drive');
+      expect(searchNaruto.first.formattedSize, '1.10 GB');
+    });
+
+    test('searchGames & Archive.org reject demos, updates, APKs, 0-byte ISOs and small cross-console packs', () async {
+      final dio = Dio();
+      dio.httpClientAdapter = _FakeHttpAdapter((options) {
+        final uri = options.uri.toString();
+        if (uri.contains('/api/')) {
+          return _jsonBody([]);
+        }
+        if (uri.contains('advancedsearch.php')) {
+          final q = options.queryParameters['q']?.toString() ?? '';
+          if (q.contains('kizuna')) {
+            return _jsonBody({
+              'response': {
+                'docs': [
+                  {
+                    'identifier': 'NPEH90049_Demo',
+                    'title': 'Naruto Shippuden Kizuna Drive Demo (PSP) (NPEH90049)',
+                  },
+                ],
+              },
+            });
+          }
+          return _jsonBody({
+            'response': {
+              'docs': [
+                {
+                  'identifier': 'PS3_NPUB31372_Updates',
+                  'title': 'PS3 Game Updates: Castlevania: Lords of Shadow 2',
+                },
+                {
+                  'identifier': 'jp.konami.epjCastlevania2',
+                  'title': 'Castlevania Symphony of the Night - Android',
+                },
+                {
+                  'identifier': 'ps2-essential-castlevania-lament-of-innocence',
+                  'title': 'PS2 - Castlevania Lament of Innocence',
+                },
+                {
+                  'identifier': 'castlevania-series-ch_202303',
+                  'title': 'Castlevania series',
+                },
+                {
+                  'identifier': 'ps2-essential-castlevania-curse-of-darkness',
+                  'title': 'PS2 - Castlevania Curse of Darkness',
+                },
+              ],
+            },
+          });
+        }
+        if (uri.endsWith('/metadata/NPEH90049_Demo')) {
+          return _jsonBody({
+            'files': [
+              {'name': 'EBOOT.PBP', 'size': '38056032', 'crc32': 'aaaaaaaa'},
+            ],
+          });
+        }
+        if (uri.endsWith('/metadata/PS3_NPUB31372_Updates')) {
+          return _jsonBody({
+            'files': [
+              {
+                'name': 'UP0101-NPUB31372_00-CLOS200000000000-A0101-V0100-PE.pkg',
+                'size': '24016544',
+                'crc32': 'bbbbbbbb',
+              },
+            ],
+          });
+        }
+        if (uri.endsWith('/metadata/jp.konami.epjCastlevania2')) {
+          return _jsonBody({
+            'files': [
+              {
+                'name': 'Castlevania Symphony of the Night/jp.konami.epjCastlevania2.zip',
+                'size': '230311071',
+                'crc32': 'cccccccc',
+              },
+            ],
+          });
+        }
+        if (uri.endsWith('/metadata/ps2-essential-castlevania-lament-of-innocence')) {
+          return _jsonBody({
+            'files': [
+              {
+                'name': 'Castlevania_Lament_of_Innocence.iso',
+                'size': '0',
+                'crc32': '00000000',
+              },
+            ],
+          });
+        }
+        if (uri.endsWith('/metadata/castlevania-series-ch_202303')) {
+          return _jsonBody({
+            'files': [
+              {
+                'name': '[Castlevania Aria of Sorrow][GBA].zip',
+                'size': '8648283',
+                'crc32': 'dddddddd',
+              },
+            ],
+          });
+        }
+        if (uri.endsWith('/metadata/ps2-essential-castlevania-curse-of-darkness')) {
+          return _jsonBody({
+            'files': [
+              {
+                'name': 'Castlevania Curse of Darkness (OST).zip',
+                'size': '8500000',
+                'crc32': '11111111',
+              },
+              {
+                'name': 'Castlevania_Curse_of_Darkness.iso',
+                'size': '3522396160',
+                'crc32': '22222222',
+              },
+            ],
+          });
+        }
+        return _jsonBody({});
+      });
+
+      final service = IgdbSteamGridService(dio: dio);
+
+      // 36 MB PSP Demo must be filtered out completely
+      final narutoArchiveOnly = await service.searchGames(
+        'naruto shippuden kizuna drive',
+        platformFilter: 'PSP',
+      );
+      expect(narutoArchiveOnly, isEmpty);
+
+      // Filtering PS2 Castlevania must ignore updates, Android, 0-byte ISO, 8 MB GBA pack & 8 MB OST
+      final ps2Castlevania = await service.searchGames(
+        'castlevania',
+        platformFilter: 'PS2',
+      );
+      expect(ps2Castlevania.length, 1);
+      expect(ps2Castlevania.single.name, 'PS2 - Castlevania Curse of Darkness');
+      expect(ps2Castlevania.single.estimatedSizeBytes, 3522396160);
+      expect(ps2Castlevania.single.formattedSize, '3.28 GB');
+    });
   });
 }

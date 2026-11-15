@@ -170,23 +170,25 @@ class RomDownloadService {
         'https://archive.org/download/neo-geo-mvs-romset/garou.zip',
   };
 
-  /// Tamanho mínimo razoável (bytes) para rejeitar scans de manual, patches e arquivos corrompidos.
+  /// Tamanho mínimo razoável (bytes) para rejeitar scans de manual, patches, updates e demos pequenas.
   static int minBytesForPlatform(String platformSlug) {
     switch (platformSlug.toLowerCase()) {
-      case 'ps1':
-      case 'psx':
-      case 'psp':
       case 'ps2':
       case 'ps3':
       case 'gamecube':
       case 'wii':
+        return 16 * 1024 * 1024; // 16 MB
+      case 'ps1':
+      case 'psx':
+      case 'psp':
       case 'dreamcast':
       case 'saturn':
+        return 8 * 1024 * 1024; // 8 MB
+      case '3ds':
         return 4 * 1024 * 1024; // 4 MB
       case 'n64':
         return 1024 * 1024; // 1 MB
       case 'nds':
-      case '3ds':
         return 512 * 1024; // 512 KB
       case 'gba':
         return 128 * 1024; // 128 KB
@@ -256,6 +258,46 @@ class RomDownloadService {
     }
   }
 
+  /// Indica se o título/identificador representa demo, update, DLC, trilha sonora
+  /// ou build de outra plataforma (Android/PC) que não é o jogo completo de console.
+  static bool isNonFullGameRelease(
+    String candidate, {
+    String gameTitle = '',
+    bool rejectBetaAndProto = true,
+  }) {
+    final lower = candidate.toLowerCase();
+    final base = lower.split('/').last;
+    final titleLower = gameTitle.toLowerCase();
+
+    final nonGameReleasePattern = RegExp(
+      rejectBetaAndProto
+          ? r'(?:^|[^a-z0-9])(demo|trial|kiosk|taikenban|preview|sample|proto|prototype|beta|updates?|dlc|map\s*pack|costume\s*pack|season\s*pass|soundtrack|ost|android|windows|win32|pc\s*version|pc\s*port|macos|linux|romset|fullset|1g1r)(?:$|[^a-z0-9])'
+          : r'(?:^|[^a-z0-9])(demo|trial|kiosk|taikenban|updates?|dlc|map\s*pack|costume\s*pack|season\s*pass|soundtrack|ost|android|windows|win32|pc\s*version|pc\s*port|macos|linux)(?:$|[^a-z0-9])',
+    );
+    final match = nonGameReleasePattern.firstMatch(lower);
+    if (match != null) {
+      final token = match.group(1) ?? '';
+      if (token.isNotEmpty && !titleLower.contains(token)) {
+        return true;
+      }
+    }
+
+    // Updates / DLC PS3 em PKG (ex: UP0101-NPUB31372_00-...-A0101-V0100-PE.pkg)
+    if (RegExp(r'^up\d{4}-[a-z0-9_-]+-pe\.pkg$').hasMatch(base) ||
+        RegExp(r'-a01\d{2}-v0\d{2,}').hasMatch(base)) {
+      return true;
+    }
+
+    // Pacotes Android por reverse-DNS (ex: jp.konami.epjCastlevania2)
+    if (RegExp(r'^(?:com|jp|net|org)\.[a-z0-9_]+\.[a-z0-9_]+').hasMatch(base) ||
+        RegExp(r'^(?:com|jp|net|org)\.[a-z0-9_]+\.[a-z0-9_]+')
+            .hasMatch(lower.trim())) {
+      return true;
+    }
+
+    return false;
+  }
+
   static bool isJunkArchiveEntry(String fileName, {String gameTitle = ''}) {
     final lower = fileName.toLowerCase();
     final base = lower.split('/').last;
@@ -287,6 +329,12 @@ class RomDownloadService {
       '.ips',
       '.bps',
       '.xdelta',
+      '.apk',
+      '.exe',
+      '.msi',
+      '.dmg',
+      '.bat',
+      '.sh',
     ];
     for (final s in junkSuffixes) {
       if (lower.endsWith(s)) return true;
@@ -303,11 +351,20 @@ class RomDownloadService {
       'guide',
       'walkthrough',
       'magazine',
+      'wallpaper',
+      'artbook',
     ];
     for (final kw in junkKeywords) {
       if (lower.contains(kw) && !titleLower.contains(kw)) {
         return true;
       }
+    }
+    if (isNonFullGameRelease(
+      fileName,
+      gameTitle: gameTitle,
+      rejectBetaAndProto: false,
+    )) {
+      return true;
     }
     return false;
   }
@@ -919,24 +976,29 @@ class RomDownloadService {
   static String _encodeArchivePath(String name) =>
       name.split('/').map(Uri.encodeComponent).join('/');
 
-  /// Seleciona o melhor arquivo Archive.org para a plataforma, exigindo tamanho mínimo,
-  /// extensão compatível e aderência ao nome do jogo (evita manuais `_jp2.zip`, patches e faixas soltas).
-  static String? pickBestArchiveFile({
+  /// Seleciona o melhor arquivo Archive.org para a plataforma, retornando nome,
+  /// tamanho em bytes e CRC32, exigindo tamanho mínimo, extensão compatível
+  /// e aderência ao título do jogo.
+  static ({String name, int sizeBytes, String crc32})? pickBestArchiveFileEntry({
     required List<Map<String, dynamic>> files,
     required String platformSlug,
     required String gameTitle,
     String canonicalName = '',
     bool requireTitleMatch = true,
+    bool requireNonZeroSize = false,
+    bool allowRawBinFallback = false,
+    bool rejectBetaAndProto = false,
+    bool Function(String fileName, int sizeBytes)? extraFileFilter,
   }) {
-    final allowedExts = allowedExtensionsForPlatform(platformSlug);
+    final baseAllowedExts = allowedExtensionsForPlatform(platformSlug);
+    final allowedExts = allowRawBinFallback && !baseAllowedExts.contains('.bin')
+        ? <String>[...baseAllowedExts, '.bin']
+        : baseAllowedExts;
     final minBytes = minBytesForPlatform(platformSlug);
-    final searchTarget =
-        canonicalName.isNotEmpty ? canonicalName : gameTitle;
-    final cleanTarget = searchTarget
-        .toLowerCase()
-        .replaceAll(RegExp(r'\([^)]*\)'), ' ')
-        .replaceAll(RegExp(r'[^a-z0-9]+'), ' ')
-        .trim();
+    final searchTarget = canonicalName.isNotEmpty ? canonicalName : gameTitle;
+    final cleanTarget = EmulationGame.normalizeSearchText(
+      searchTarget.replaceAll(RegExp(r'\([^)]*\)'), ' '),
+    );
     final tokens = cleanTarget
         .split(RegExp(r'\s+'))
         .where((t) => t.isNotEmpty)
@@ -946,7 +1008,7 @@ class RomDownloadService {
     final wordTokens = tokens.where((t) => t.length >= 3).toList();
     final compactTarget = cleanTarget.replaceAll(' ', '');
 
-    String? bestName;
+    ({String name, int sizeBytes, String crc32})? bestEntry;
     int bestScore = -999999;
 
     for (final f in files) {
@@ -955,22 +1017,30 @@ class RomDownloadService {
       final isPrivate = f['private'] == 'true' || f['private'] == true;
       if (isPrivate) continue;
       if (isJunkArchiveEntry(name, gameTitle: gameTitle)) continue;
+      if (rejectBetaAndProto &&
+          isNonFullGameRelease(name, gameTitle: gameTitle)) {
+        continue;
+      }
 
       final lower = name.toLowerCase();
       final extIdx = allowedExts.indexWhere(lower.endsWith);
       if (extIdx < 0) continue;
 
       final sizeVal = int.tryParse('${f['size'] ?? ''}') ?? 0;
+      if (requireNonZeroSize && sizeVal <= 0) continue;
       if (sizeVal > 0 && sizeVal < minBytes) continue;
+      if (extraFileFilter != null && !extraFileFilter(name, sizeVal)) {
+        continue;
+      }
 
-      final baseNoParens = lower
-          .split('/')
-          .last
-          .replaceAll(RegExp(r'\.[^.]+$'), '')
-          .replaceAll(RegExp(r'\([^)]*\)'), ' ')
-          .replaceAll(RegExp(r'\[[^\]]*\]'), ' ')
-          .replaceAll(RegExp(r'[^a-z0-9]+'), ' ')
-          .trim();
+      final baseNoParens = EmulationGame.normalizeSearchText(
+        lower
+            .split('/')
+            .last
+            .replaceAll(RegExp(r'\.[^.]+$'), '')
+            .replaceAll(RegExp(r'\([^)]*\)'), ' ')
+            .replaceAll(RegExp(r'\[[^\]]*\]'), ' '),
+      );
       final compactFile = baseNoParens.replaceAll(' ', '');
 
       if (requireTitleMatch) {
@@ -992,6 +1062,11 @@ class RomDownloadService {
 
       int score = (allowedExts.length - extIdx) * 100;
       if (compactFile == compactTarget) score += 250;
+      if (wordTokens.isNotEmpty &&
+          wordTokens.every(baseNoParens.contains) &&
+          numericTokens.every(baseNoParens.contains)) {
+        score += 120;
+      }
       if (lower.contains('(usa)') || lower.contains('(world)')) {
         score += 120;
       } else if (lower.contains('(europe)')) {
@@ -1000,18 +1075,46 @@ class RomDownloadService {
           !searchTarget.toLowerCase().contains('japan')) {
         score -= 220;
       }
-      if (lower.contains('[t-') || lower.contains('hack') || lower.contains('beta')) {
+      if (lower.contains('[t-') ||
+          lower.contains('hack') ||
+          lower.contains('beta')) {
         score -= 180;
       }
-      if (sizeVal == 0) score -= 30;
+      if (sizeVal == 0) {
+        score -= 30;
+      } else {
+        // Desempate discreto para preferir o arquivo principal maior (ex: ISO/Track 1 vs faixa extra pequena)
+        score += (sizeVal / (100 * 1024 * 1024)).clamp(0, 20).round();
+      }
 
       if (score > bestScore) {
         bestScore = score;
-        bestName = name;
+        bestEntry = (
+          name: name,
+          sizeBytes: sizeVal,
+          crc32: ((f['crc32'] as String?) ?? '').toUpperCase(),
+        );
       }
     }
-    return bestName;
+    return bestEntry;
   }
+
+  /// Seleciona o melhor arquivo Archive.org para a plataforma, exigindo tamanho mínimo,
+  /// extensão compatível e aderência ao nome do jogo (evita manuais `_jp2.zip`, patches e faixas soltas).
+  static String? pickBestArchiveFile({
+    required List<Map<String, dynamic>> files,
+    required String platformSlug,
+    required String gameTitle,
+    String canonicalName = '',
+    bool requireTitleMatch = true,
+  }) =>
+      pickBestArchiveFileEntry(
+        files: files,
+        platformSlug: platformSlug,
+        gameTitle: gameTitle,
+        canonicalName: canonicalName,
+        requireTitleMatch: requireTitleMatch,
+      )?.name;
 
   /// Extrai um arquivo `.zip` em streaming para [extractDir] preservando `.cue`/`.bin`
   /// e retorna o caminho da ROM principal válida para [platformSlug], ou `null`.
@@ -1209,13 +1312,15 @@ class RomDownloadService {
                 ((metaRes.data?['files'] as List<dynamic>?) ?? const [])
                     .whereType<Map<String, dynamic>>()
                     .toList();
-            final best = pickBestArchiveFile(
+            final best = pickBestArchiveFileEntry(
               files: files,
               platformSlug: game.platformSlug,
               gameTitle: game.name,
               canonicalName: game.canonicalNoIntroName,
               requireTitleMatch: false,
-            );
+              requireNonZeroSize: true,
+              rejectBetaAndProto: true,
+            )?.name;
             if (best != null) {
               return 'https://archive.org/download/$identifier/${_encodeArchivePath(best)}';
             }

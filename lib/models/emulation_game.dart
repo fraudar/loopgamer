@@ -648,8 +648,52 @@ class EmulationGame {
     return const Color(0xFF00F5A0);
   }
 
+  static const Map<String, String> _diacriticReplacements = {
+    'á': 'a',
+    'à': 'a',
+    'â': 'a',
+    'ã': 'a',
+    'ä': 'a',
+    'å': 'a',
+    'é': 'e',
+    'è': 'e',
+    'ê': 'e',
+    'ë': 'e',
+    'í': 'i',
+    'ì': 'i',
+    'î': 'i',
+    'ï': 'i',
+    'ó': 'o',
+    'ò': 'o',
+    'ô': 'o',
+    'õ': 'o',
+    'ö': 'o',
+    'ú': 'u',
+    'ù': 'u',
+    'û': 'u',
+    'ü': 'u',
+    'ç': 'c',
+    'ñ': 'n',
+  };
+
+  /// Normaliza títulos e consultas removendo pontuação e acentos para comparação consistente.
+  static String normalizeSearchText(String input) {
+    final lower = input.toLowerCase();
+    final buffer = StringBuffer();
+    for (final rune in lower.runes) {
+      final ch = String.fromCharCode(rune);
+      buffer.write(_diacriticReplacements[ch] ?? ch);
+    }
+    return buffer
+        .toString()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), ' ')
+        .trim();
+  }
+
+  bool get hasKnownSize => estimatedSizeBytes > 0;
+
   String get formattedSize {
-    if (estimatedSizeBytes <= 0) return '4.2 MB';
+    if (estimatedSizeBytes <= 0) return 'Tam. n/d';
     final mb = estimatedSizeBytes / (1024 * 1024);
     if (mb >= 1024) {
       return '${(mb / 1024).toStringAsFixed(2)} GB';
