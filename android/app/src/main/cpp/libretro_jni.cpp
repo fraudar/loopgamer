@@ -269,7 +269,17 @@ std::atomic<int> g_turbo_half_period{3};
 std::atomic<uint32_t> g_emu_frame_count{0};
 std::atomic<int16_t> g_left_x{0};
 std::atomic<int16_t> g_left_y{0};
+std::atomic<int16_t> g_right_x{0};
+std::atomic<int16_t> g_right_y{0};
 std::atomic<int> g_frame_skip{0};
+
+inline void reset_input_state() {
+  g_joypad_mask.store(0, std::memory_order_relaxed);
+  g_left_x.store(0, std::memory_order_relaxed);
+  g_left_y.store(0, std::memory_order_relaxed);
+  g_right_x.store(0, std::memory_order_relaxed);
+  g_right_y.store(0, std::memory_order_relaxed);
+}
 unsigned g_frame_counter = 0;
 
 unsigned g_last_width = 480;
@@ -1672,10 +1682,17 @@ int16_t input_state_callback(unsigned port, unsigned device, unsigned index, uns
       return (mask & (1u << id)) ? 1 : 0;
     }
   }
-  if (device == 5 && index == 0) {
-    return (id == 0)
-        ? g_left_x.load(std::memory_order_relaxed)
-        : g_left_y.load(std::memory_order_relaxed);
+  if (device == 5) {
+    if (index == 0) {
+      if (id == 0) return g_left_x.load(std::memory_order_relaxed);
+      if (id == 1) return g_left_y.load(std::memory_order_relaxed);
+      return 0;
+    }
+    if (index == 1) {
+      if (id == 0) return g_right_x.load(std::memory_order_relaxed);
+      if (id == 1) return g_right_y.load(std::memory_order_relaxed);
+      return 0;
+    }
   }
   return 0;
 }
@@ -1714,6 +1731,7 @@ void unload_core_locked() {
   g_hwEverPresented = false;
   g_hwPresentCount = 0;
   g_presentedThisStep.store(false, std::memory_order_relaxed);
+  reset_input_state();
   if (g_window) {
     ANativeWindow_release(g_window);
     g_window = nullptr;
@@ -1853,6 +1871,7 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
   g_hwPresentCount = 0;
   g_lastLoggedGlErr = GL_NO_ERROR;
   g_presentedThisStep.store(false, std::memory_order_relaxed);
+  reset_input_state();
 
   {
     std::lock_guard<std::mutex> audio_lock(g_audio_mutex);
@@ -2180,10 +2199,12 @@ Java_org_loopgamer_emulator_MainActivity_nativeGetTargetFps(JNIEnv*, jobject) {
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_loopgamer_emulator_MainActivity_nativeUpdateInput(
-    JNIEnv*, jobject, jint mask, jshort lx, jshort ly) {
+    JNIEnv*, jobject, jint mask, jshort lx, jshort ly, jshort rx, jshort ry) {
   g_joypad_mask.store(static_cast<uint32_t>(mask), std::memory_order_relaxed);
   g_left_x.store(lx, std::memory_order_relaxed);
   g_left_y.store(ly, std::memory_order_relaxed);
+  g_right_x.store(rx, std::memory_order_relaxed);
+  g_right_y.store(ry, std::memory_order_relaxed);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

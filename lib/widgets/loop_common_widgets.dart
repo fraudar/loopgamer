@@ -23,7 +23,9 @@ KeyEventResult handleGamepadNavigationKey({
   ValueChanged<int>? onActivate,
   ValueChanged<int>? onSecondaryAction,
   ValueChanged<int>? onTertiaryAction,
+  VoidCallback? onBack,
   bool allowSecondaryWhenEmpty = false,
+  bool handleBumpers = false,
   bool isActive = true,
 }) {
   if (!isActive) return KeyEventResult.ignored;
@@ -38,6 +40,7 @@ KeyEventResult handleGamepadNavigationKey({
 
   if (isInitialPress) {
     if (key == LogicalKeyboardKey.gameButtonA ||
+        key == LogicalKeyboardKey.gameButton1 ||
         key == LogicalKeyboardKey.enter ||
         key == LogicalKeyboardKey.numpadEnter ||
         key == LogicalKeyboardKey.select) {
@@ -45,7 +48,15 @@ KeyEventResult handleGamepadNavigationKey({
       onActivate(safeIndex);
       return KeyEventResult.handled;
     }
-    if (key == LogicalKeyboardKey.gameButtonY) {
+    if (key == LogicalKeyboardKey.gameButtonB ||
+        key == LogicalKeyboardKey.gameButton2 ||
+        key == LogicalKeyboardKey.escape) {
+      if (onBack == null) return KeyEventResult.ignored;
+      onBack();
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.gameButtonY ||
+        key == LogicalKeyboardKey.gameButton4) {
       if (onSecondaryAction == null) return KeyEventResult.ignored;
       if (!hasItems && !allowSecondaryWhenEmpty) {
         return KeyEventResult.ignored;
@@ -53,7 +64,8 @@ KeyEventResult handleGamepadNavigationKey({
       onSecondaryAction(safeIndex);
       return KeyEventResult.handled;
     }
-    if (key == LogicalKeyboardKey.gameButtonX) {
+    if (key == LogicalKeyboardKey.gameButtonX ||
+        key == LogicalKeyboardKey.gameButton3) {
       if (!hasItems || onTertiaryAction == null) return KeyEventResult.ignored;
       onTertiaryAction(safeIndex);
       return KeyEventResult.handled;
@@ -65,9 +77,9 @@ KeyEventResult handleGamepadNavigationKey({
   final cols = crossAxisCount < 1 ? 1 : crossAxisCount;
   int? targetIndex;
 
-  if (key == LogicalKeyboardKey.gameButtonRight1) {
+  if (handleBumpers && key == LogicalKeyboardKey.gameButtonRight1) {
     targetIndex = _stepIndex(safeIndex, 1, itemCount, wrapAround);
-  } else if (key == LogicalKeyboardKey.gameButtonLeft1) {
+  } else if (handleBumpers && key == LogicalKeyboardKey.gameButtonLeft1) {
     targetIndex = _stepIndex(safeIndex, -1, itemCount, wrapAround);
   } else if (cols > 1) {
     if (key == LogicalKeyboardKey.arrowRight) {

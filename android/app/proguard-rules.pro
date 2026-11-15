@@ -6,6 +6,7 @@
 # Preserva Activity, Service e FileProvider declarados no AndroidManifest.xml
 -keep class org.loopgamer.emulator.MainActivity { *; }
 -keep class org.loopgamer.emulator.EmulationForegroundService { *; }
+-keep class org.loopgamer.emulator.DownloadForegroundService { *; }
 -keep class androidx.core.content.FileProvider { *; }
 
 # Nunca remove/renomeia métodos JNI nativos nem classes chamadas via FindClass

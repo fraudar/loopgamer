@@ -57,6 +57,7 @@ class LibretroPlayerScreen extends StatefulWidget {
 
 class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
   final GlobalKey _viewportRepaintKey = GlobalKey();
+  final FocusNode _playerFocusNode = FocusNode(debugLabel: 'LibretroPlayerFocus');
   final SettingsStorageService _settingsStorage = SettingsStorageService();
 
   late final ValueNotifier<AppSettings> _settingsNotifier =
@@ -105,6 +106,9 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
 
   StreamSubscription<LibretroTelemetryEvent>? _telemetrySub;
   StreamSubscription<void>? _gamepadSub;
+  StreamSubscription<bool>? _gamepadStateSub;
+  StreamSubscription<Map<String, dynamic>>? _gamepadUiSub;
+  BuildContext? _exitDialogContext;
 
   final DateTime _sessionStartTime = DateTime.now();
   bool _isGameSpecificProfile = false;
@@ -133,11 +137,21 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
         DeviceOrientation.landscapeRight,
       ]),
     );
+    _hardwareGamepadNotifier.value =
+        widget.emulatorService.isHardwareGamepadConnected;
     _gamepadSub = widget.emulatorService.hardwareGamepadStream.listen((_) {
       if (mounted && !_hardwareGamepadNotifier.value) {
         _hardwareGamepadNotifier.value = true;
       }
     });
+    _gamepadStateSub =
+        widget.emulatorService.hardwareGamepadStateStream.listen((connected) {
+      if (mounted && _hardwareGamepadNotifier.value != connected) {
+        _hardwareGamepadNotifier.value = connected;
+      }
+    });
+    _gamepadUiSub = widget.emulatorService.gamepadUiActionStream
+        .listen(_handleNativeGamepadUiAction);
     unawaited(_bootLibretroSession());
   }
 
@@ -147,6 +161,9 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
     _flushPendingOverlaySave(syncNative: false);
     unawaited(_telemetrySub?.cancel());
     unawaited(_gamepadSub?.cancel());
+    unawaited(_gamepadStateSub?.cancel());
+    unawaited(_gamepadUiSub?.cancel());
+    _playerFocusNode.dispose();
     unawaited(widget.emulatorService.stopSession());
     // Preserva immersiveSticky para não divergir do modo do app em main.dart.
     unawaited(
@@ -311,6 +328,191 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
     return _lastCapturedPreviewPng;
   }
 
+  void _cycleSidebarSection(int delta) {
+    if (!mounted) return;
+    const sections = _SidebarSection.values;
+    final nextIdx =
+        (_sidebarSection.index + delta + sections.length) % sections.length;
+    setState(() => _sidebarSection = sections[nextIdx]);
+  }
+
+  void _movePlayerFocus(TraversalDirection direction) {
+    final current = FocusManager.instance.primaryFocus;
+    if (current != null && current.context != null) {
+      current.focusInDirection(direction);
+      return;
+    }
+    _playerFocusNode.requestFocus();
+  }
+
+  void _activateFocusedControl() {
+    final ctx = FocusManager.instance.primaryFocus?.context;
+    if (ctx != null) {
+      Actions.maybeInvoke<ActivateIntent>(ctx, const ActivateIntent());
+    }
+  }
+
+  void _handleNativeGamepadUiAction(Map<String, dynamic> event) {
+    if (!mounted) return;
+    final action = (event['action'] as String?) ?? '';
+    switch (action) {
+      case 'guide':
+      case 'menu':
+      case 'pause':
+        if (_isExitDialogOpen) return;
+        if (_isDraggingGamepad) {
+          _flushPendingOverlaySave();
+          setState(() {
+            _isDraggingGamepad = false;
+            _isSidebarOpen = true;
+          });
+          unawaited(widget.emulatorService.setPaused(true));
+        } else if (_isSidebarOpen) {
+          unawaited(_closeSidebarAndResume());
+        } else if (!_isPreparingCore && _errorMessage == null) {
+          unawaited(_openSidebar());
+        }
+        return;
+      case 'toggleFastForward':
+        _setFastForward(!_isFastForwardActive);
+        return;
+      case 'quickSave':
+        unawaited(_handleSaveToSlot(0));
+        return;
+      case 'dpadUp':
+        if (_isSidebarOpen || _isExitDialogOpen) {
+          _movePlayerFocus(TraversalDirection.up);
+        }
+        return;
+      case 'dpadDown':
+        if (_isSidebarOpen || _isExitDialogOpen) {
+          _movePlayerFocus(TraversalDirection.down);
+        }
+        return;
+      case 'dpadLeft':
+        if (_isSidebarOpen || _isExitDialogOpen) {
+          _movePlayerFocus(TraversalDirection.left);
+        }
+        return;
+      case 'dpadRight':
+        if (_isSidebarOpen || _isExitDialogOpen) {
+          _movePlayerFocus(TraversalDirection.right);
+        }
+        return;
+      case 'a':
+        if (_isSidebarOpen || _isExitDialogOpen) {
+          _activateFocusedControl();
+        }
+        return;
+      case 'b':
+        if (_isExitDialogOpen) {
+          final dlgCtx = _exitDialogContext;
+          if (dlgCtx != null && dlgCtx.mounted) {
+            Navigator.of(dlgCtx).maybePop('cancel');
+          }
+        } else if (_isDraggingGamepad) {
+          _flushPendingOverlaySave();
+          setState(() {
+            _isDraggingGamepad = false;
+            _isSidebarOpen = true;
+          });
+          unawaited(widget.emulatorService.setPaused(true));
+        } else if (_isSidebarOpen) {
+          unawaited(_closeSidebarAndResume());
+        } else {
+          unawaited(_openSidebar());
+        }
+        return;
+      case 'l1':
+      case 'l2':
+        if (_isSidebarOpen) {
+          _cycleSidebarSection(-1);
+        }
+        return;
+      case 'r1':
+      case 'r2':
+        if (_isSidebarOpen) {
+          _cycleSidebarSection(1);
+        }
+        return;
+      default:
+        return;
+    }
+  }
+
+  KeyEventResult _handlePlayerKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.gameButtonMode) {
+      if (event is KeyDownEvent) {
+        _handleNativeGamepadUiAction(const {'action': 'guide'});
+      }
+      return KeyEventResult.handled;
+    }
+    if (!_isSidebarOpen || _isExitDialogOpen) {
+      return KeyEventResult.ignored;
+    }
+    if (key == LogicalKeyboardKey.gameButtonLeft1 ||
+        key == LogicalKeyboardKey.gameButtonLeft2) {
+      if (event is KeyDownEvent) _cycleSidebarSection(-1);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.gameButtonRight1 ||
+        key == LogicalKeyboardKey.gameButtonRight2) {
+      if (event is KeyDownEvent) _cycleSidebarSection(1);
+      return KeyEventResult.handled;
+    }
+    return _handleFocusTraversalKeyEvent(
+      event,
+      onBack: () => unawaited(_closeSidebarAndResume()),
+    );
+  }
+
+  KeyEventResult _handleFocusTraversalKeyEvent(
+    KeyEvent event, {
+    required VoidCallback onBack,
+  }) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.arrowUp) {
+      _movePlayerFocus(TraversalDirection.up);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowDown) {
+      _movePlayerFocus(TraversalDirection.down);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowLeft) {
+      _movePlayerFocus(TraversalDirection.left);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowRight) {
+      _movePlayerFocus(TraversalDirection.right);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.gameButtonA ||
+        key == LogicalKeyboardKey.gameButton1 ||
+        key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.numpadEnter ||
+        key == LogicalKeyboardKey.space ||
+        key == LogicalKeyboardKey.select) {
+      if (event is KeyDownEvent) _activateFocusedControl();
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.gameButtonB ||
+        key == LogicalKeyboardKey.gameButton2 ||
+        key == LogicalKeyboardKey.escape ||
+        key == LogicalKeyboardKey.goBack) {
+      if (event is KeyDownEvent) onBack();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
   Future<void> _openSidebar([_SidebarSection? section]) async {
     await _captureViewportPreviewPng();
     await _refreshSaveSlots();
@@ -321,6 +523,11 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
       _isDraggingGamepad = false;
     });
     await widget.emulatorService.setPaused(true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _isSidebarOpen) {
+        _playerFocusNode.requestFocus();
+      }
+    });
   }
 
   Future<void> _closeSidebarAndResume() async {
@@ -330,6 +537,9 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
       _isDraggingGamepad = false;
     });
     await widget.emulatorService.setPaused(false);
+    if (mounted) {
+      _playerFocusNode.requestFocus();
+    }
   }
 
   Future<void> _bootLibretroSession() async {
@@ -375,6 +585,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
         customDriverName: _settings.customVulkanDriverName,
         adrenoTurbo: _settings.adrenoTurboMode,
         freedrenoPreset: _settings.freedrenoPreset.envValue,
+        singleTrigger: _shouldUseSingleShoulderTriggers(_settings),
         coreOptions: widget.game.platformSlug.toLowerCase() == 'psp'
             ? _settings.libretroCoreOptions
             : null,
@@ -491,7 +702,14 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
         context: context,
         barrierDismissible: true,
         builder: (ctx) {
-          return AlertDialog(
+          _exitDialogContext = ctx;
+          return Focus(
+            autofocus: true,
+            onKeyEvent: (node, event) => _handleFocusTraversalKeyEvent(
+              event,
+              onBack: () => Navigator.of(ctx).maybePop('cancel'),
+            ),
+            child: AlertDialog(
             backgroundColor: HydraTokens.bgNearBlack,
             shape: HydraTokens.dialogShape,
             title: const Text(
@@ -590,10 +808,12 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                 ],
               ),
             ],
+            ),
           );
         },
       );
     } finally {
+      _exitDialogContext = null;
       _isExitDialogOpen = false;
     }
 
@@ -719,34 +939,46 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
   Widget build(BuildContext context) {
     final screenSize = MediaQuery.sizeOf(context);
 
-    return PopScope(
-      canPop: false,
-      onPopInvokedWithResult: (didPop, _) {
-        if (didPop || _isExitDialogOpen) return;
-        if (_isDraggingGamepad) {
-          _flushPendingOverlaySave();
-          setState(() {
-            _isDraggingGamepad = false;
-            _isSidebarOpen = true;
-          });
-          unawaited(widget.emulatorService.setPaused(true));
-        } else if (_isSidebarOpen || _isPreparingCore || _errorMessage != null) {
-          unawaited(_confirmExitPlayer());
-        } else {
-          unawaited(_openSidebar());
-        }
-      },
-      child: Scaffold(
-        backgroundColor: HydraTokens.bgPureBlack,
-        body: Listener(
-          behavior: HitTestBehavior.translucent,
-          onPointerDown: (_) {
-            if (_hardwareGamepadNotifier.value) {
-              _hardwareGamepadNotifier.value = false;
-            }
-          },
-          child: SafeArea(
-            child: Stack(
+    return Focus(
+      focusNode: _playerFocusNode,
+      autofocus: true,
+      onKeyEvent: _handlePlayerKeyEvent,
+      child: PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) {
+          if (didPop || _isExitDialogOpen) return;
+          if (_isDraggingGamepad) {
+            _flushPendingOverlaySave();
+            setState(() {
+              _isDraggingGamepad = false;
+              _isSidebarOpen = true;
+            });
+            unawaited(widget.emulatorService.setPaused(true));
+          } else if (_isSidebarOpen || _isPreparingCore || _errorMessage != null) {
+            unawaited(_confirmExitPlayer());
+          } else {
+            unawaited(_openSidebar());
+          }
+        },
+        child: Scaffold(
+          backgroundColor: HydraTokens.bgPureBlack,
+          body: Listener(
+            behavior: HitTestBehavior.translucent,
+            onPointerDown: (event) {
+              // Tocar na sidebar, no diálogo de saída ou na barra HUD superior não
+              // desativa o estado do controle físico (preserva atalhos do gamepad).
+              if (_isSidebarOpen ||
+                  _isExitDialogOpen ||
+                  event.localPosition.dy < 56) {
+                return;
+              }
+              if (_hardwareGamepadNotifier.value) {
+                _hardwareGamepadNotifier.value = false;
+              }
+            },
+            child: SafeArea(
+              top: false,
+              child: Stack(
               fit: StackFit.expand,
               children: [
                 // ==============================================================
@@ -1462,6 +1694,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
           ),
         ),
       ),
+    ),
     );
   }
 

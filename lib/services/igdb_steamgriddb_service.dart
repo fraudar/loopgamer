@@ -118,6 +118,13 @@ class IgdbSteamGridService {
   static bool _isSuccessStatus(int? statusCode) =>
       statusCode != null && statusCode >= 200 && statusCode < 300;
 
+  static int _parseByteSize(dynamic rawValue) {
+    if (rawValue is num) return rawValue.toInt();
+    final str = '${rawValue ?? ''}'.trim();
+    if (str.isEmpty) return 0;
+    return int.tryParse(str) ?? double.tryParse(str)?.toInt() ?? 0;
+  }
+
   static const Set<String> _validRomExtensions = {
     '.gba',
     '.gbc',
@@ -241,7 +248,7 @@ class IgdbSteamGridService {
 
           final dedupeKey = '${slug}_${cleanDisplayTitle.toLowerCase()}';
           final romName = (raw['rom_name'] as String?) ?? '$rawName.rom';
-          final rawSize = (raw['size'] as num?)?.toInt() ?? 0;
+          final rawSize = _parseByteSize(raw['size']);
           final sizeBytes = rawSize > 0 ? rawSize : 0;
 
           final lowerRom = romName.toLowerCase();
@@ -602,7 +609,7 @@ class IgdbSteamGridService {
           continue;
         }
 
-        final sizeBytes = (raw['fs_size_bytes'] as num?)?.toInt() ?? 0;
+        final sizeBytes = _parseByteSize(raw['fs_size_bytes']);
         final crc =
             ((raw['crc_hash'] ?? raw['md5_hash'] ?? '') as String).toUpperCase();
         final summary = (raw['summary'] as String?)?.trim().isNotEmpty == true
@@ -1308,7 +1315,7 @@ class IgdbSteamGridService {
       final lower = fileName.toLowerCase();
       if (!_validRomExtensions.any(lower.endsWith)) continue;
 
-      final sizeBytes = int.tryParse('${f['size'] ?? ''}') ?? 0;
+      final sizeBytes = _parseByteSize(f['size']);
       if (sizeBytes <= 0) continue;
 
       final plat = _detectPlatformFromFileName(

@@ -6,6 +6,7 @@ import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
+import 'emulator_service.dart';
 
 class TurnipDriverRelease {
   const TurnipDriverRelease({
@@ -213,7 +214,11 @@ class GpuDriverService {
     final safeId = result!.files.single.name
         .replaceAll(RegExp(r'\.zip$', caseSensitive: false), '')
         .replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
-    return _installFromZipFile(safeId, file.path);
+    try {
+      return await _installFromZipFile(safeId, file.path);
+    } finally {
+      await EmulatorService.cleanFilePickerTempCache(pickedPath: path);
+    }
   }
 
   Future<InstalledGpuDriver> _installFromZipFile(
@@ -227,11 +232,23 @@ class GpuDriverService {
     final root = await _driversRootDir();
     final rootPath = root.path;
 
+    return _runExtractDriverZipInIsolate(
+      zipPath: zipPath,
+      rootPath: rootPath,
+      driverId: normalizedId,
+    );
+  }
+
+  static Future<InstalledGpuDriver> _runExtractDriverZipInIsolate({
+    required String zipPath,
+    required String rootPath,
+    required String driverId,
+  }) {
     return Isolate.run(
       () => _extractDriverZipSync(
         zipPath: zipPath,
         rootPath: rootPath,
-        driverId: normalizedId,
+        driverId: driverId,
       ),
     );
   }
