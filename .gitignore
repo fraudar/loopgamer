@@ -44,3 +44,6 @@ app.*.map.json
 /android/app/.cxx/
 /android/.kotlin/
 /android/app/intermediates/
+
+# Android APKs (distribuídos via GitHub Releases)
+*.apk
