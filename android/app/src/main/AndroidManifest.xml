@@ -4,11 +4,6 @@
     <uses-permission android:name="android.permission.VIBRATE" />
 
     <queries>
-        <package android:name="dev.eden.eden_emulator" />
-        <package android:name="com.miHoYo.Yuanshen" />
-        <package android:name="dev.legacy.eden_emulator" />
-        <package android:name="org.yuzu.yuzu_emu" />
-        <package android:name="org.citra.citra_emu" />
         <intent>
             <action android:name="android.intent.action.VIEW" />
             <data android:scheme="https" />

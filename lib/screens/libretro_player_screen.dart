@@ -23,7 +23,7 @@ enum _SidebarSection {
 
 enum _GamepadEditTarget {
   global('Todos'),
-  shoulders('L1/L2 & R1/R2'),
+  shoulders('Gatilhos L/R'),
   dpad('D-Pad'),
   stick('Analógico'),
   actions('Botões Ação'),
@@ -281,6 +281,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
         customDriverDir: _settings.customVulkanDriverDir,
         customDriverName: _settings.customVulkanDriverName,
         adrenoTurbo: _settings.adrenoTurboMode,
+        freedrenoPreset: _settings.freedrenoPreset.envValue,
         coreOptions:
             widget.game.platformSlug.toLowerCase() == 'psp'
                 ? _settings.libretroCoreOptions
@@ -414,6 +415,9 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
     _syncInputToCore();
     setState(() {});
   }
+
+  bool get _useSingleShoulderTriggers =>
+      _settings.shouldUseSingleTriggers(widget.game.platformSlug);
 
   void _updateAnalogVector(double nx, double ny) {
     if (_isDraggingGamepad || _isSidebarOpen) return;
@@ -637,7 +641,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
               // ==============================================================
               if (_shouldShowTouchOverlay) ...[
               // ==============================================================
-              // 3. GATILHOS L1/L2 & R1/R2 COMPACTOS JUNTOS (OU ESTILO ESCOLHIDO)
+              // 3. GATILHOS L/R (ÚNICO EM PSP/GBA/SNES OU L1/L2 & R1/R2)
               // ==============================================================
               Positioned(
                 left: 20,
@@ -653,7 +657,8 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                       : null,
                   child: _EditableControlFrame(
                     editing: _isDraggingGamepad,
-                    label: 'Gatilhos L1 / L2',
+                    label:
+                        _useSingleShoulderTriggers ? 'Gatilho L' : 'Gatilhos L1 / L2',
                     onTapEdit: () =>
                         _openElementCustomizer(_GamepadEditTarget.shoulders),
                     child: Opacity(
@@ -669,6 +674,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                           style: _settings.shoulderStyle,
                           buttonStyle: _settings.buttonStyle,
                           spacing: _settings.shoulderSpacing,
+                          singleTriggerOnly: _useSingleShoulderTriggers,
                           primaryActive:
                               (_joypadMask & RetroJoypadMask.l) != 0,
                           secondaryActive:
@@ -697,7 +703,8 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                       : null,
                   child: _EditableControlFrame(
                     editing: _isDraggingGamepad,
-                    label: 'Gatilhos R1 / R2',
+                    label:
+                        _useSingleShoulderTriggers ? 'Gatilho R' : 'Gatilhos R1 / R2',
                     onTapEdit: () =>
                         _openElementCustomizer(_GamepadEditTarget.shoulders),
                     child: Opacity(
@@ -713,6 +720,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                           style: _settings.shoulderStyle,
                           buttonStyle: _settings.buttonStyle,
                           spacing: _settings.shoulderSpacing,
+                          singleTriggerOnly: _useSingleShoulderTriggers,
                           primaryActive:
                               (_joypadMask & RetroJoypadMask.r) != 0,
                           secondaryActive:
@@ -1810,7 +1818,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
               const SizedBox(width: 10),
               const Expanded(
                 child: Text(
-                  'Toque no botão acima para ver seus botões em tamanho real. No modo de edição, você pode arrastar para mover e dar um toque em qualquer botão (L1, R2, D-Pad, Ações) para mudar tamanho, opacidade e estilo ao vivo!',
+                  'Toque no botão acima para ver seus botões em tamanho real. No modo de edição, arraste para mover e dê um toque em qualquer botão (L/R, D-Pad, Ações) para mudar tamanho, opacidade e estilo ao vivo!',
                   style: TextStyle(
                     fontFamily: 'Rubik',
                     fontSize: 11.5,
@@ -1824,7 +1832,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
         ),
         const SizedBox(height: 14),
         const Text(
-          'Modo do Controle na Tela:',
+          'Visibilidade do Controle na Tela:',
           style: TextStyle(
             fontFamily: 'ReadexPro',
             fontSize: 12,
@@ -1833,44 +1841,52 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
           ),
         ),
         const SizedBox(height: 8),
-        Row(
-          children: TouchOverlayMode.values.map((mode) {
-            final active = _settings.touchOverlayMode == mode;
-            return Expanded(
-              child: Padding(
-                padding: EdgeInsets.only(
-                  right: mode != TouchOverlayMode.alwaysHide ? 6 : 0,
-                ),
-                child: GestureDetector(
-                  onTap: () => _applyAndSaveSettings(
-                    _settings.copyWith(touchOverlayMode: mode),
-                  ),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(vertical: 8),
-                    alignment: Alignment.center,
-                    decoration: BoxDecoration(
-                      color: active
-                          ? Colors.white
-                          : HydraTokens.surfaceCatalog,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(
-                      mode.label,
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontFamily: 'ReadexPro',
-                        fontSize: 10,
-                        fontWeight: FontWeight.w700,
-                        color: active
-                            ? HydraTokens.bgPureBlack
-                            : HydraTokens.textPrimary,
-                      ),
-                    ),
-                  ),
-                ),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+          decoration: BoxDecoration(
+            color: HydraTokens.surfaceCatalog,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: HydraTokens.borderSubtle10),
+          ),
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<TouchOverlayMode>(
+              value: _settings.touchOverlayMode,
+              isExpanded: true,
+              dropdownColor: HydraTokens.surfaceElevated1,
+              borderRadius: BorderRadius.circular(10),
+              icon: PhosphorIcon(
+                PhosphorIcons.caretDown(PhosphorIconsStyle.bold),
+                size: 14,
+                color: HydraTokens.primaryAurora,
               ),
-            );
-          }).toList(),
+              items: TouchOverlayMode.values.map((mode) {
+                final active = mode == _settings.touchOverlayMode;
+                return DropdownMenuItem<TouchOverlayMode>(
+                  value: mode,
+                  child: Text(
+                    mode.label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: active
+                          ? HydraTokens.primaryAurora
+                          : HydraTokens.textPrimary,
+                    ),
+                  ),
+                );
+              }).toList(),
+              onChanged: (mode) {
+                if (mode != null) {
+                  _applyAndSaveSettings(
+                    _settings.copyWith(touchOverlayMode: mode),
+                  );
+                }
+              },
+            ),
+          ),
         ),
         const SizedBox(height: 12),
         _CompactSwitchRow(
@@ -2025,7 +2041,10 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
 
             final title = switch (target) {
               _GamepadEditTarget.global => 'Controles Gerais',
-              _GamepadEditTarget.shoulders => 'Gatilhos L1, L2, R1, R2',
+              _GamepadEditTarget.shoulders =>
+                _useSingleShoulderTriggers
+                    ? 'Gatilhos L & R (Adaptado)'
+                    : 'Gatilhos L1, L2, R1, R2',
               _GamepadEditTarget.dpad => 'Direcional D-Pad',
               _GamepadEditTarget.stick => 'Alavanca Analógica',
               _GamepadEditTarget.actions => 'Botões de Ação (A, B, X, Y)',
@@ -2229,7 +2248,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                         ),
                       ],
                     ),
-                  // Se for Shoulders (Gatilhos): Formato Compacto / Empilhado / Separado
+                  // Se for Shoulders (Gatilhos): Adaptado (L/R) ou Seletor de Formato
                   if (target == _GamepadEditTarget.shoulders) ...[
                     const SizedBox(height: 8),
                     const Text(
@@ -2242,41 +2261,78 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                       ),
                     ),
                     const SizedBox(height: 6),
-                    Row(
-                      children: ShoulderTriggerStyle.values.map((st) {
-                        final active = _settings.shoulderStyle == st;
-                        return Expanded(
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 2),
-                            child: GestureDetector(
-                              onTap: () {
-                                _applyAndSaveSettings(
-                                  _settings.copyWith(shoulderStyle: st),
-                                );
-                                setModalState(() {});
-                              },
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(vertical: 6),
-                                decoration: BoxDecoration(
-                                  color: active ? Colors.white : Colors.white12,
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
-                                alignment: Alignment.center,
+                    if (AppSettings.isSingleTriggerPlatform(
+                      widget.game.platformSlug,
+                    ))
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 9,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white12,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text(
+                          'Gatilho único (L e R) ativo automaticamente para ${widget.game.platformName}.',
+                          style: const TextStyle(
+                            fontFamily: 'Rubik',
+                            fontSize: 11,
+                            color: Colors.white,
+                          ),
+                        ),
+                      )
+                    else
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white10,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: Colors.white24),
+                        ),
+                        child: DropdownButtonHideUnderline(
+                          child: DropdownButton<ShoulderTriggerStyle>(
+                            value: _settings.shoulderStyle,
+                            isExpanded: true,
+                            dropdownColor: HydraTokens.surfaceElevated1,
+                            borderRadius: BorderRadius.circular(10),
+                            icon: PhosphorIcon(
+                              PhosphorIcons.caretDown(PhosphorIconsStyle.bold),
+                              size: 14,
+                              color: Colors.white,
+                            ),
+                            items: ShoulderTriggerStyle.values.map((st) {
+                              final active = _settings.shoulderStyle == st;
+                              return DropdownMenuItem<ShoulderTriggerStyle>(
+                                value: st,
                                 child: Text(
                                   st.label,
                                   style: TextStyle(
                                     fontFamily: 'ReadexPro',
-                                    fontSize: 9.5,
+                                    fontSize: 11.5,
                                     fontWeight: FontWeight.w700,
-                                    color: active ? Colors.black : Colors.white,
+                                    color: active
+                                        ? HydraTokens.primaryAurora
+                                        : Colors.white,
                                   ),
                                 ),
-                              ),
-                            ),
+                              );
+                            }).toList(),
+                            onChanged: (st) {
+                              if (st != null) {
+                                _applyAndSaveSettings(
+                                  _settings.copyWith(shoulderStyle: st),
+                                );
+                                setModalState(() {});
+                              }
+                            },
                           ),
-                        );
-                      }).toList(),
-                    ),
+                        ),
+                      ),
                   ],
                   // Se for Shoulders, D-pad ou Ações: Estilo Visual dos Botões
                   if (target == _GamepadEditTarget.shoulders ||
@@ -2648,13 +2704,14 @@ class _GraphicsChipRow<T> extends StatelessWidget {
   }
 }
 
-/// Gatilhos L1/L2 e R1/R2 com modo "Compactos Juntos" (Unidos numa cápsula ergonômica fácil de clicar!)
+/// Gatilhos L1/L2 e R1/R2, ou gatilho único L / R em consoles como PSP, GBA e SNES.
 class _ShoulderTriggerCluster extends StatelessWidget {
   const _ShoulderTriggerCluster({
     required this.isLeft,
     required this.style,
     required this.buttonStyle,
     required this.spacing,
+    this.singleTriggerOnly = false,
     required this.primaryActive,
     required this.secondaryActive,
     required this.onPrimaryChanged,
@@ -2665,6 +2722,7 @@ class _ShoulderTriggerCluster extends StatelessWidget {
   final ShoulderTriggerStyle style;
   final GamepadButtonStyle buttonStyle;
   final double spacing;
+  final bool singleTriggerOnly;
   final bool primaryActive;
   final bool secondaryActive;
   final ValueChanged<bool> onPrimaryChanged;
@@ -2672,6 +2730,16 @@ class _ShoulderTriggerCluster extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (singleTriggerOnly || style == ShoulderTriggerStyle.singleLR) {
+      return _PillGamepadButton(
+        label: isLeft ? 'L' : 'R',
+        style: buttonStyle,
+        active: primaryActive,
+        largeSingleTrigger: true,
+        onChanged: onPrimaryChanged,
+      );
+    }
+
     final l1Label = isLeft ? 'L1' : 'R1';
     final l2Label = isLeft ? 'L2' : 'R2';
 
@@ -3310,12 +3378,14 @@ class _PillGamepadButton extends StatelessWidget {
     required this.style,
     required this.active,
     required this.onChanged,
+    this.largeSingleTrigger = false,
   });
 
   final String label;
   final GamepadButtonStyle style;
   final bool active;
   final ValueChanged<bool> onChanged;
+  final bool largeSingleTrigger;
 
   @override
   Widget build(BuildContext context) {
@@ -3327,7 +3397,10 @@ class _PillGamepadButton extends StatelessWidget {
       onPointerCancel: (_) => onChanged(false),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 70),
-        padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 6.5),
+        padding: EdgeInsets.symmetric(
+          horizontal: largeSingleTrigger ? 22 : 13,
+          vertical: largeSingleTrigger ? 10 : 6.5,
+        ),
         decoration: BoxDecoration(
           color: active
               ? Colors.white
@@ -3343,7 +3416,7 @@ class _PillGamepadButton extends StatelessWidget {
           label,
           style: TextStyle(
             fontFamily: 'ReadexPro',
-            fontSize: 10.5,
+            fontSize: largeSingleTrigger ? 13 : 10.5,
             fontWeight: FontWeight.w700,
             letterSpacing: 0.6,
             color: active ? HydraTokens.bgPureBlack : HydraTokens.textPrimary,

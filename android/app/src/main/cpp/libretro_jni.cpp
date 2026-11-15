@@ -7,6 +7,7 @@
 #include <GLES2/gl2ext.h>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -35,6 +36,7 @@ void set_custom_driver(const char* hook_lib_dir,
                        const char* custom_driver_dir,
                        const char* custom_driver_name,
                        bool adreno_turbo);
+void set_freedreno_preset(const char* preset);
 void set_backend(int mode); // 0 = GL, 1 = software, 2 = Vulkan
 void set_vsync(bool enabled);
 bool vulkan_requested();    // usuário pediu Vulkan e probe passou
@@ -189,10 +191,19 @@ typedef size_t (*retro_audio_sample_batch_t)(const int16_t* data, size_t frames)
 typedef void (*retro_input_poll_t)(void);
 typedef int16_t (*retro_input_state_t)(unsigned port, unsigned device, unsigned index, unsigned id);
 
+struct retro_system_info {
+  const char* library_name;
+  const char* library_version;
+  const char* valid_extensions;
+  bool need_fullpath;
+  bool block_extract;
+};
+
 struct LibretroCoreSymbols {
   void* handle = nullptr;
   void (*retro_init)(void) = nullptr;
   void (*retro_deinit)(void) = nullptr;
+  void (*retro_get_system_info)(retro_system_info*) = nullptr;
   void (*retro_set_environment)(retro_environment_t) = nullptr;
   void (*retro_set_video_refresh)(retro_video_refresh_t) = nullptr;
   void (*retro_set_audio_sample)(retro_audio_sample_t) = nullptr;
@@ -282,6 +293,31 @@ GLuint g_swTex = 0;
 unsigned g_swTexW = 0;
 unsigned g_swTexH = 0;
 retro_pixel_format g_swTexFormat = RETRO_PIXEL_FORMAT_RGB565;
+uint64_t g_swPresentCount = 0;
+std::vector<uint32_t> g_swConvertBuf;
+double g_appliedWindowFps = 0.0;
+
+// Baseado no EmuWindow_Android::OnSurfaceChanged do Eden: informa o frame rate
+// exato do núcleo ao SurfaceFlinger (Android 11+/12+) para paineis LTPO/120Hz.
+void apply_window_frame_rate(ANativeWindow* window, double fps) {
+  if (!window || fps <= 10.0) return;
+  if (std::abs(fps - g_appliedWindowFps) < 0.05) return;
+  using PfnSetFrameRateChange = int32_t (*)(ANativeWindow*, float, int8_t, int8_t);
+  using PfnSetFrameRate = int32_t (*)(ANativeWindow*, float, int8_t);
+  static auto fnChange = reinterpret_cast<PfnSetFrameRateChange>(
+      dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRateWithChangeStrategy"));
+  static auto fnBasic = reinterpret_cast<PfnSetFrameRate>(
+      dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRate"));
+  const float rate = static_cast<float>(fps);
+  // 1 = FIXED_SOURCE, 0 = CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS
+  if (fnChange) {
+    fnChange(window, rate, 1, 0);
+    g_appliedWindowFps = fps;
+  } else if (fnBasic) {
+    fnBasic(window, rate, 1);
+    g_appliedWindowFps = fps;
+  }
+}
 
 GLuint g_hwFbo = 0;
 GLuint g_hwColorTex = 0;
@@ -467,6 +503,9 @@ void gl_shutdown() {
   g_glBindVertexArray = nullptr;
   g_glBindSampler = nullptr;
   g_swTexW = g_swTexH = 0;
+  g_swPresentCount = 0;
+  g_swConvertBuf.clear();
+  g_appliedWindowFps = 0.0;
   g_hwFboW = g_hwFboH = 0;
   g_hwEverPresented = false;
   g_hwPresentCount = 0;
@@ -805,7 +844,7 @@ void present_sw_frame_gl(const void* data, unsigned w, unsigned h,
     glPixelStorei(0x0CF2 /*GL_UNPACK_ROW_LENGTH*/, 0);
   }
 
-  // (Re)aloca a textura quando a resolução do core muda
+  // (Re)aloca a textura quando a resolução ou o pixel format do core mudam
   if (g_swTex == 0 || w != g_swTexW || h != g_swTexH ||
       g_pixel_format != g_swTexFormat) {
     if (g_swTex != 0) glDeleteTextures(1, &g_swTex);
@@ -816,12 +855,15 @@ void present_sw_frame_gl(const void* data, unsigned w, unsigned h,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     if (g_pixel_format == RETRO_PIXEL_FORMAT_RGB565) {
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB565, static_cast<GLsizei>(w),
-                   static_cast<GLsizei>(h), 0, GL_RGB565,
+      // Adreno/GLES2+ exige GL_RGB (não GL_RGB565) em format/internalformat
+      // combinado com GL_UNSIGNED_SHORT_5_6_5 para não retornar GL_INVALID_ENUM.
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, static_cast<GLsizei>(w),
+                   static_cast<GLsizei>(h), 0, GL_RGB,
                    GL_UNSIGNED_SHORT_5_6_5, nullptr);
-    } else if (g_pixel_format == RETRO_PIXEL_FORMAT_XRGB8888) {
-      // Upload universal via GL_RGBA/GL_RGBA + swizzle B<->R no fragment shader
-      // (evita GL_INVALID_OPERATION de GL_RGBA+GL_BGRA_EXT no GLES Android).
+    } else if (g_pixel_format == RETRO_PIXEL_FORMAT_XRGB8888 ||
+               g_pixel_format == RETRO_PIXEL_FORMAT_0RGB1555) {
+      // Upload universal via GL_RGBA/GL_RGBA (XRGB8888 usa swizzle no shader;
+      // 0RGB1555 é convertido em buffer compacto já em ordem RGBA).
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(w),
                    static_cast<GLsizei>(h), 0, GL_RGBA, GL_UNSIGNED_BYTE,
                    nullptr);
@@ -837,27 +879,74 @@ void present_sw_frame_gl(const void* data, unsigned w, unsigned h,
 
   glBindTexture(GL_TEXTURE_2D, g_swTex);
   const bool isRgb565 = (g_pixel_format == RETRO_PIXEL_FORMAT_RGB565);
+  const bool isXrgb8888 = (g_pixel_format == RETRO_PIXEL_FORMAT_XRGB8888);
+  const uint8_t* uploadBytes = static_cast<const uint8_t*>(data);
+  size_t uploadPitch = pitch;
+
+  if (g_pixel_format == RETRO_PIXEL_FORMAT_0RGB1555) {
+    const size_t totalPx = static_cast<size_t>(w) * static_cast<size_t>(h);
+    if (g_swConvertBuf.size() < totalPx) {
+      g_swConvertBuf.resize(totalPx);
+    }
+    const auto* srcBytes = static_cast<const uint8_t*>(data);
+    for (unsigned y = 0; y < h; ++y) {
+      const auto* srcRow =
+          reinterpret_cast<const uint16_t*>(srcBytes + y * pitch);
+      uint32_t* dstRow = g_swConvertBuf.data() + static_cast<size_t>(y) * w;
+      for (unsigned x = 0; x < w; ++x) {
+        const uint16_t px = srcRow[x];
+        const uint32_t r5 = (px >> 10) & 0x1Fu;
+        const uint32_t g5 = (px >> 5) & 0x1Fu;
+        const uint32_t b5 = px & 0x1Fu;
+        const uint32_t r = (r5 << 3) | (r5 >> 2);
+        const uint32_t g = (g5 << 3) | (g5 >> 2);
+        const uint32_t b = (b5 << 3) | (b5 >> 2);
+        dstRow[x] = 0xFF000000u | (b << 16) | (g << 8) | r;
+      }
+    }
+    uploadBytes = reinterpret_cast<const uint8_t*>(g_swConvertBuf.data());
+    uploadPitch = static_cast<size_t>(w) * sizeof(uint32_t);
+  }
+
   glPixelStorei(GL_UNPACK_ALIGNMENT, isRgb565 ? 2 : 4);
-  const auto* bytes = static_cast<const uint8_t*>(data);
-  const GLsizei rowBytes =
-      static_cast<GLsizei>(w * (isRgb565 ? sizeof(uint16_t) : sizeof(uint32_t)));
-  const GLenum uploadFmt = isRgb565 ? GL_RGB565 : GL_RGBA;
+  const size_t bytesPerPx = isRgb565 ? sizeof(uint16_t) : sizeof(uint32_t);
+  const size_t rowBytes = static_cast<size_t>(w) * bytesPerPx;
+  const GLenum uploadFmt = isRgb565 ? GL_RGB : GL_RGBA;
   const GLenum uploadType =
       isRgb565 ? GL_UNSIGNED_SHORT_5_6_5 : GL_UNSIGNED_BYTE;
-  if (pitch == static_cast<size_t>(rowBytes)) {
+  if (uploadPitch == rowBytes) {
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(w),
-                    static_cast<GLsizei>(h), uploadFmt, uploadType, bytes);
+                    static_cast<GLsizei>(h), uploadFmt, uploadType, uploadBytes);
+  } else if (g_eglGlesVersion >= 3 && uploadPitch > rowBytes &&
+             (uploadPitch % bytesPerPx) == 0) {
+    // Cores como mGBA entregam pitch=512 para width=240: GLES3 faz upload em 1 chamada.
+    glPixelStorei(0x0CF2 /*GL_UNPACK_ROW_LENGTH*/,
+                  static_cast<GLint>(uploadPitch / bytesPerPx));
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(w),
+                    static_cast<GLsizei>(h), uploadFmt, uploadType, uploadBytes);
+    glPixelStorei(0x0CF2 /*GL_UNPACK_ROW_LENGTH*/, 0);
   } else {
     for (unsigned y = 0; y < h; ++y) {
       glTexSubImage2D(GL_TEXTURE_2D, 0, 0, static_cast<GLsizei>(y),
                       static_cast<GLsizei>(w), 1, uploadFmt, uploadType,
-                      bytes + y * pitch);
+                      uploadBytes + y * uploadPitch);
     }
   }
   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
   // Frames de software têm origem top-left: v = 0.5 - 0.5*y → [1, 0]
-  gl_draw_bound(g_swTex, 1.0f, -1.0f, 0.5f,
-                g_pixel_format == RETRO_PIXEL_FORMAT_XRGB8888);
+  gl_draw_bound(g_swTex, 1.0f, -1.0f, 0.5f, isXrgb8888);
+  const GLenum err = glGetError();
+  ++g_swPresentCount;
+  if (g_swPresentCount <= 3 ||
+      (err != GL_NO_ERROR && err != g_lastLoggedGlErr)) {
+    if (err != GL_NO_ERROR) g_lastLoggedGlErr = err;
+    __android_log_print(
+        err == GL_NO_ERROR ? ANDROID_LOG_INFO : ANDROID_LOG_WARN,
+        "loopgamer-core",
+        "SW GL present #%llu: frame=%ux%u pitch=%zu fmt=%d gles=%d err=0x%x",
+        static_cast<unsigned long long>(g_swPresentCount),
+        w, h, pitch, static_cast<int>(g_pixel_format), g_eglGlesVersion, err);
+  }
   gl_finish_frame();
 }
 
@@ -1029,6 +1118,8 @@ const char* get_core_variable(const char* key) {
   if (k == "ppsspp_cache_iso") return "enabled";
 
   // PCSX ReARMed (PS1)
+  if (k == "pcsx_rearmed_bios") return "auto";
+  if (k == "pcsx_rearmed_region") return "Auto";
   if (k == "pcsx_rearmed_neon_interlace_enable") return "enabled";
   if (k == "pcsx_rearmed_neon_enhancement_enable") return "disabled";
   if (k == "pcsx_rearmed_frameskip") return "0";
@@ -1157,7 +1248,10 @@ bool environment_callback(unsigned cmd, void* data) {
         g_hwMaxW = av->geometry.max_width;
         g_hwMaxH = av->geometry.max_height;
       }
-      if (av->timing.fps > 10.0) g_target_fps = av->timing.fps;
+      if (av->timing.fps > 10.0) {
+        g_target_fps = av->timing.fps;
+        apply_window_frame_rate(g_window, g_target_fps);
+      }
       if (av->timing.sample_rate > 8000.0) {
         g_sample_rate = static_cast<int>(av->timing.sample_rate);
       }
@@ -1329,12 +1423,14 @@ void video_refresh_callback(const void* data, unsigned width, unsigned height, s
     return;
   }
 
-  // Caminho GPU: upload para textura + blit (RGB565 nativo ou XRGB8888 via shader swizzle).
-  const bool gl_ok = gl_ensure_current() && g_blitProgram != 0;
+  // Caminho GPU: upload para textura + blit (RGB565 nativo, XRGB8888 via swizzle,
+  // ou 0RGB1555 convertido em RGBA8888 compacto). Verifica formato ANTES de bind EGL
+  // para não bloquear ANativeWindow_lock caso caia no fallback CPU.
   const bool format_ok =
       g_pixel_format == RETRO_PIXEL_FORMAT_RGB565 ||
-      g_pixel_format == RETRO_PIXEL_FORMAT_XRGB8888;
-  if (gl_ok && format_ok) {
+      g_pixel_format == RETRO_PIXEL_FORMAT_XRGB8888 ||
+      g_pixel_format == RETRO_PIXEL_FORMAT_0RGB1555;
+  if (format_ok && gl_ensure_current() && g_blitProgram != 0) {
     present_sw_frame_gl(data, width, height, pitch);
     return;
   }
@@ -1441,6 +1537,8 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
 
   LOAD_SYM(retro_init)
   LOAD_SYM(retro_deinit)
+  g_core.retro_get_system_info = reinterpret_cast<decltype(g_core.retro_get_system_info)>(
+      dlsym(g_core.handle, "retro_get_system_info"));
   LOAD_SYM(retro_set_environment)
   LOAD_SYM(retro_set_video_refresh)
   LOAD_SYM(retro_set_audio_sample)
@@ -1466,9 +1564,13 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
   g_eglDisplay = EGL_NO_DISPLAY;
   g_eglSurface = EGL_NO_SURFACE;
   g_eglContext = EGL_NO_CONTEXT;
-  g_eglGlesVersion = 2;
+  // Tenta GLES3 primeiro (es3Candidates faz fallback automático para ES2),
+  // habilitando GL_UNPACK_ROW_LENGTH (mGBA/SNES) e VAOs nos cores de software.
+  g_eglGlesVersion = 3;
   g_pixel_format = RETRO_PIXEL_FORMAT_0RGB1555;
   g_swTexFormat = RETRO_PIXEL_FORMAT_RGB565;
+  g_swPresentCount = 0;
+  g_appliedWindowFps = 0.0;
   g_hwNeedDepth = false;
   g_hwNeedStencil = false;
   g_hwPreferredEs3 = false;
@@ -1504,9 +1606,49 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
   g_core.retro_set_input_state(input_state_callback);
   g_core.retro_init();
 
+  retro_system_info sys_info{};
+  if (g_core.retro_get_system_info) {
+    g_core.retro_get_system_info(&sys_info);
+  }
+
   retro_game_info info{};
   info.path = rom_path.c_str();
+  std::vector<uint8_t> rom_buffer;
+  auto ends_with_ci = [](const std::string& s, const char* suffix) {
+    const size_t sl = s.size();
+    const size_t tl = std::strlen(suffix);
+    if (sl < tl) return false;
+    for (size_t i = 0; i < tl; ++i) {
+      const char a = s[sl - tl + i];
+      const char b = suffix[i];
+      if (std::tolower(static_cast<unsigned char>(a)) !=
+          std::tolower(static_cast<unsigned char>(b))) {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (g_core.retro_get_system_info && !sys_info.need_fullpath &&
+      !ends_with_ci(rom_path, ".zip") && !ends_with_ci(rom_path, ".7z")) {
+    std::ifstream rom_in(rom_path, std::ios::binary | std::ios::ate);
+    if (rom_in) {
+      const auto end_pos = rom_in.tellg();
+      constexpr std::streamoff kMaxInMemRom = 64LL * 1024LL * 1024LL;
+      if (end_pos > 0 && end_pos <= kMaxInMemRom) {
+        rom_buffer.resize(static_cast<size_t>(end_pos));
+        rom_in.seekg(0, std::ios::beg);
+        if (rom_in.read(reinterpret_cast<char*>(rom_buffer.data()), end_pos)) {
+          info.data = rom_buffer.data();
+          info.size = rom_buffer.size();
+        } else {
+          rom_buffer.clear();
+        }
+      }
+    }
+  }
+
   if (!g_core.retro_load_game(&info)) {
+    rom_buffer.clear();
     if (g_core.retro_deinit) g_core.retro_deinit();
     vkfe::shutdown_public();
     gl_shutdown();
@@ -1518,6 +1660,7 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
     }
     return JNI_FALSE;
   }
+  rom_buffer.clear();
 
   retro_system_av_info av{};
   g_core.retro_get_system_av_info(&av);
@@ -1528,6 +1671,7 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
   if (av.timing.fps > 10.0) {
     g_target_fps = av.timing.fps;
   }
+  apply_window_frame_rate(g_window, g_target_fps);
   if (av.timing.sample_rate > 8000.0) {
     g_sample_rate = static_cast<int>(av.timing.sample_rate);
   }
@@ -1694,6 +1838,18 @@ Java_org_loopgamer_emulator_MainActivity_nativeSetCustomVulkanDriver(
   const std::string drvName = to_std(drv_name_j);
   vkfe::set_custom_driver(hookDir.c_str(), tmpDir.c_str(), drvDir.c_str(),
                           drvName.c_str(), turbo == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_loopgamer_emulator_MainActivity_nativeSetFreedrenoPreset(
+    JNIEnv* env, jobject, jstring preset_j) {
+  if (!preset_j) {
+    vkfe::set_freedreno_preset("");
+    return;
+  }
+  const char* c = env->GetStringUTFChars(preset_j, nullptr);
+  vkfe::set_freedreno_preset(c ? c : "");
+  if (c) env->ReleaseStringUTFChars(preset_j, c);
 }
 
 extern "C" JNIEXPORT void JNICALL

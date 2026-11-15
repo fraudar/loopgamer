@@ -111,9 +111,10 @@ class IgdbSteamGridService {
       final data = res.data;
       if (data is! List) return const [];
 
-      final List<EmulationGame> parsed = [];
+      final List<EmulationGame> preferred = [];
+      final List<EmulationGame> secondary = [];
       final Set<String> seenBaseTitles = {};
-      const int maxCachePerPlatform = 240;
+      const int maxCachePerPlatform = 800;
 
       for (final group in data) {
         if (group is! List) continue;
@@ -131,12 +132,10 @@ class IgdbSteamGridService {
             continue;
           }
 
-          // Prioriza lançamentos USA / World / Europe para capas e idioma
           final isPreferredRegion = rawName.contains('(USA') ||
               rawName.contains('(World') ||
               rawName.contains('(Europe') ||
               !rawName.contains('(');
-          if (!isPreferredRegion && parsed.length > 16) continue;
 
           final cleanDisplayTitle = rawName
               .replaceAll(RegExp(r'\s*\([^)]*\)'), '')
@@ -166,32 +165,41 @@ class IgdbSteamGridService {
 
           final idSeed = '${slug}_$rawName'.hashCode.abs() % 800000 + 100000;
 
-          parsed.add(
-            EmulationGame(
-              igdbId: idSeed,
-              name: cleanDisplayTitle,
-              canonicalNoIntroName: rawName,
-              summary: (rawDesc != null && rawDesc.length > 12)
-                  ? rawDesc
-                  : 'Título clássico de ${querySpec.platformDisplay} desenvolvido por $developer${releaseYear != null ? " ($releaseYear)" : ""}. Catálogo integrado via RetroAPI & ROM-Gripper.',
-              genres: [genre, querySpec.platformLabel],
-              developer: developer,
-              releaseYear: releaseYear,
-              rating: 89,
-              platformName: querySpec.platformLabel,
-              platformSlug: slug,
-              region: region,
-              crc32: crc,
-              estimatedSizeBytes: sizeBytes,
-              directRomUrl:
-                  'retroapi://$slug/${Uri.encodeComponent(romName)}',
-            ),
+          final item = EmulationGame(
+            igdbId: idSeed,
+            name: cleanDisplayTitle,
+            canonicalNoIntroName: rawName,
+            summary: (rawDesc != null && rawDesc.length > 12)
+                ? rawDesc
+                : 'Título clássico de ${querySpec.platformDisplay} desenvolvido por $developer${releaseYear != null ? " ($releaseYear)" : ""}. Catálogo integrado via RetroAPI & ROM-Gripper.',
+            genres: [genre, querySpec.platformLabel],
+            developer: developer,
+            releaseYear: releaseYear,
+            rating: 89,
+            platformName: querySpec.platformLabel,
+            platformSlug: slug,
+            region: region,
+            crc32: crc,
+            estimatedSizeBytes: sizeBytes,
+            directRomUrl:
+                'retroapi://$slug/${Uri.encodeComponent(romName)}',
           );
 
-          if (parsed.length >= maxCachePerPlatform) break;
+          if (isPreferredRegion) {
+            preferred.add(item);
+            if (preferred.length >= maxCachePerPlatform) break;
+          } else if (secondary.length < maxCachePerPlatform ~/ 2) {
+            secondary.add(item);
+          }
         }
-        if (parsed.length >= maxCachePerPlatform) break;
+        if (preferred.length >= maxCachePerPlatform) break;
       }
+
+      final remaining = (maxCachePerPlatform - preferred.length).clamp(0, maxCachePerPlatform);
+      final parsed = [
+        ...preferred,
+        ...secondary.take(remaining),
+      ];
 
       _retroApiCache[slug] = parsed;
       if (offset >= parsed.length) return const [];
@@ -997,34 +1005,52 @@ class IgdbSteamGridService {
     }
   }
 
+  /// Deduplica lista de jogos em O(N) preservando o primeiro exemplar por `(plataforma, título)`.
+  static List<EmulationGame> deduplicateCatalog(Iterable<EmulationGame> games) {
+    final List<EmulationGame> out = [];
+    final Set<String> seen = {};
+    for (final g in games) {
+      final key = '${g.platformSlug.toLowerCase()}|${g.name.toLowerCase()}';
+      if (seen.add(key)) {
+        out.add(g);
+      }
+    }
+    return out;
+  }
+
   /// Carrega o catálogo completo combinando:
   /// 1. Servidor RomM (se configurado)
-  /// 2. Catálogo integrado de 84 jogos em 14 plataformas
-  /// 3. Dezenas de jogos adicionais de cada plataforma via RetroAPI (`retroapi.konsumer.workers.dev`)
+  /// 2. Catálogo curado integrado
+  /// 3. Milhares de jogos reais da RetroAPI (`retroapi.konsumer.workers.dev`)
   Future<List<EmulationGame>> fetchRealCatalog({
     String rommServerUrl = '',
     String rommApiToken = '',
   }) async {
     final List<EmulationGame> combined = [];
+    final Set<String> seenKeys = {};
+
+    void addIfNew(EmulationGame g) {
+      final key = '${g.platformSlug.toLowerCase()}|${g.name.toLowerCase()}';
+      if (seenKeys.add(key)) {
+        combined.add(g);
+      }
+    }
+
     if (rommServerUrl.trim().isNotEmpty) {
       final remote = await fetchFromRommServer(
         serverUrl: rommServerUrl,
         apiToken: rommApiToken,
       );
-      combined.addAll(remote);
-    }
-
-    for (final g in kVerifiedRealGamesCatalog) {
-      if (!combined.any(
-        (c) =>
-            c.name.toLowerCase() == g.name.toLowerCase() &&
-            c.platformSlug == g.platformSlug,
-      )) {
-        combined.add(g);
+      for (final g in remote) {
+        addIfNew(g);
       }
     }
 
-    // Busca em paralelo lotes reais da RetroAPI para multiplicar o catálogo em todas as plataformas
+    for (final g in kVerifiedRealGamesCatalog) {
+      addIfNew(g);
+    }
+
+    // Busca em paralelo lotes reais da RetroAPI para restaurar catálogo completo (3.000+ jogos)
     const targetPlatforms = [
       'psp',
       'ps1',
@@ -1053,22 +1079,19 @@ class IgdbSteamGridService {
 
     final retroBatches = await Future.wait(
       targetPlatforms.map(
-        (slug) => fetchFromRetroApiPlatform(slug, maxPerPlatform: 16),
+        (slug) => fetchFromRetroApiPlatform(slug, maxPerPlatform: 260),
       ),
     );
 
     for (final batch in retroBatches) {
       for (final g in batch) {
-        if (!combined.any(
-          (c) =>
-              c.name.toLowerCase() == g.name.toLowerCase() &&
-              c.platformSlug == g.platformSlug,
-        )) {
-          combined.add(g);
-        }
+        addIfNew(g);
       }
     }
 
+    if (steamGridDbApiKey.isEmpty) {
+      return combined;
+    }
     return Future.wait(combined.map(enrichWithSteamGridDbArt));
   }
 }
@@ -1374,6 +1397,22 @@ const List<EmulationGame> kVerifiedRealGamesCatalog = [
     region: 'USA',
     estimatedSizeBytes: 429916160,
     directRomUrl: 'retroapi://ps1/Tekken_3.chd',
+  ),
+  EmulationGame(
+    igdbId: 1184,
+    name: 'Crash Bandicoot 2: Cortex Strikes Back',
+    canonicalNoIntroName: 'Crash Bandicoot 2 - Cortex Strikes Back (USA)',
+    summary:
+        'Crash retorna para coletar os 25 cristais espalhados pelas salas dimensionais enquanto Dr. Neo Cortex oculta suas reais intenções com a estação espacial Cortex Vortex.',
+    genres: ['Plataforma 3D', 'Aventura'],
+    developer: 'Naughty Dog',
+    releaseYear: 1997,
+    rating: 92,
+    platformName: 'PS1',
+    platformSlug: 'ps1',
+    region: 'EUR',
+    estimatedSizeBytes: 136501796,
+    directRomUrl: 'retroapi://ps1/Crash_Bandicoot_2_Cortex_Strikes_Back.chd',
   ),
   EmulationGame(
     igdbId: 1185,
@@ -2623,99 +2662,5 @@ const List<EmulationGame> kVerifiedRealGamesCatalog = [
     region: 'USA',
     estimatedSizeBytes: 524288,
     directRomUrl: 'retroapi://mastersystem/Phantasy_Star.sms',
-  ),
-
-  // ==========================================================================
-  // NINTENDO SWITCH (PONTE DE LANÇAMENTO PARA EDEN — NCE + TURNIP)
-  // ==========================================================================
-  EmulationGame(
-    igdbId: 99501,
-    name: 'Hollow Knight: Silksong',
-    canonicalNoIntroName: 'Hollow Knight - Silksong',
-    summary:
-        'A sequência protagonizada por Hornet em um reino de seda e canções. Importe sua ROM (.nsp/.xci/.nsz) local ou via RomM para abrir direto no Eden com NCE e Turnip.',
-    genres: ['Metroidvania', 'Ação', 'Aventura'],
-    developer: 'Team Cherry',
-    releaseYear: 2025,
-    rating: 95,
-    platformName: 'SWITCH',
-    platformSlug: 'switch',
-    region: 'WORLD',
-    estimatedSizeBytes: 4200000000,
-    gridCoverUrl:
-        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1030300/library_600x900.jpg',
-    directRomUrl: 'external://switch/Hollow_Knight_Silksong.nsp',
-  ),
-  EmulationGame(
-    igdbId: 99502,
-    name: 'Hollow Knight',
-    canonicalNoIntroName: 'Hollow Knight',
-    summary:
-        'Explore as cavernas interconectadas de Hallownest. Abra sua ROM Switch (.nsp/.xci) direto pelo LoopGamer usando o motor Eden ARM64.',
-    genres: ['Metroidvania', 'Ação', 'Plataforma'],
-    developer: 'Team Cherry',
-    releaseYear: 2018,
-    rating: 94,
-    platformName: 'SWITCH',
-    platformSlug: 'switch',
-    region: 'WORLD',
-    estimatedSizeBytes: 3600000000,
-    gridCoverUrl:
-        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/367520/library_600x900.jpg',
-    directRomUrl: 'external://switch/Hollow_Knight.nsp',
-  ),
-  EmulationGame(
-    igdbId: 99503,
-    name: 'Celeste',
-    canonicalNoIntroName: 'Celeste',
-    summary:
-        'Escale a montanha Celeste em centenas de desafios precisos de plataforma 2D. Compatível via ponte Eden.',
-    genres: ['Plataforma', 'Aventura'],
-    developer: 'Maddy Makes Games',
-    releaseYear: 2018,
-    rating: 94,
-    platformName: 'SWITCH',
-    platformSlug: 'switch',
-    region: 'WORLD',
-    estimatedSizeBytes: 1200000000,
-    gridCoverUrl:
-        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/504230/library_600x900.jpg',
-    directRomUrl: 'external://switch/Celeste.nsp',
-  ),
-  EmulationGame(
-    igdbId: 99504,
-    name: 'Cuphead',
-    canonicalNoIntroName: 'Cuphead',
-    summary:
-        'Ação e chefes clássicos desenhados à mão no estilo animação dos anos 1930 a 60 FPS no Eden.',
-    genres: ['Shooter', 'Plataforma', 'Ação'],
-    developer: 'Studio MDHR',
-    releaseYear: 2019,
-    rating: 91,
-    platformName: 'SWITCH',
-    platformSlug: 'switch',
-    region: 'WORLD',
-    estimatedSizeBytes: 3400000000,
-    gridCoverUrl:
-        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/268910/library_600x900.jpg',
-    directRomUrl: 'external://switch/Cuphead.nsp',
-  ),
-  EmulationGame(
-    igdbId: 99505,
-    name: 'Hades',
-    canonicalNoIntroName: 'Hades',
-    summary:
-        'Roguelike frenético da Supergiant Games nos domínios do submundo grego. Lance sua ROM Switch direto no Eden.',
-    genres: ['Ação', 'RPG'],
-    developer: 'Supergiant Games',
-    releaseYear: 2020,
-    rating: 93,
-    platformName: 'SWITCH',
-    platformSlug: 'switch',
-    region: 'WORLD',
-    estimatedSizeBytes: 5700000000,
-    gridCoverUrl:
-        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1145360/library_600x900.jpg',
-    directRomUrl: 'external://switch/Hades.nsp',
   ),
 ];

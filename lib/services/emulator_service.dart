@@ -384,6 +384,7 @@ class EmulatorService {
     String customDriverDir = '',
     String customDriverName = '',
     bool adrenoTurbo = false,
+    String freedrenoPreset = '',
     Map<String, String>? coreOptions,
     void Function(double coreProgress)? onCoreDownloadProgress,
   }) async {
@@ -395,7 +396,7 @@ class EmulatorService {
       final hasPup = await hasPs3Firmware();
       if (!hasPup) {
         throw StateError(
-          'Firmware de PS3 (PS3UPDAT.PUP) não encontrada. Vá em Configurações > Saves e Armazenamento e importe o arquivo PS3UPDAT.PUP antes de iniciar.',
+          'Firmware de PS3 (PS3UPDAT.PUP) não encontrada. Vá em Configurações > Drivers, Firmware & Saves e importe o arquivo PS3UPDAT.PUP antes de iniciar.',
         );
       }
       gpuBackend = 'vulkan';
@@ -490,6 +491,7 @@ SoundSpeedHack = True
         'customDriverDir': customDriverDir,
         'customDriverName': customDriverName,
         'adrenoTurbo': adrenoTurbo,
+        'freedrenoPreset': freedrenoPreset,
         'coreOptions': coreOptions == null
             ? ''
             : coreOptions.entries
@@ -659,49 +661,5 @@ SoundSpeedHack = True
     try {
       await _methodChannel.invokeMethod<void>('stopLibretroSession');
     } catch (_) {}
-  }
-
-  /// Verifica se o emulador Eden (Switch) está instalado neste aparelho Android.
-  Future<String?> getInstalledEdenPackage() async {
-    try {
-      return await _methodChannel.invokeMethod<String>('getInstalledEdenPackage');
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /// Lança uma ROM Switch (.nsp / .xci / .nsz / .nro) diretamente no app Eden.
-  Future<bool> launchRomInEden(String romPath) async {
-    final res = await _methodChannel.invokeMethod<bool>(
-      'launchRomInEden',
-      {'romPath': romPath},
-    );
-    return res == true;
-  }
-
-  Future<void> openExternalUrl(String url) async {
-    await _methodChannel.invokeMethod<bool>('openExternalUrl', {'url': url});
-  }
-
-  /// Busca a URL do APK Android mais recente na API oficial do Eden Git.
-  Future<String> fetchLatestEdenApkUrl({bool optimized = false}) async {
-    const fallback = 'https://git.eden-emu.dev/eden-emu/eden/releases';
-    try {
-      final res = await _dio.get<Map<String, dynamic>>(
-        'https://git.eden-emu.dev/api/v1/repos/eden-emu/eden/releases/latest',
-      );
-      final assets = res.data?['assets'] as List<dynamic>? ?? const [];
-      final targetSuffix = optimized ? '-optimized.apk' : '-standard.apk';
-      for (final asset in assets.whereType<Map<String, dynamic>>()) {
-        final name = (asset['name'] as String?)?.toLowerCase() ?? '';
-        if (name.endsWith(targetSuffix)) {
-          final url = (asset['browser_download_url'] as String?) ?? '';
-          if (url.isNotEmpty) return url;
-        }
-      }
-      return (res.data?['html_url'] as String?) ?? fallback;
-    } catch (_) {
-      return fallback;
-    }
   }
 }

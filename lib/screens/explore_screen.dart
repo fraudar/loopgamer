@@ -114,12 +114,13 @@ class _ExploreScreenState extends State<ExploreScreen> {
   void _mergeIntoResults(List<EmulationGame> extra) {
     if (extra.isEmpty || !mounted) return;
     final merged = List<EmulationGame>.from(_results);
+    final seen = <String>{
+      for (final m in merged)
+        '${m.platformSlug.toLowerCase()}|${m.name.toLowerCase()}',
+    };
     for (final g in extra) {
-      if (!merged.any(
-        (m) =>
-            m.name.toLowerCase() == g.name.toLowerCase() &&
-            m.platformSlug == g.platformSlug,
-      )) {
+      final key = '${g.platformSlug.toLowerCase()}|${g.name.toLowerCase()}';
+      if (seen.add(key)) {
         merged.add(g);
       }
     }
@@ -1398,16 +1399,14 @@ class _GameDetailSheetState extends State<GameDetailSheet> {
                                           _startBackgroundDownload();
                                         }
                                       },
-                                      child: Text(
+                                        child: Text(
                                         canPlay
-                                            ? (game.isExternalEdenSwitch
-                                                ? 'Jogar no Eden'
-                                                : 'Jogar Agora')
+                                            ? 'Jogar Agora'
                                             : isDownloading
                                                 ? 'Baixando ${(100 * _status.progress).toStringAsFixed(0)}% (${_status.speedLabel ?? "Turbo"})'
                                                 : game.directRomUrl
                                                         .startsWith('external://')
-                                                    ? 'Importar ROM (.NSP / .XCI)'
+                                                    ? 'Importar Arquivo Local'
                                                     : 'Baixar (${game.formattedSize})',
                                         style: const TextStyle(
                                           fontFamily: 'ReadexPro',

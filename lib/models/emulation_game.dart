@@ -312,18 +312,6 @@ const List<RommPlatformSpec> kRommPlatforms = [
         'Experimental (RPCS3 ARM64): requer Vulkan e PS3UPDAT.PUP importado nas Configurações.',
   ),
   RommPlatformSpec(
-    slug: 'switch',
-    shortName: 'SWITCH',
-    fullName: 'Nintendo Switch',
-    manufacturer: 'Nintendo',
-    releaseYear: 2017,
-    defaultExtension: 'NSP',
-    accentColor: Color(0xFFE11D48),
-    category: RommPlatformCategory.nextGen3d,
-    coreNote:
-        'Ponte Eden (Switch): importe sua ROM (.nsp, .xci, .nsz, .nro) ou baixe do seu RomM para abrir direto no emulador Eden.',
-  ),
-  RommPlatformSpec(
     slug: 'saturn',
     shortName: 'SATURN',
     fullName: 'Sega Saturn',
@@ -532,14 +520,9 @@ class EmulationGame {
       logoUrl ??
       'https://thumbnails.libretro.com/${Uri.encodeComponent(libretroPlaylistName)}/Named_Logos/$_sanitizedThumbnailFile';
 
-  bool get isExternalEdenSwitch => platformSlug.toLowerCase() == 'switch';
-
   /// Escolhe o binário interno do emulador silenciosamente conforme a plataforma
   String get libretroCoreSoName {
     final p = platformSlug.toLowerCase();
-    if (p == 'switch' || p.contains('nintendo switch')) {
-      return 'external_eden_switch';
-    }
     if (p == 'gba' || p == 'gbc' || p == 'gb') {
       return 'mgba_libretro_android.so';
     }

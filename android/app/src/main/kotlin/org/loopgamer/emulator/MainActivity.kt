@@ -1,14 +1,9 @@
 package org.loopgamer.emulator
 
-import android.content.ComponentName
-import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.SurfaceTexture
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
-import android.net.Uri
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
@@ -16,7 +11,6 @@ import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
-import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -50,6 +44,22 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         private const val RETRO_L2 = 1 shl 12
         private const val RETRO_R2 = 1 shl 13
 
+        // Plataformas que só possuem 1 gatilho de cada lado (L e R, sem L2/R2),
+        // como PSP (God of War), GBA, SNES e Nintendo DS.
+        private val SINGLE_TRIGGER_PLATFORMS = setOf(
+            "psp",
+            "gba",
+            "snes",
+            "nds",
+            "gbc",
+            "gb",
+            "nes",
+            "gamegear",
+            "mastersystem",
+            "md",
+            "pce"
+        )
+
         init {
             System.loadLibrary("libretro_jni")
         }
@@ -68,6 +78,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     @Volatile private var fastForwardMultiplier: Double = 1.0
     private val touchJoypadMask = AtomicInteger(0)
     private val hardwareJoypadMask = AtomicInteger(0)
+    private val hardwareAxisMask = AtomicInteger(0)
+    @Volatile private var singleTriggerPlatform: Boolean = false
     private val leftStickX = AtomicInteger(0)
     private val leftStickY = AtomicInteger(0)
     private var currentSavesDir: String = ""
@@ -123,6 +135,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 val customDriverDir = call.argument<String>("customDriverDir") ?: ""
                 val customDriverName = call.argument<String>("customDriverName") ?: ""
                 val adrenoTurbo = call.argument<Boolean>("adrenoTurbo") ?: false
+                val freedrenoPreset = call.argument<String>("freedrenoPreset") ?: ""
 
                 if (corePath.isNullOrEmpty() || romPath.isNullOrEmpty()) {
                     result.error("INVALID_ARGS", "corePath e romPath são obrigatórios.", null)
@@ -138,6 +151,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     customDriverName,
                     adrenoTurbo
                 )
+                nativeSetFreedrenoPreset(freedrenoPreset)
 
                 vsyncEnabledFlag.set(vsync)
                 audioEnabledFlag.set(audEnabled)
@@ -155,13 +169,25 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 surfaceTexture = st
                 val platform = call.argument<String>("platform")?.lowercase() ?: ""
                 val romLower = romPath.lowercase()
+                val isPs1 = platform == "ps1" || platform == "psx"
                 val isPsp = platform == "psp" ||
                     romLower.endsWith(".iso") ||
                     romLower.endsWith(".cso") ||
-                    romLower.endsWith(".pbp") ||
-                    romLower.endsWith(".chd")
-                val initW = ((if (isPsp) 480 else 320) * screenScale).coerceIn(64, 4096)
-                val initH = ((if (isPsp) 272 else 240) * screenScale).coerceIn(64, 4096)
+                    (!isPs1 && (romLower.endsWith(".pbp") || romLower.endsWith(".chd")))
+                singleTriggerPlatform = platform in SINGLE_TRIGGER_PLATFORMS || isPsp
+                touchJoypadMask.set(0)
+                hardwareJoypadMask.set(0)
+                hardwareAxisMask.set(0)
+                val initW = when {
+                    isPsp -> (480 * screenScale).coerceIn(64, 4096)
+                    isPs1 -> maxOf(320 * screenScale, 640).coerceIn(64, 4096)
+                    else -> (320 * screenScale).coerceIn(64, 4096)
+                }
+                val initH = when {
+                    isPsp -> (272 * screenScale).coerceIn(64, 4096)
+                    isPs1 -> maxOf(240 * screenScale, 480).coerceIn(64, 4096)
+                    else -> (240 * screenScale).coerceIn(64, 4096)
+                }
                 st.setDefaultBufferSize(initW, initH)
                 val surface = Surface(st)
 
@@ -188,12 +214,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 }
 
                 // Define o tamanho real do buffer do SurfaceTexture conforme a
-                // resolução base do jogo × escala de tela escolhida (evita a
-                // imagem esticada/borrada de antes).
+                // resolução base do jogo × escala de tela escolhida (PS1 garante
+                // mínimo de 640x480 para telas entrelaçadas de boot/menu).
                 val baseW = nativeGetFrameWidth().coerceAtLeast(64)
                 val baseH = nativeGetFrameHeight().coerceAtLeast(64)
-                val targetW = (baseW * screenScale).coerceAtMost(4096)
-                val targetH = (baseH * screenScale).coerceAtMost(4096)
+                val targetW = maxOf(baseW * screenScale, if (isPs1) 640 else 64).coerceAtMost(4096)
+                val targetH = maxOf(baseH * screenScale, if (isPs1) 480 else 64).coerceAtMost(4096)
                 if (targetW != initW || targetH != initH) {
                     st.setDefaultBufferSize(targetW, targetH)
                 }
@@ -273,101 +299,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 result.success(null)
             }
 
-            "getInstalledEdenPackage" -> {
-                result.success(findInstalledEdenPackage())
-            }
-
-            "launchRomInEden" -> {
-                val romPath = call.argument<String>("romPath")
-                if (romPath.isNullOrEmpty()) {
-                    result.error("INVALID_ARGS", "Caminho da ROM ausente.", null)
-                    return
-                }
-                val romFile = File(romPath)
-                if (!romFile.exists()) {
-                    result.error("FILE_NOT_FOUND", "ROM não encontrada em disco.", null)
-                    return
-                }
-                val edenPkg = findInstalledEdenPackage()
-                if (edenPkg == null) {
-                    result.error("EDEN_NOT_INSTALLED", "Emulador Eden não está instalado neste dispositivo.", null)
-                    return
-                }
-                try {
-                    val uri = FileProvider.getUriForFile(
-                        this,
-                        "$packageName.fileprovider",
-                        romFile
-                    )
-                    grantUriPermission(edenPkg, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    val launchIntent = Intent(Intent.ACTION_VIEW).apply {
-                        setDataAndType(uri, "application/octet-stream")
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-                        component = ComponentName(
-                            edenPkg,
-                            "org.yuzu.yuzu_emu.activities.EmulationActivity"
-                        )
-                    }
-                    try {
-                        startActivity(launchIntent)
-                    } catch (_: Exception) {
-                        val fallbackIntent = Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(uri, "application/octet-stream")
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-                            setPackage(edenPkg)
-                        }
-                        startActivity(fallbackIntent)
-                    }
-                    result.success(true)
-                } catch (e: Exception) {
-                    result.error("EDEN_LAUNCH_FAILED", e.message ?: "Falha ao abrir no Eden.", null)
-                }
-            }
-
-            "openExternalUrl" -> {
-                val url = call.argument<String>("url")
-                if (url.isNullOrEmpty()) {
-                    result.error("INVALID_ARGS", "URL vazia.", null)
-                    return
-                }
-                try {
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    }
-                    startActivity(intent)
-                    result.success(true)
-                } catch (e: Exception) {
-                    result.error("OPEN_URL_FAILED", e.message ?: "Não foi possível abrir link.", null)
-                }
-            }
-
             else -> result.notImplemented()
         }
-    }
-
-    private fun findInstalledEdenPackage(): String? {
-        val candidates = listOf(
-            "dev.eden.eden_emulator",
-            "com.miHoYo.Yuanshen",
-            "dev.legacy.eden_emulator",
-            "org.yuzu.yuzu_emu"
-        )
-        for (pkg in candidates) {
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    packageManager.getPackageInfo(
-                        pkg,
-                        PackageManager.PackageInfoFlags.of(0)
-                    )
-                } else {
-                    @Suppress("DEPRECATION")
-                    packageManager.getPackageInfo(pkg, 0)
-                }
-                return pkg
-            } catch (_: Exception) {
-            }
-        }
-        return null
     }
 
     private fun applyAudioVolume() {
@@ -403,7 +336,15 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     }
 
     private fun pushCombinedInputToNative() {
-        val mergedMask = touchJoypadMask.get() or hardwareJoypadMask.get()
+        var mergedMask = touchJoypadMask.get() or hardwareJoypadMask.get() or hardwareAxisMask.get()
+        if (singleTriggerPlatform) {
+            if ((mergedMask and RETRO_L2) != 0) {
+                mergedMask = (mergedMask and RETRO_L2.inv()) or RETRO_L
+            }
+            if ((mergedMask and RETRO_R2) != 0) {
+                mergedMask = (mergedMask and RETRO_R2.inv()) or RETRO_R
+            }
+        }
         nativeUpdateInput(
             mergedMask,
             leftStickX.get().toShort(),
@@ -439,10 +380,32 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         ) {
             val lx = (event.getAxisValue(MotionEvent.AXIS_X) * 32767f).toInt().coerceIn(-32767, 32767)
             val ly = (event.getAxisValue(MotionEvent.AXIS_Y) * 32767f).toInt().coerceIn(-32767, 32767)
+            val lTrig = maxOf(
+                event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
+                event.getAxisValue(MotionEvent.AXIS_BRAKE)
+            )
+            val rTrig = maxOf(
+                event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
+                event.getAxisValue(MotionEvent.AXIS_GAS)
+            )
+            val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
+            val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
+
+            var axisBits = 0
+            if (lTrig >= 0.30f) axisBits = axisBits or RETRO_L2
+            if (rTrig >= 0.30f) axisBits = axisBits or RETRO_R2
+            if (hatX <= -0.5f) axisBits = axisBits or RETRO_LEFT
+            if (hatX >= 0.5f) axisBits = axisBits or RETRO_RIGHT
+            if (hatY <= -0.5f) axisBits = axisBits or RETRO_UP
+            if (hatY >= 0.5f) axisBits = axisBits or RETRO_DOWN
+
             leftStickX.set(lx)
             leftStickY.set(ly)
+            hardwareAxisMask.set(axisBits)
             pushCombinedInputToNative()
-            mainHandler.post { eventSink?.success(mapOf("event" to "hardwareGamepadActive")) }
+            if (kotlin.math.abs(lx) > 3000 || kotlin.math.abs(ly) > 3000 || axisBits != 0) {
+                mainHandler.post { eventSink?.success(mapOf("event" to "hardwareGamepadActive")) }
+            }
             return true
         }
         return super.onGenericMotionEvent(event)
@@ -579,6 +542,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         driverName: String,
         turbo: Boolean
     )
+    private external fun nativeSetFreedrenoPreset(preset: String)
     private external fun nativeSetGpuBackend(mode: Int)
     private external fun nativeSetRendererMode(software: Boolean)
     private external fun nativeSetFrameDup(enabled: Boolean)

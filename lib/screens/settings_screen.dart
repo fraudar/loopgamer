@@ -28,16 +28,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   int _usedBytes = 0;
   bool _hasPs3Firmware = false;
   bool _importingPs3Firmware = false;
-  String? _edenPackage;
-  bool _openingEdenDownload = false;
   int _selectedCategory = 0;
 
   static const List<({String title, String subtitle})> _categories = [
     (title: 'HUD na Tela', subtitle: 'Escolher FPS, ms, escala e console'),
     (title: 'Gamepad Touch & Físico', subtitle: 'Modo do controle e vibração'),
     (
-      title: 'Drivers, Saves e Switch',
-      subtitle: 'Turnip GPU, RomM, PS3 e Eden',
+      title: 'Drivers, Firmware & Saves',
+      subtitle: 'Turnip GPU, Firmware PS3, Saves e RomM',
     ),
   ];
 
@@ -46,40 +44,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     super.initState();
     _refreshStorageBytes();
     _refreshPs3FirmwareStatus();
-    _refreshEdenStatus();
   }
 
   Future<void> _refreshPs3FirmwareStatus() async {
     final installed = await _emulatorService.hasPs3Firmware();
     if (mounted) {
       setState(() => _hasPs3Firmware = installed);
-    }
-  }
-
-  Future<void> _refreshEdenStatus() async {
-    final pkg = await _emulatorService.getInstalledEdenPackage();
-    if (mounted) {
-      setState(() => _edenPackage = pkg);
-    }
-  }
-
-  Future<void> _launchEdenDownload() async {
-    if (_openingEdenDownload) return;
-    setState(() => _openingEdenDownload = true);
-    try {
-      final url = await _emulatorService.fetchLatestEdenApkUrl();
-      await _emulatorService.openExternalUrl(url);
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Não foi possível abrir o download do Eden: $e'),
-        ),
-      );
-    } finally {
-      if (mounted) {
-        setState(() => _openingEdenDownload = false);
-      }
     }
   }
 
@@ -637,52 +607,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
               const SizedBox(height: 4),
-              const Text(
-                'Ao conectar um joystick Bluetooth/USB, o controle na tela pode se ocultar automaticamente',
-                style: TextStyle(
+              Text(
+                s.touchOverlayMode.description,
+                style: const TextStyle(
                   fontFamily: 'Rubik',
                   fontSize: 12,
                   color: HydraTokens.textSecondary,
                 ),
               ),
-              const SizedBox(height: 12),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: TouchOverlayMode.values.map((mode) {
-                  final active = s.touchOverlayMode == mode;
-                  return GestureDetector(
-                    onTap: () => _update(s.copyWith(touchOverlayMode: mode)),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 9,
-                      ),
-                      decoration: BoxDecoration(
-                        color: active
-                            ? Colors.white
-                            : HydraTokens.surfaceCatalog,
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(
-                          color: active
-                              ? Colors.white
-                              : HydraTokens.borderSubtle8,
-                        ),
-                      ),
-                      child: Text(
-                        mode.label,
-                        style: TextStyle(
-                          fontFamily: 'ReadexPro',
-                          fontSize: 12,
-                          fontWeight: FontWeight.w700,
-                          color: active
-                              ? HydraTokens.bgPureBlack
-                              : HydraTokens.textPrimary,
-                        ),
-                      ),
-                    ),
-                  );
-                }).toList(),
+              const SizedBox(height: 10),
+              _SettingsSelectMenu<TouchOverlayMode>(
+                value: s.touchOverlayMode,
+                items: TouchOverlayMode.values,
+                labelOf: (mode) => mode.label,
+                descriptionOf: (mode) => mode.description,
+                onChanged: (mode) =>
+                    _update(s.copyWith(touchOverlayMode: mode)),
               ),
               const SizedBox(height: 14),
               const Divider(color: HydraTokens.borderSubtle8, height: 1),
@@ -711,7 +651,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     const SizedBox(width: 10),
                     const Expanded(
                       child: Text(
-                        'Dica: Durante qualquer partida, abra a Sidebar (botão Voltar) e toque em "Mover e Editar Botões na Tela". Toque em qualquer botão (L1, R2, D-Pad, Ações) para editar tamanho, opacidade e estilo direto na tela com prévia ao vivo!',
+                        'Dica: Durante qualquer partida, abra a Sidebar (botão Voltar) e toque em "Mover e Editar Botões na Tela". Consoles como PSP (God of War), GBA e SNES adaptam automaticamente os gatilhos para apenas L e R.',
                         style: TextStyle(
                           fontFamily: 'Rubik',
                           fontSize: 11.5,
@@ -766,16 +706,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     color: Colors.white,
                   ),
                   const SizedBox(width: 10),
-                  const Text(
-                    'Espaço Ocupado pelas ROMs',
-                    style: TextStyle(
-                      fontFamily: 'ReadexPro',
-                      fontSize: 13.5,
-                      fontWeight: FontWeight.w600,
-                      color: HydraTokens.textPrimary,
+                  const Expanded(
+                    child: Text(
+                      'Espaço Ocupado pelas ROMs',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontFamily: 'ReadexPro',
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w600,
+                        color: HydraTokens.textPrimary,
+                      ),
                     ),
                   ),
-                  const Spacer(),
+                  const SizedBox(width: 8),
                   Text(
                     _formatStorage(_usedBytes),
                     style: const TextStyle(
@@ -792,127 +736,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
         const SizedBox(height: 18),
         const _SectionHeader(
-          title: 'Servidor RomM & Firmware PS3 (RPCS3)',
+          title: 'Drivers, Firmware & Adreno Turnip',
           subtitle:
-              'Integre biblioteca privada RomM ou importe PS3UPDAT.PUP para títulos de PS3',
-        ),
-        const SizedBox(height: 10),
-        _SettingsSurfaceCard(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  PhosphorIcon(
-                    PhosphorIcons.cloudArrowDown(PhosphorIconsStyle.regular),
-                    size: 18,
-                    color: Colors.white,
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'Servidor RomM Privado',
-                          style: TextStyle(
-                            fontFamily: 'ReadexPro',
-                            fontSize: 13.5,
-                            fontWeight: FontWeight.w600,
-                            color: HydraTokens.textPrimary,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          s.rommServerUrl.trim().isEmpty
-                              ? 'Não configurado (usando RetroAPI & Archive.org)'
-                              : s.rommServerUrl.trim(),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            fontFamily: 'JetBrainsMono',
-                            fontSize: 11,
-                            color: HydraTokens.textSecondary,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  OutlinedButton(
-                    onPressed: () => _showRommConfigDialog(s),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: HydraTokens.primaryAurora,
-                      side: const BorderSide(color: HydraTokens.borderSubtle10),
-                    ),
-                    child: Text(
-                      s.rommServerUrl.trim().isEmpty ? 'Configurar' : 'Editar',
-                    ),
-                  ),
-                ],
-              ),
-              const Divider(color: HydraTokens.borderSubtle8, height: 22),
-              Row(
-                children: [
-                  PhosphorIcon(
-                    PhosphorIcons.cpu(PhosphorIconsStyle.regular),
-                    size: 18,
-                    color: Colors.white,
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'Firmware PS3 (PS3UPDAT.PUP)',
-                          style: TextStyle(
-                            fontFamily: 'ReadexPro',
-                            fontSize: 13.5,
-                            fontWeight: FontWeight.w600,
-                            color: HydraTokens.textPrimary,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          _hasPs3Firmware
-                              ? 'Instalado — pronto para RPCS3 (Vulkan)'
-                              : 'Pendente — importe o PS3UPDAT.PUP para abrir jogos de PS3',
-                          style: TextStyle(
-                            fontFamily: 'Rubik',
-                            fontSize: 11.5,
-                            color: _hasPs3Firmware
-                                ? HydraTokens.primaryAurora
-                                : HydraTokens.textSecondary,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  OutlinedButton(
-                    onPressed:
-                        _importingPs3Firmware ? null : _handleImportPs3Firmware,
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: HydraTokens.primaryAurora,
-                      side: const BorderSide(color: HydraTokens.borderSubtle10),
-                    ),
-                    child: Text(
-                      _importingPs3Firmware
-                          ? 'Importando...'
-                          : (_hasPs3Firmware ? 'Atualizar' : 'Importar PUP'),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 18),
-        const _SectionHeader(
-          title: 'Drivers Vulkan (AdrenoTools) & Switch (Eden)',
-          subtitle:
-              'Carregamento rootless de drivers Mesa Turnip (ARM64) e integração com Eden',
+              'Driver Vulkan Turnip (AdrenoTools), Freedreno (TU_DEBUG) e Firmware PS3',
         ),
         const SizedBox(height: 10),
         _SettingsSurfaceCard(
@@ -978,10 +804,38 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 onChanged: (v) => _update(s.copyWith(adrenoTurboMode: v)),
               ),
               const Divider(color: HydraTokens.borderSubtle8, height: 22),
+              const Text(
+                'Perfil Freedreno / Turnip (TU_DEBUG)',
+                style: TextStyle(
+                  fontFamily: 'ReadexPro',
+                  fontSize: 13.5,
+                  fontWeight: FontWeight.w600,
+                  color: HydraTokens.textPrimary,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                s.freedrenoPreset.description,
+                style: const TextStyle(
+                  fontFamily: 'Rubik',
+                  fontSize: 11.5,
+                  color: HydraTokens.textSecondary,
+                ),
+              ),
+              const SizedBox(height: 10),
+              _SettingsSelectMenu<TurnipFreedrenoPreset>(
+                value: s.freedrenoPreset,
+                items: TurnipFreedrenoPreset.values,
+                labelOf: (preset) => preset.label,
+                descriptionOf: (preset) => preset.description,
+                onChanged: (preset) =>
+                    _update(s.copyWith(freedrenoPreset: preset)),
+              ),
+              const Divider(color: HydraTokens.borderSubtle8, height: 22),
               Row(
                 children: [
                   PhosphorIcon(
-                    PhosphorIcons.gameController(PhosphorIconsStyle.regular),
+                    PhosphorIcons.cpu(PhosphorIconsStyle.regular),
                     size: 18,
                     color: Colors.white,
                   ),
@@ -991,7 +845,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         const Text(
-                          'Emulador Nintendo Switch (Eden)',
+                          'Firmware PS3 (PS3UPDAT.PUP)',
                           style: TextStyle(
                             fontFamily: 'ReadexPro',
                             fontSize: 13.5,
@@ -1001,13 +855,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                         const SizedBox(height: 2),
                         Text(
-                          _edenPackage != null
-                              ? 'Detectado ($_edenPackage) — ROMs .NSP/.XCI abrem direto no Eden'
-                              : 'Não instalado — baixe o Eden para abrir jogos Switch direto do catálogo',
+                          _hasPs3Firmware
+                              ? 'Instalado — pronto para RPCS3 (Vulkan)'
+                              : 'Pendente — importe o PS3UPDAT.PUP para abrir jogos de PS3',
                           style: TextStyle(
                             fontFamily: 'Rubik',
                             fontSize: 11.5,
-                            color: _edenPackage != null
+                            color: _hasPs3Firmware
                                 ? HydraTokens.primaryAurora
                                 : HydraTokens.textSecondary,
                           ),
@@ -1016,29 +870,78 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
                   ),
                   const SizedBox(width: 8),
-                  IconButton(
-                    tooltip: 'Verificar instalação do Eden',
-                    onPressed: _refreshEdenStatus,
-                    icon: PhosphorIcon(
-                      PhosphorIcons.arrowsClockwise(PhosphorIconsStyle.regular),
-                      size: 18,
-                      color: HydraTokens.textSecondary,
-                    ),
-                  ),
                   OutlinedButton(
                     onPressed:
-                        _openingEdenDownload ? null : _launchEdenDownload,
+                        _importingPs3Firmware ? null : _handleImportPs3Firmware,
                     style: OutlinedButton.styleFrom(
                       foregroundColor: HydraTokens.primaryAurora,
                       side: const BorderSide(color: HydraTokens.borderSubtle10),
                     ),
                     child: Text(
-                      _openingEdenDownload
-                          ? 'Abrindo...'
-                          : (_edenPackage != null ? 'Atualizar' : 'Baixar Eden'),
+                      _importingPs3Firmware
+                          ? 'Importando...'
+                          : (_hasPs3Firmware ? 'Atualizar' : 'Importar PUP'),
                     ),
                   ),
                 ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        const _SectionHeader(
+          title: 'Servidor RomM Privado',
+          subtitle: 'Integre sua biblioteca privada RomM (opcional)',
+        ),
+        const SizedBox(height: 10),
+        _SettingsSurfaceCard(
+          child: Row(
+            children: [
+              PhosphorIcon(
+                PhosphorIcons.cloudArrowDown(PhosphorIconsStyle.regular),
+                size: 18,
+                color: Colors.white,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'URL e Token do Servidor',
+                      style: TextStyle(
+                        fontFamily: 'ReadexPro',
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w600,
+                        color: HydraTokens.textPrimary,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      s.rommServerUrl.trim().isEmpty
+                          ? 'Não configurado (usando RetroAPI & Archive.org)'
+                          : s.rommServerUrl.trim(),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontFamily: 'JetBrainsMono',
+                        fontSize: 11,
+                        color: HydraTokens.textSecondary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              OutlinedButton(
+                onPressed: () => _showRommConfigDialog(s),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: HydraTokens.primaryAurora,
+                  side: const BorderSide(color: HydraTokens.borderSubtle10),
+                ),
+                child: Text(
+                  s.rommServerUrl.trim().isEmpty ? 'Configurar' : 'Editar',
+                ),
               ),
             ],
           ),
@@ -1253,6 +1156,105 @@ class _SectionHeader extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _SettingsSelectMenu<T> extends StatelessWidget {
+  const _SettingsSelectMenu({
+    required this.value,
+    required this.items,
+    required this.labelOf,
+    this.descriptionOf,
+    required this.onChanged,
+  });
+
+  final T value;
+  final List<T> items;
+  final String Function(T) labelOf;
+  final String Function(T)? descriptionOf;
+  final ValueChanged<T> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
+      decoration: BoxDecoration(
+        color: HydraTokens.surfaceCatalog,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: HydraTokens.borderSubtle10),
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<T>(
+          value: value,
+          isExpanded: true,
+          itemHeight: null,
+          dropdownColor: HydraTokens.surfaceElevated1,
+          borderRadius: BorderRadius.circular(12),
+          icon: PhosphorIcon(
+            PhosphorIcons.caretDown(PhosphorIconsStyle.bold),
+            size: 16,
+            color: HydraTokens.primaryAurora,
+          ),
+          selectedItemBuilder: (context) => items.map((item) {
+            return Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                labelOf(item),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontFamily: 'ReadexPro',
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: HydraTokens.textPrimary,
+                ),
+              ),
+            );
+          }).toList(),
+          items: items.map((item) {
+            final selected = item == value;
+            final desc = descriptionOf?.call(item);
+            return DropdownMenuItem<T>(
+              value: item,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      labelOf(item),
+                      style: TextStyle(
+                        fontFamily: 'ReadexPro',
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                        color: selected
+                            ? HydraTokens.primaryAurora
+                            : HydraTokens.textPrimary,
+                      ),
+                    ),
+                    if (desc != null && desc.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        desc,
+                        style: const TextStyle(
+                          fontFamily: 'Rubik',
+                          fontSize: 11,
+                          color: HydraTokens.textSecondary,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            );
+          }).toList(),
+          onChanged: (next) {
+            if (next != null) onChanged(next);
+          },
+        ),
+      ),
     );
   }
 }

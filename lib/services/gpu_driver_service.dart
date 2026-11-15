@@ -48,10 +48,16 @@ class InstalledGpuDriver {
 /// Todos os binários ficam em storage interno do app (`filesDir/gpu_drivers/`)
 /// para permitir `dlopen`/injeção rootless em dispositivos ARM64.
 class GpuDriverService {
+  // Repositórios Turnip AdrenoTools usados no ecossistema Eden/Android
   static const List<String> _repos = [
     'K11MCH1/AdrenoToolsDrivers',
     'MrPurple666/purple-turnip',
+    'crueter/GameHub-8Elite-Drivers',
+    'Weab-chan/freedreno_turnip-CI',
   ];
+
+  static List<TurnipDriverRelease>? _cachedReleases;
+  static DateTime? _cachedAt;
 
   final Dio _dio = Dio(
     BaseOptions(
@@ -70,38 +76,56 @@ class GpuDriverService {
     return dir;
   }
 
-  /// Lista releases públicas de drivers Turnip no GitHub (`AdrenoToolsDrivers` e `purple-turnip`).
-  Future<List<TurnipDriverRelease>> fetchAvailableDrivers() async {
-    final List<TurnipDriverRelease> releases = [];
-    for (final repo in _repos) {
-      try {
-        final res = await _dio.get<List<dynamic>>(
-          'https://api.github.com/repos/$repo/releases',
-          queryParameters: {'per_page': 6},
-        );
-        final list = res.data ?? const [];
-        for (final item in list.whereType<Map<String, dynamic>>()) {
-          final tag = (item['tag_name'] as String?) ?? '';
-          final assets = item['assets'] as List<dynamic>? ?? const [];
-          for (final asset in assets.whereType<Map<String, dynamic>>()) {
-            final name = (asset['name'] as String?) ?? '';
-            final lower = name.toLowerCase();
-            if (!lower.endsWith('.zip')) continue;
-            final url = (asset['browser_download_url'] as String?) ?? '';
-            final size = (asset['size'] as num?)?.toInt() ?? 0;
-            if (url.isEmpty) continue;
-            releases.add(
-              TurnipDriverRelease(
-                repo: repo,
-                tag: tag,
-                assetName: name,
-                downloadUrl: url,
-                sizeBytes: size,
-              ),
-            );
+  /// Lista releases públicas de drivers Turnip nos repositórios AdrenoTools no GitHub.
+  Future<List<TurnipDriverRelease>> fetchAvailableDrivers({
+    bool forceRefresh = false,
+  }) async {
+    final now = DateTime.now();
+    if (!forceRefresh &&
+        _cachedReleases != null &&
+        _cachedAt != null &&
+        now.difference(_cachedAt!).inMinutes < 15) {
+      return _cachedReleases!;
+    }
+
+    final lists = await Future.wait(
+      _repos.map((repo) async {
+        final List<TurnipDriverRelease> repoReleases = [];
+        try {
+          final res = await _dio.get<List<dynamic>>(
+            'https://api.github.com/repos/$repo/releases',
+            queryParameters: {'per_page': 5},
+          );
+          final list = res.data ?? const [];
+          for (final item in list.whereType<Map<String, dynamic>>()) {
+            final tag = (item['tag_name'] as String?) ?? '';
+            final assets = item['assets'] as List<dynamic>? ?? const [];
+            for (final asset in assets.whereType<Map<String, dynamic>>()) {
+              final name = (asset['name'] as String?) ?? '';
+              final lower = name.toLowerCase();
+              if (!lower.endsWith('.zip')) continue;
+              final url = (asset['browser_download_url'] as String?) ?? '';
+              final size = (asset['size'] as num?)?.toInt() ?? 0;
+              if (url.isEmpty) continue;
+              repoReleases.add(
+                TurnipDriverRelease(
+                  repo: repo,
+                  tag: tag,
+                  assetName: name,
+                  downloadUrl: url,
+                  sizeBytes: size,
+                ),
+              );
+            }
           }
-        }
-      } catch (_) {}
+        } catch (_) {}
+        return repoReleases;
+      }),
+    );
+    final releases = [for (final batch in lists) ...batch];
+    if (releases.isNotEmpty) {
+      _cachedReleases = releases;
+      _cachedAt = now;
     }
     return releases;
   }

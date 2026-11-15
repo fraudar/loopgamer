@@ -33,7 +33,11 @@ enum GamepadButtonStyle {
 enum ShoulderTriggerStyle {
   compactTogether('Compactos Juntos', 'L1/L2 e R1/R2 unidos para clique rápido'),
   stackedVertical('Empilhados', 'L2 em cima de L1 verticalmente'),
-  sideBySide('Separados', 'Gatilhos lado a lado tradicionais');
+  sideBySide('Separados', 'Gatilhos lado a lado tradicionais'),
+  singleLR(
+    'Gatilho Único (L / R)',
+    'Apenas L e R maiores (automático em PSP / God of War, GBA e SNES)',
+  );
 
   const ShoulderTriggerStyle(this.label, this.description);
   final String label;
@@ -48,6 +52,19 @@ enum GpuBackend {
   const GpuBackend(this.label, this.description);
   final String label;
   final String description;
+}
+
+enum TurnipFreedrenoPreset {
+  standard('Padrão', 'Configuração padrão do driver Vulkan/Turnip', ''),
+  sysmem('Sysmem', 'Desativa tiling GMEM (corrige glitch em algumas Adreno)', 'sysmem'),
+  noubwc('Sem UBWC', 'Desativa compressão UBWC para compatibilidade extra', 'noubwc'),
+  nobin('Sem Binning', 'Desativa binning Freedreno em cenas complexas', 'nobin'),
+  gmem('GMEM Forçado', 'Força cache GMEM em Adreno para maior throughput', 'gmem');
+
+  const TurnipFreedrenoPreset(this.label, this.description, this.envValue);
+  final String label;
+  final String description;
+  final String envValue;
 }
 
 enum RenderResolutionPreset {
@@ -208,6 +225,7 @@ class AppSettings {
     this.customVulkanDriverName = '',
     this.customVulkanDriverLabel = '',
     this.adrenoTurboMode = false,
+    this.freedrenoPreset = TurnipFreedrenoPreset.standard,
   });
 
   // Fast-Forward (2x/3x/4x) — segurar ou alternar
@@ -309,6 +327,29 @@ class AppSettings {
   final String customVulkanDriverName;
   final String customVulkanDriverLabel;
   final bool adrenoTurboMode;
+  final TurnipFreedrenoPreset freedrenoPreset;
+
+  /// Consoles que possuem apenas gatilhos simples L e R (sem L2/R2 no controle original).
+  static const Set<String> singleTriggerPlatforms = <String>{
+    'psp',
+    'gba',
+    'snes',
+    'nds',
+    'gbc',
+    'gb',
+    'nes',
+    'gamegear',
+    'mastersystem',
+    'md',
+    'pce',
+  };
+
+  static bool isSingleTriggerPlatform(String platformSlug) =>
+      singleTriggerPlatforms.contains(platformSlug.trim().toLowerCase());
+
+  bool shouldUseSingleTriggers(String platformSlug) =>
+      shoulderStyle == ShoulderTriggerStyle.singleLR ||
+      isSingleTriggerPlatform(platformSlug);
 
   String get resolutionLabel => renderResolution.label;
 
@@ -431,6 +472,7 @@ class AppSettings {
     String? customVulkanDriverName,
     String? customVulkanDriverLabel,
     bool? adrenoTurboMode,
+    TurnipFreedrenoPreset? freedrenoPreset,
   }) {
     return AppSettings(
       fastForwardSpeed: fastForwardSpeed ?? this.fastForwardSpeed,
@@ -510,6 +552,7 @@ class AppSettings {
       customVulkanDriverLabel:
           customVulkanDriverLabel ?? this.customVulkanDriverLabel,
       adrenoTurboMode: adrenoTurboMode ?? this.adrenoTurboMode,
+      freedrenoPreset: freedrenoPreset ?? this.freedrenoPreset,
     );
   }
 
@@ -617,6 +660,7 @@ class AppSettings {
       'customVulkanDriverName': customVulkanDriverName,
       'customVulkanDriverLabel': customVulkanDriverLabel,
       'adrenoTurboMode': adrenoTurboMode,
+      'freedrenoPreset': freedrenoPreset.name,
     };
   }
 
@@ -761,6 +805,10 @@ class AppSettings {
       customVulkanDriverLabel:
           (map['customVulkanDriverLabel'] as String?) ?? '',
       adrenoTurboMode: (map['adrenoTurboMode'] as bool?) ?? false,
+      freedrenoPreset: TurnipFreedrenoPreset.values.firstWhere(
+        (e) => e.name == map['freedrenoPreset'],
+        orElse: () => TurnipFreedrenoPreset.standard,
+      ),
     );
   }
 }

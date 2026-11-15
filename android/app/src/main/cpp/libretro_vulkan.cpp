@@ -12,15 +12,18 @@
 #include <android/native_window.h>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <mutex>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_android.h>
 
 #if defined(LOOPGAMER_HAS_ADRENOTOOLS)
+#include <adrenotools/bcenabler.h>
 #include <adrenotools/driver.h>
 #endif
 
@@ -239,7 +242,9 @@ std::string g_tmpDir;
 std::string g_customDriverDir;
 std::string g_customDriverName;
 std::string g_loadedDriverKey;
+std::string g_freedrenoPreset;
 bool g_adrenoTurbo = false;
+bool g_bcnPatchAttempted = false;
 
 std::string ensure_trailing_slash(const char* raw) {
   if (!raw || !*raw) return {};
@@ -248,7 +253,39 @@ std::string ensure_trailing_slash(const char* raw) {
   return out;
 }
 
+bool ensure_dir_exists(const std::string& path) {
+  if (path.empty()) return false;
+  struct stat st{};
+  if (stat(path.c_str(), &st) == 0) return S_ISDIR(st.st_mode);
+  if (mkdir(path.c_str(), 0755) == 0) return true;
+  return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+// Configura flags Turnip/Freedreno inspiradas no NativeLibrary::SetFreedrenoEnv do Eden
+void apply_freedreno_env() {
+  if (g_freedrenoPreset == "sysmem") {
+    setenv("TU_DEBUG", "sysmem", 1);
+    unsetenv("FD_DEV_FEATURES");
+  } else if (g_freedrenoPreset == "noubwc") {
+    setenv("TU_DEBUG", "noubwc", 1);
+    unsetenv("FD_DEV_FEATURES");
+  } else if (g_freedrenoPreset == "nobin") {
+    setenv("TU_DEBUG", "nobin", 1);
+    unsetenv("FD_DEV_FEATURES");
+  } else if (g_freedrenoPreset == "noconform") {
+    setenv("TU_DEBUG", "noconform", 1);
+    unsetenv("FD_DEV_FEATURES");
+  } else if (g_freedrenoPreset == "gmem") {
+    setenv("TU_DEBUG", "gmem", 1);
+    unsetenv("FD_DEV_FEATURES");
+  } else {
+    unsetenv("TU_DEBUG");
+    unsetenv("FD_DEV_FEATURES");
+  }
+}
+
 bool load_loader() {
+  apply_freedreno_env();
   const std::string desiredKey =
       g_customDriverDir + "|" + g_customDriverName;
   if (g_fn.lib && g_loadedDriverKey == desiredKey) {
@@ -259,20 +296,33 @@ bool load_loader() {
   }
   g_fn = VulkanFns{};
   g_loadedDriverKey = desiredKey;
+  g_bcnPatchAttempted = false;
 
 #if defined(LOOPGAMER_HAS_ADRENOTOOLS)
   if (!g_customDriverName.empty() && !g_customDriverDir.empty() &&
       !g_hookLibDir.empty()) {
-    VK_LOGI("Tentando carregar driver Vulkan custom via adrenotools: %s%s",
-            g_customDriverDir.c_str(), g_customDriverName.c_str());
+    int flags = ADRENOTOOLS_DRIVER_CUSTOM;
+    std::string redirectDir;
+    if (!g_tmpDir.empty()) {
+      redirectDir = g_tmpDir + "vk_redirect/";
+      if (ensure_dir_exists(redirectDir)) {
+        flags |= ADRENOTOOLS_DRIVER_FILE_REDIRECT;
+      } else {
+        redirectDir.clear();
+      }
+    }
+    VK_LOGI("Tentando carregar driver Vulkan custom via adrenotools: %s%s (redirect=%s preset=%s)",
+            g_customDriverDir.c_str(), g_customDriverName.c_str(),
+            redirectDir.empty() ? "none" : redirectDir.c_str(),
+            g_freedrenoPreset.empty() ? "default" : g_freedrenoPreset.c_str());
     g_fn.lib = adrenotools_open_libvulkan(
         RTLD_NOW,
-        ADRENOTOOLS_DRIVER_CUSTOM,
+        flags,
         g_tmpDir.empty() ? nullptr : g_tmpDir.c_str(),
         g_hookLibDir.c_str(),
         g_customDriverDir.c_str(),
         g_customDriverName.c_str(),
-        nullptr,
+        redirectDir.empty() ? nullptr : redirectDir.c_str(),
         nullptr);
     if (g_fn.lib) {
       adrenotools_set_turbo(g_adrenoTurbo);
@@ -1627,8 +1677,25 @@ bool init_from_negotiation(
 
   VkPhysicalDeviceProperties props{};
   g_fn.physProps(fe.gpu, &props);
-  VK_LOGI("Vulkan ativo na GPU: %s (queueFamily=%u presentFamily=%u)",
-          props.deviceName, fe.queueFamily, fe.presentQueueFamily);
+  const uint32_t drvMajor = VK_API_VERSION_MAJOR(props.driverVersion);
+  const uint32_t drvMinor = VK_API_VERSION_MINOR(props.driverVersion);
+#if defined(LOOPGAMER_HAS_ADRENOTOOLS)
+  const auto bcnType =
+      adrenotools_get_bcn_type(drvMajor, drvMinor, props.vendorID);
+  if (!g_customDriverName.empty() && !g_bcnPatchAttempted &&
+      bcnType == ADRENOTOOLS_BCN_PATCH && g_fn.formatProps) {
+    g_bcnPatchAttempted = true;
+    const bool patched =
+        adrenotools_patch_bcn(reinterpret_cast<void*>(g_fn.formatProps));
+    VK_LOGI("BCeNabler patch Adreno %u.%u: %s", drvMajor, drvMinor,
+            patched ? "OK" : "falhou");
+  }
+#endif
+  VK_LOGI("Vulkan ativo na GPU: %s (vendor=0x%04x dev=0x%04x drv=%u.%u api=%u.%u q=%u pq=%u)",
+          props.deviceName, props.vendorID, props.deviceID, drvMajor, drvMinor,
+          VK_API_VERSION_MAJOR(props.apiVersion),
+          VK_API_VERSION_MINOR(props.apiVersion),
+          fe.queueFamily, fe.presentQueueFamily);
 
   fe.iface.interface_type = 0;
   fe.iface.interface_version = 5;
@@ -1679,6 +1746,18 @@ void set_custom_driver(const char* hook_lib_dir,
   if (changed && !g_fe.active) {
     g_fe.probed = false;
     g_fe.probeOk = false;
+  }
+}
+
+void set_freedreno_preset(const char* preset) {
+  const std::string next = preset ? preset : "";
+  if (next != g_freedrenoPreset) {
+    g_freedrenoPreset = next;
+    apply_freedreno_env();
+    if (!g_fe.active) {
+      g_fe.probed = false;
+      g_fe.probeOk = false;
+    }
   }
 }
 
