@@ -1,0 +1,1828 @@
+import 'package:flutter/material.dart';
+import 'package:phosphor_flutter/phosphor_flutter.dart';
+import '../models/app_settings.dart';
+import '../services/emulator_service.dart';
+import '../services/gpu_driver_service.dart';
+import '../services/rom_download_service.dart';
+import '../theme/hydra_tokens.dart';
+
+class SettingsScreen extends StatefulWidget {
+  const SettingsScreen({
+    super.key,
+    required this.settings,
+    required this.downloadService,
+    required this.onSettingsChanged,
+  });
+
+  final AppSettings settings;
+  final RomDownloadService downloadService;
+  final ValueChanged<AppSettings> onSettingsChanged;
+
+  @override
+  State<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends State<SettingsScreen> {
+  final EmulatorService _emulatorService = EmulatorService();
+  final GpuDriverService _gpuDriverService = GpuDriverService();
+  int _usedBytes = 0;
+  bool _hasPs3Firmware = false;
+  bool _importingPs3Firmware = false;
+  String? _edenPackage;
+  bool _openingEdenDownload = false;
+  int _selectedCategory = 0;
+
+  static const List<({String title, String subtitle})> _categories = [
+    (title: 'HUD na Tela', subtitle: 'Escolher FPS, ms, escala e console'),
+    (title: 'Gamepad Touch & Físico', subtitle: 'Modo do controle e vibração'),
+    (
+      title: 'Drivers, Saves e Switch',
+      subtitle: 'Turnip GPU, RomM, PS3 e Eden',
+    ),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshStorageBytes();
+    _refreshPs3FirmwareStatus();
+    _refreshEdenStatus();
+  }
+
+  Future<void> _refreshPs3FirmwareStatus() async {
+    final installed = await _emulatorService.hasPs3Firmware();
+    if (mounted) {
+      setState(() => _hasPs3Firmware = installed);
+    }
+  }
+
+  Future<void> _refreshEdenStatus() async {
+    final pkg = await _emulatorService.getInstalledEdenPackage();
+    if (mounted) {
+      setState(() => _edenPackage = pkg);
+    }
+  }
+
+  Future<void> _launchEdenDownload() async {
+    if (_openingEdenDownload) return;
+    setState(() => _openingEdenDownload = true);
+    try {
+      final url = await _emulatorService.fetchLatestEdenApkUrl();
+      await _emulatorService.openExternalUrl(url);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Não foi possível abrir o download do Eden: $e'),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _openingEdenDownload = false);
+      }
+    }
+  }
+
+  Future<void> _openGpuDriverManagerModal(AppSettings s) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => _GpuDriverManagerSheet(
+        gpuDriverService: _gpuDriverService,
+        activeDriverDir: s.customVulkanDriverDir,
+        activeDriverName: s.customVulkanDriverName,
+        onDriverSelected: (InstalledGpuDriver? driver) {
+          if (driver == null) {
+            _update(
+              s.copyWith(
+                customVulkanDriverDir: '',
+                customVulkanDriverName: '',
+                customVulkanDriverLabel: '',
+              ),
+            );
+          } else {
+            _update(
+              s.copyWith(
+                customVulkanDriverDir: driver.directoryPath,
+                customVulkanDriverName: driver.libraryName,
+                customVulkanDriverLabel:
+                    '${driver.name} (${driver.driverVersion})',
+              ),
+            );
+          }
+        },
+      ),
+    );
+  }
+
+  Future<void> _handleImportPs3Firmware() async {
+    if (_importingPs3Firmware) return;
+    setState(() => _importingPs3Firmware = true);
+    try {
+      final path = await _emulatorService.importPs3Firmware();
+      if (!mounted) return;
+      if (path != null) {
+        setState(() => _hasPs3Firmware = true);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Firmware PS3 (PS3UPDAT.PUP) importada com sucesso!'),
+          ),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(e.toString().replaceFirst('Bad state: ', ''))),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _importingPs3Firmware = false);
+      }
+    }
+  }
+
+  Future<void> _showRommConfigDialog(AppSettings s) async {
+    final urlController = TextEditingController(text: s.rommServerUrl);
+    final tokenController = TextEditingController(text: s.rommApiToken);
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          backgroundColor: HydraTokens.bgNearBlack,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: const BorderSide(color: HydraTokens.borderSubtle10),
+          ),
+          title: const Text(
+            'Servidor RomM Próprio',
+            style: TextStyle(
+              fontFamily: 'ReadexPro',
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+              color: HydraTokens.textPrimary,
+            ),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Conecte sua instância RomM (opcional) para listar e baixar sua coleção privada direto no Catálogo.',
+                style: TextStyle(
+                  fontFamily: 'Rubik',
+                  fontSize: 12,
+                  color: HydraTokens.textSecondary,
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: urlController,
+                style: const TextStyle(
+                  fontFamily: 'JetBrainsMono',
+                  fontSize: 12.5,
+                  color: HydraTokens.textPrimary,
+                ),
+                decoration: const InputDecoration(
+                  labelText: 'URL do Servidor RomM',
+                  hintText: 'https://romm.exemplo.com',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: tokenController,
+                obscureText: true,
+                style: const TextStyle(
+                  fontFamily: 'JetBrainsMono',
+                  fontSize: 12.5,
+                  color: HydraTokens.textPrimary,
+                ),
+                decoration: const InputDecoration(
+                  labelText: 'Bearer Token (opcional)',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancelar'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              style: FilledButton.styleFrom(
+                backgroundColor: HydraTokens.primaryAurora,
+                foregroundColor: HydraTokens.bgPureBlack,
+              ),
+              child: const Text('Salvar'),
+            ),
+          ],
+        );
+      },
+    );
+    if (saved == true) {
+      _update(
+        s.copyWith(
+          rommServerUrl: urlController.text.trim(),
+          rommApiToken: tokenController.text.trim(),
+        ),
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              urlController.text.trim().isEmpty
+                  ? 'Servidor RomM removido.'
+                  : 'Servidor RomM salvo! A sincronização foi iniciada.',
+            ),
+          ),
+        );
+      }
+    }
+    urlController.dispose();
+    tokenController.dispose();
+  }
+
+  Future<void> _refreshStorageBytes() async {
+    final total = await widget.downloadService.getDownloadedRomsTotalBytes();
+    if (mounted) {
+      setState(() => _usedBytes = total);
+    }
+  }
+
+  String _formatStorage(int bytes) {
+    if (bytes <= 0) return '0 MB';
+    final mb = bytes / (1024 * 1024);
+    if (mb >= 1024) {
+      return '${(mb / 1024).toStringAsFixed(2)} GB';
+    }
+    return '${mb.toStringAsFixed(1)} MB';
+  }
+
+  void _update(AppSettings next) {
+    widget.onSettingsChanged(next);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final size = MediaQuery.sizeOf(context);
+    final isLandscape = size.width > size.height && size.width >= 560;
+    final s = widget.settings;
+
+    return Scaffold(
+      backgroundColor: HydraTokens.bgPureBlack,
+      body: SafeArea(
+        child: isLandscape
+            ? _buildLandscapeSplitSettings(s)
+            : _buildPortraitSettings(s),
+      ),
+    );
+  }
+
+  // ==========================================================================
+  // MODO DEITADO (LANDSCAPE): PAINEL DIVIDIDO ESTILO CONSOLE GAMEHUB / PS5
+  // ==========================================================================
+  Widget _buildLandscapeSplitSettings(AppSettings s) {
+    return Row(
+      children: [
+        Container(
+          width: 230,
+          decoration: const BoxDecoration(
+            color: HydraTokens.bgNearBlack,
+            border: Border(
+              right: BorderSide(color: HydraTokens.borderSubtle8),
+            ),
+          ),
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                child: Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        'Configurações',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontFamily: 'ReadexPro',
+                          fontSize: 18,
+                          fontWeight: FontWeight.w700,
+                          color: HydraTokens.textPrimary,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    GestureDetector(
+                      onTap: () => _showHelpGuide(context),
+                      child: Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.10),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: Colors.white.withOpacity(0.18),
+                          ),
+                        ),
+                        child: PhosphorIcon(
+                          PhosphorIcons.question(PhosphorIconsStyle.bold),
+                          size: 15,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 10),
+              Expanded(
+                child: ListView.separated(
+                  itemCount: _categories.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 6),
+                  itemBuilder: (context, idx) {
+                    final cat = _categories[idx];
+                    final active = _selectedCategory == idx;
+                    return GestureDetector(
+                      onTap: () => setState(() => _selectedCategory = idx),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 160),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 11,
+                        ),
+                        decoration: BoxDecoration(
+                          color: active
+                              ? Colors.white.withOpacity(0.12)
+                              : Colors.transparent,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: active
+                                ? Colors.white.withOpacity(0.35)
+                                : Colors.transparent,
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              cat.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontFamily: 'ReadexPro',
+                                fontSize: 13,
+                                fontWeight: active
+                                    ? FontWeight.w700
+                                    : FontWeight.w500,
+                                color: active
+                                    ? Colors.white
+                                    : HydraTokens.textSecondary,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              cat.subtitle,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontFamily: 'Rubik',
+                                fontSize: 10.5,
+                                color: HydraTokens.textMuted,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: HydraTokens.surfaceCatalog,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        'ROMs Locais',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontFamily: 'Rubik',
+                          fontSize: 11.5,
+                          color: HydraTokens.textSecondary,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      _formatStorage(_usedBytes),
+                      style: const TextStyle(
+                        fontFamily: 'JetBrainsMono',
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                        color: HydraTokens.secondaryTeal,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(24, 18, 24, 28),
+            children: [
+              if (_selectedCategory == 0) _buildHudTelemetrySection(s),
+              if (_selectedCategory == 1) _buildGamepadSection(s),
+              if (_selectedCategory == 2) _buildSavesAndStorageSection(s),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ==========================================================================
+  // MODO EM PÉ (PORTRAIT): SEÇÕES ORGANIZADAS ESTILO GAMEHUB OS
+  // ==========================================================================
+  Widget _buildPortraitSettings(AppSettings s) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 14),
+          decoration: const BoxDecoration(
+            color: HydraTokens.bgPureBlack,
+            border: Border(
+              bottom: BorderSide(color: HydraTokens.borderSubtle8),
+            ),
+          ),
+          child: Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  'Configurações',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontFamily: 'ReadexPro',
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                    color: HydraTokens.textPrimary,
+                  ),
+                ),
+              ),
+              GestureDetector(
+                onTap: () => _showHelpGuide(context),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.10),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: Colors.white.withOpacity(0.20)),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      PhosphorIcon(
+                        PhosphorIcons.question(PhosphorIconsStyle.bold),
+                        size: 13,
+                        color: Colors.white,
+                      ),
+                      const SizedBox(width: 4),
+                      const Text(
+                        'Ajuda',
+                        style: TextStyle(
+                          fontFamily: 'ReadexPro',
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 11,
+                  vertical: 5,
+                ),
+                decoration: BoxDecoration(
+                  color: HydraTokens.bgNearBlack,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: HydraTokens.borderSubtle10),
+                ),
+                child: Text(
+                  _formatStorage(_usedBytes),
+                  style: const TextStyle(
+                    fontFamily: 'JetBrainsMono',
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    color: HydraTokens.secondaryTeal,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(18, 18, 18, 34),
+            children: [
+              _buildHudTelemetrySection(s),
+              const SizedBox(height: 22),
+              _buildGamepadSection(s),
+              const SizedBox(height: 22),
+              _buildSavesAndStorageSection(s),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildHudTelemetrySection(AppSettings s) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const _SectionHeader(
+          title: 'Informações na Tela (HUD / Telemetria)',
+          subtitle: 'Escolha exatamente quais informações aparecem durante o jogo',
+        ),
+        const SizedBox(height: 10),
+        _SettingsSurfaceCard(
+          child: Column(
+            children: [
+              _SettingsSwitchTile(
+                title: 'Exibir Barra de Informações no Jogo',
+                subtitle: 'Ativa ou oculta o indicador superior na partida',
+                value: s.showFpsTelemetry,
+                onChanged: (v) => _update(s.copyWith(showFpsTelemetry: v)),
+              ),
+              const Divider(color: HydraTokens.borderSubtle8, height: 16),
+              _SettingsSwitchTile(
+                title: 'Mostrar Contador de FPS',
+                subtitle: 'Exibe a taxa de quadros por segundo (ex.: 60 FPS)',
+                value: s.hudShowFps,
+                onChanged: s.showFpsTelemetry
+                    ? (v) => _update(s.copyWith(hudShowFps: v))
+                    : null,
+              ),
+              _SettingsSwitchTile(
+                title: 'Mostrar Multiplicador de Resolução',
+                subtitle: 'Exibe a resolução ativa (ex.: 2x, 3x, 4x)',
+                value: s.hudShowResolution,
+                onChanged: s.showFpsTelemetry
+                    ? (v) => _update(s.copyWith(hudShowResolution: v))
+                    : null,
+              ),
+              _SettingsSwitchTile(
+                title: 'Mostrar Plataforma / Console',
+                subtitle: 'Exibe o nome do console em execução (ex.: PSP, PS1)',
+                value: s.hudShowConsole,
+                onChanged: s.showFpsTelemetry
+                    ? (v) => _update(s.copyWith(hudShowConsole: v))
+                    : null,
+              ),
+              _SettingsSwitchTile(
+                title: 'Mostrar Tempo de Quadro (ms)',
+                subtitle: 'Exibe a latência de renderização em milissegundos',
+                value: s.hudShowFrameTime,
+                onChanged: s.showFpsTelemetry
+                    ? (v) => _update(s.copyWith(hudShowFrameTime: v))
+                    : null,
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildGamepadSection(AppSettings s) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const _SectionHeader(
+          title: 'Gamepad Touch & Controles Físicos',
+          subtitle:
+              'Configure o comportamento do overlay e vibração ao tocar',
+        ),
+        const SizedBox(height: 10),
+        _SettingsSurfaceCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Visibilidade do Controle na Tela',
+                style: TextStyle(
+                  fontFamily: 'ReadexPro',
+                  fontSize: 14,
+                  fontWeight: FontWeight.w700,
+                  color: HydraTokens.textPrimary,
+                ),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'Ao conectar um joystick Bluetooth/USB, o controle na tela pode se ocultar automaticamente',
+                style: TextStyle(
+                  fontFamily: 'Rubik',
+                  fontSize: 12,
+                  color: HydraTokens.textSecondary,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: TouchOverlayMode.values.map((mode) {
+                  final active = s.touchOverlayMode == mode;
+                  return GestureDetector(
+                    onTap: () => _update(s.copyWith(touchOverlayMode: mode)),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 9,
+                      ),
+                      decoration: BoxDecoration(
+                        color: active
+                            ? Colors.white
+                            : HydraTokens.surfaceCatalog,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(
+                          color: active
+                              ? Colors.white
+                              : HydraTokens.borderSubtle8,
+                        ),
+                      ),
+                      child: Text(
+                        mode.label,
+                        style: TextStyle(
+                          fontFamily: 'ReadexPro',
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                          color: active
+                              ? HydraTokens.bgPureBlack
+                              : HydraTokens.textPrimary,
+                        ),
+                      ),
+                    ),
+                  );
+                }).toList(),
+              ),
+              const SizedBox(height: 14),
+              const Divider(color: HydraTokens.borderSubtle8, height: 1),
+              const SizedBox(height: 12),
+              _SettingsSwitchTile(
+                title: 'Vibração Tátil nos Botões',
+                subtitle: 'Resposta háptica ao pressionar comandos na tela',
+                value: s.hapticVibration,
+                onChanged: (v) => _update(s.copyWith(hapticVibration: v)),
+              ),
+              const SizedBox(height: 14),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.06),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.white.withOpacity(0.12)),
+                ),
+                child: Row(
+                  children: [
+                    PhosphorIcon(
+                      PhosphorIcons.handTap(PhosphorIconsStyle.bold),
+                      size: 18,
+                      color: Colors.white,
+                    ),
+                    const SizedBox(width: 10),
+                    const Expanded(
+                      child: Text(
+                        'Dica: Durante qualquer partida, abra a Sidebar (botão Voltar) e toque em "Mover e Editar Botões na Tela". Toque em qualquer botão (L1, R2, D-Pad, Ações) para editar tamanho, opacidade e estilo direto na tela com prévia ao vivo!',
+                        style: TextStyle(
+                          fontFamily: 'Rubik',
+                          fontSize: 11.5,
+                          height: 1.4,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSavesAndStorageSection(AppSettings s) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const _SectionHeader(
+          title: 'Save States (PPSSPP) e Armazenamento',
+          subtitle: 'Gerencie salvamento manual de onde parou e espaço de ROMs',
+        ),
+        const SizedBox(height: 10),
+        _SettingsSurfaceCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _SettingsSwitchTile(
+                title: 'Salvar Automaticamente ao Sair (Opcional)',
+                subtitle:
+                    'Desativado por padrão: só salva quando você clicar em Salvar na Sidebar do jogo (ideal para jogos de luta)',
+                value: s.autoSaveOnExit,
+                onChanged: (v) => _update(s.copyWith(autoSaveOnExit: v)),
+              ),
+              _SettingsSwitchTile(
+                title: 'Carregar Último Save ao Abrir (Opcional)',
+                subtitle:
+                    'Desativado por padrão para arcade e lutas iniciarem do início normalmente',
+                value: s.autoLoadOnStart,
+                onChanged: (v) => _update(s.copyWith(autoLoadOnStart: v)),
+              ),
+              const Divider(color: HydraTokens.borderSubtle8, height: 18),
+              Row(
+                children: [
+                  PhosphorIcon(
+                    PhosphorIcons.hardDrive(PhosphorIconsStyle.regular),
+                    size: 18,
+                    color: Colors.white,
+                  ),
+                  const SizedBox(width: 10),
+                  const Text(
+                    'Espaço Ocupado pelas ROMs',
+                    style: TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w600,
+                      color: HydraTokens.textPrimary,
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    _formatStorage(_usedBytes),
+                    style: const TextStyle(
+                      fontFamily: 'JetBrainsMono',
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        const _SectionHeader(
+          title: 'Servidor RomM & Firmware PS3 (RPCS3)',
+          subtitle:
+              'Integre biblioteca privada RomM ou importe PS3UPDAT.PUP para títulos de PS3',
+        ),
+        const SizedBox(height: 10),
+        _SettingsSurfaceCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  PhosphorIcon(
+                    PhosphorIcons.cloudArrowDown(PhosphorIconsStyle.regular),
+                    size: 18,
+                    color: Colors.white,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Servidor RomM Privado',
+                          style: TextStyle(
+                            fontFamily: 'ReadexPro',
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w600,
+                            color: HydraTokens.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          s.rommServerUrl.trim().isEmpty
+                              ? 'Não configurado (usando RetroAPI & Archive.org)'
+                              : s.rommServerUrl.trim(),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontFamily: 'JetBrainsMono',
+                            fontSize: 11,
+                            color: HydraTokens.textSecondary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton(
+                    onPressed: () => _showRommConfigDialog(s),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: HydraTokens.primaryAurora,
+                      side: const BorderSide(color: HydraTokens.borderSubtle10),
+                    ),
+                    child: Text(
+                      s.rommServerUrl.trim().isEmpty ? 'Configurar' : 'Editar',
+                    ),
+                  ),
+                ],
+              ),
+              const Divider(color: HydraTokens.borderSubtle8, height: 22),
+              Row(
+                children: [
+                  PhosphorIcon(
+                    PhosphorIcons.cpu(PhosphorIconsStyle.regular),
+                    size: 18,
+                    color: Colors.white,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Firmware PS3 (PS3UPDAT.PUP)',
+                          style: TextStyle(
+                            fontFamily: 'ReadexPro',
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w600,
+                            color: HydraTokens.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          _hasPs3Firmware
+                              ? 'Instalado — pronto para RPCS3 (Vulkan)'
+                              : 'Pendente — importe o PS3UPDAT.PUP para abrir jogos de PS3',
+                          style: TextStyle(
+                            fontFamily: 'Rubik',
+                            fontSize: 11.5,
+                            color: _hasPs3Firmware
+                                ? HydraTokens.primaryAurora
+                                : HydraTokens.textSecondary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton(
+                    onPressed:
+                        _importingPs3Firmware ? null : _handleImportPs3Firmware,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: HydraTokens.primaryAurora,
+                      side: const BorderSide(color: HydraTokens.borderSubtle10),
+                    ),
+                    child: Text(
+                      _importingPs3Firmware
+                          ? 'Importando...'
+                          : (_hasPs3Firmware ? 'Atualizar' : 'Importar PUP'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        const _SectionHeader(
+          title: 'Drivers Vulkan (AdrenoTools) & Switch (Eden)',
+          subtitle:
+              'Carregamento rootless de drivers Mesa Turnip (ARM64) e integração com Eden',
+        ),
+        const SizedBox(height: 10),
+        _SettingsSurfaceCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  PhosphorIcon(
+                    PhosphorIcons.graphicsCard(PhosphorIconsStyle.regular),
+                    size: 18,
+                    color: Colors.white,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Driver Vulkan Customizado (Turnip)',
+                          style: TextStyle(
+                            fontFamily: 'ReadexPro',
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w600,
+                            color: HydraTokens.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          s.customVulkanDriverLabel.trim().isEmpty
+                              ? 'Padrão do Sistema (GPU Nativa)'
+                              : s.customVulkanDriverLabel,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontFamily: 'Rubik',
+                            fontSize: 11.5,
+                            color: s.customVulkanDriverLabel.trim().isEmpty
+                                ? HydraTokens.textSecondary
+                                : HydraTokens.primaryAurora,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton(
+                    onPressed: () => _openGpuDriverManagerModal(s),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: HydraTokens.primaryAurora,
+                      side: const BorderSide(color: HydraTokens.borderSubtle10),
+                    ),
+                    child: const Text('Gerenciar'),
+                  ),
+                ],
+              ),
+              const Divider(color: HydraTokens.borderSubtle8, height: 22),
+              _SettingsSwitchTile(
+                title: 'Adreno Turbo Clock (AdrenoTools)',
+                subtitle:
+                    'Força perfil máximo de GPU em chips Qualcomm Adreno usando Vulkan',
+                value: s.adrenoTurboMode,
+                onChanged: (v) => _update(s.copyWith(adrenoTurboMode: v)),
+              ),
+              const Divider(color: HydraTokens.borderSubtle8, height: 22),
+              Row(
+                children: [
+                  PhosphorIcon(
+                    PhosphorIcons.gameController(PhosphorIconsStyle.regular),
+                    size: 18,
+                    color: Colors.white,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Emulador Nintendo Switch (Eden)',
+                          style: TextStyle(
+                            fontFamily: 'ReadexPro',
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w600,
+                            color: HydraTokens.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          _edenPackage != null
+                              ? 'Detectado ($_edenPackage) — ROMs .NSP/.XCI abrem direto no Eden'
+                              : 'Não instalado — baixe o Eden para abrir jogos Switch direto do catálogo',
+                          style: TextStyle(
+                            fontFamily: 'Rubik',
+                            fontSize: 11.5,
+                            color: _edenPackage != null
+                                ? HydraTokens.primaryAurora
+                                : HydraTokens.textSecondary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    tooltip: 'Verificar instalação do Eden',
+                    onPressed: _refreshEdenStatus,
+                    icon: PhosphorIcon(
+                      PhosphorIcons.arrowsClockwise(PhosphorIconsStyle.regular),
+                      size: 18,
+                      color: HydraTokens.textSecondary,
+                    ),
+                  ),
+                  OutlinedButton(
+                    onPressed:
+                        _openingEdenDownload ? null : _launchEdenDownload,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: HydraTokens.primaryAurora,
+                      side: const BorderSide(color: HydraTokens.borderSubtle10),
+                    ),
+                    child: Text(
+                      _openingEdenDownload
+                          ? 'Abrindo...'
+                          : (_edenPackage != null ? 'Atualizar' : 'Baixar Eden'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  void _showHelpGuide(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) {
+        return Container(
+          height: MediaQuery.sizeOf(ctx).height * 0.85,
+          decoration: const BoxDecoration(
+            color: HydraTokens.bgNearBlack,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+            border: Border(
+              top: BorderSide(color: HydraTokens.borderSubtle10, width: 1.5),
+            ),
+          ),
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.25),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  PhosphorIcon(
+                    PhosphorIcons.question(PhosphorIconsStyle.bold),
+                    size: 20,
+                    color: Colors.white,
+                  ),
+                  const SizedBox(width: 8),
+                  const Text(
+                    'Guia e Ajuda do LoopGamer',
+                    style: TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontSize: 18,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white70),
+                    onPressed: () => Navigator.of(ctx).pop(),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              Expanded(
+                child: ListView(
+                  children: [
+                    _HelpGuideItem(
+                      icon: PhosphorIcons.gauge(PhosphorIconsStyle.bold),
+                      title: 'HUD e Informações na Tela',
+                      description:
+                          'Mostra dados em tempo real da emulação:\n'
+                          '• FPS: Quantos quadros por segundo o jogo está rodando (o padrão ideal é 60 FPS).\n'
+                          '• ms: Tempo de resposta de cada quadro (quanto menor, mais rápido o jogo responde).\n'
+                          '• Escala e Console: Qual resolução interna e nome do console em execução.\n'
+                          'Você pode ativar ou desativar cada item nas configurações ou tocando no HUD durante o modo de edição na tela.',
+                    ),
+                    const SizedBox(height: 12),
+                    _HelpGuideItem(
+                      icon:
+                          PhosphorIcons.gameController(PhosphorIconsStyle.bold),
+                      title: 'Gamepad na Tela e Controles Físicos',
+                      description:
+                          '• Mover e Customizar Botões: Durante a partida, abra a Sidebar (botão Voltar do celular) e clique em "Mover e Editar Botões". Arraste os botões para onde preferir e dê um toque em qualquer um deles (L1, R2, D-Pad, Ações) para mudar tamanho, opacidade e estilo com prévia ao vivo!\n'
+                          '• Controles Físicos (USB/Bluetooth): Se conectar um joystick no celular, o app oculta os botões táteis automaticamente para liberar a visão da tela.',
+                    ),
+                    const SizedBox(height: 12),
+                    _HelpGuideItem(
+                      icon: PhosphorIcons.fastForward(PhosphorIconsStyle.bold),
+                      title: 'Avanço Rápido (Fast-Forward 2x)',
+                      description:
+                          'Quer adiantar um diálogo ou parte demorada do jogo? Simplesmente segure o botão SELECT na tela ou no seu controle por alguns instantes! Enquanto estiver segurando, o jogo acelera 2x na hora. Solte para voltar ao normal.',
+                    ),
+                    const SizedBox(height: 12),
+                    _HelpGuideItem(
+                      icon: PhosphorIcons.floppyDisk(PhosphorIconsStyle.bold),
+                      title: 'Saves Estilo PPSSPP (Onde Parou)',
+                      description:
+                          'O jogo NÃO salva sozinho sem sua autorização (ideal para jogos de luta e arcade). Quando quiser salvar, abra a Sidebar, escolha um dos slots e clique em "Salvar". Ele gera uma foto do exato instante onde você parou com data e hora para você carregar quando quiser.',
+                    ),
+                    const SizedBox(height: 12),
+                    _HelpGuideItem(
+                      icon:
+                          PhosphorIcons.downloadSimple(PhosphorIconsStyle.bold),
+                      title: 'Downloads Resilientes em 2º Plano',
+                      description:
+                          'Seus downloads continuam em segundo plano mesmo navegando pelo app. Se a conexão cair ou você quiser pausar, pode retomar mais tarde sem perder nenhum megabyte já baixado.',
+                    ),
+                    const SizedBox(height: 12),
+                    _HelpGuideItem(
+                      icon: PhosphorIcons.star(PhosphorIconsStyle.bold),
+                      title: 'Favoritos e Coleções',
+                      description:
+                          'Toque na estrela para favoritar seus jogos preferidos e crie coleções customizadas (ex.: Luta, RPG, Favoritos) para organizar sua biblioteca como preferir.',
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _HelpGuideItem extends StatelessWidget {
+  const _HelpGuideItem({
+    required this.icon,
+    required this.title,
+    required this.description,
+  });
+
+  final PhosphorIconData icon;
+  final String title;
+  final String description;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: HydraTokens.surfaceCatalog,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: HydraTokens.borderSubtle8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              PhosphorIcon(icon, size: 16, color: Colors.white),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  title,
+                  style: const TextStyle(
+                    fontFamily: 'ReadexPro',
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            description,
+            style: const TextStyle(
+              fontFamily: 'Rubik',
+              fontSize: 12,
+              height: 1.45,
+              color: HydraTokens.textSecondary,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SectionHeader extends StatelessWidget {
+  const _SectionHeader({
+    required this.title,
+    required this.subtitle,
+  });
+
+  final String title;
+  final String subtitle;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: const TextStyle(
+            fontFamily: 'ReadexPro',
+            fontSize: 16,
+            fontWeight: FontWeight.w700,
+            color: HydraTokens.textPrimary,
+          ),
+        ),
+        const SizedBox(height: 3),
+        Text(
+          subtitle,
+          style: const TextStyle(
+            fontFamily: 'Rubik',
+            fontSize: 12,
+            color: HydraTokens.textSecondary,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _SettingsSurfaceCard extends StatelessWidget {
+  const _SettingsSurfaceCard({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: HydraTokens.bgNearBlack,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: HydraTokens.borderSubtle8),
+      ),
+      child: child,
+    );
+  }
+}
+
+class _SettingsSwitchTile extends StatelessWidget {
+  const _SettingsSwitchTile({
+    required this.title,
+    required this.subtitle,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final String title;
+  final String subtitle;
+  final bool value;
+  final ValueChanged<bool>? onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontFamily: 'ReadexPro',
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.w600,
+                    color: HydraTokens.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  subtitle,
+                  style: const TextStyle(
+                    fontFamily: 'Rubik',
+                    fontSize: 11.5,
+                    color: HydraTokens.textSecondary,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          Switch(
+            value: value,
+            activeColor: Colors.white,
+            activeTrackColor: Colors.white.withOpacity(0.35),
+            onChanged: onChanged,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _GpuDriverManagerSheet extends StatefulWidget {
+  const _GpuDriverManagerSheet({
+    required this.gpuDriverService,
+    required this.activeDriverDir,
+    required this.activeDriverName,
+    required this.onDriverSelected,
+  });
+
+  final GpuDriverService gpuDriverService;
+  final String activeDriverDir;
+  final String activeDriverName;
+  final ValueChanged<InstalledGpuDriver?> onDriverSelected;
+
+  @override
+  State<_GpuDriverManagerSheet> createState() => _GpuDriverManagerSheetState();
+}
+
+class _GpuDriverManagerSheetState extends State<_GpuDriverManagerSheet> {
+  List<InstalledGpuDriver> _installed = const [];
+  List<TurnipDriverRelease> _releases = const [];
+  bool _loadingInstalled = true;
+  bool _loadingReleases = true;
+  bool _importingZip = false;
+  String? _downloadingUrl;
+  double _downloadProgress = 0;
+  String? _statusMessage;
+  late String _selectedDir = widget.activeDriverDir;
+  late String _selectedName = widget.activeDriverName;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadInstalled();
+    _loadReleases();
+  }
+
+  Future<void> _loadInstalled() async {
+    setState(() => _loadingInstalled = true);
+    try {
+      final list = await widget.gpuDriverService.listInstalledDrivers();
+      if (mounted) {
+        setState(() {
+          _installed = list;
+          _loadingInstalled = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _loadingInstalled = false;
+          _statusMessage = 'Erro ao ler drivers locais: $e';
+        });
+      }
+    }
+  }
+
+  Future<void> _loadReleases() async {
+    setState(() => _loadingReleases = true);
+    try {
+      final list = await widget.gpuDriverService.fetchAvailableDrivers();
+      if (mounted) {
+        setState(() {
+          _releases = list;
+          _loadingReleases = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() => _loadingReleases = false);
+      }
+    }
+  }
+
+  void _applyDriver(InstalledGpuDriver? driver) {
+    setState(() {
+      _selectedDir = driver?.directoryPath ?? '';
+      _selectedName = driver?.libraryName ?? '';
+    });
+    widget.onDriverSelected(driver);
+  }
+
+  Future<void> _importZip() async {
+    if (_importingZip) return;
+    setState(() {
+      _importingZip = true;
+      _statusMessage = null;
+    });
+    try {
+      final driver = await widget.gpuDriverService.importLocalDriverZip();
+      if (!mounted) return;
+      if (driver != null) {
+        await _loadInstalled();
+        if (!mounted) return;
+        _applyDriver(driver);
+        setState(
+          () => _statusMessage = 'Driver "${driver.name}" importado e ativado.',
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _statusMessage = e.toString().replaceFirst('Bad state: ', ''),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _importingZip = false);
+      }
+    }
+  }
+
+  Future<void> _downloadRelease(TurnipDriverRelease release) async {
+    if (_downloadingUrl != null) return;
+    setState(() {
+      _downloadingUrl = release.downloadUrl;
+      _downloadProgress = 0;
+      _statusMessage = null;
+    });
+    try {
+      final driver = await widget.gpuDriverService.downloadAndInstallDriver(
+        release,
+        onProgress: (p) {
+          if (mounted) setState(() => _downloadProgress = p);
+        },
+      );
+      if (!mounted) return;
+      await _loadInstalled();
+      if (!mounted) return;
+      _applyDriver(driver);
+      setState(
+        () => _statusMessage = 'Driver "${driver.name}" baixado e ativado!',
+      );
+    } catch (e) {
+      if (mounted) {
+        setState(() => _statusMessage = 'Falha no download do driver: $e');
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _downloadingUrl = null;
+          _downloadProgress = 0;
+        });
+      }
+    }
+  }
+
+  Future<void> _deleteInstalled(InstalledGpuDriver driver) async {
+    await widget.gpuDriverService.deleteDriver(driver.id);
+    if (!mounted) return;
+    if (_selectedDir == driver.directoryPath &&
+        _selectedName == driver.libraryName) {
+      _applyDriver(null);
+    }
+    await _loadInstalled();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDefault = _selectedDir.isEmpty || _selectedName.isEmpty;
+
+    return FractionallySizedBox(
+      heightFactor: 0.88,
+      child: Container(
+        decoration: const BoxDecoration(
+          color: HydraTokens.bgNearBlack,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+          border: Border(
+            top: BorderSide(color: HydraTokens.borderSubtle10, width: 1.5),
+          ),
+        ),
+        padding: const EdgeInsets.fromLTRB(20, 14, 20, 24),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.25),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                PhosphorIcon(
+                  PhosphorIcons.cpu(PhosphorIconsStyle.bold),
+                  size: 20,
+                  color: HydraTokens.primaryAurora,
+                ),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'Gerenciador de Drivers Vulkan (Turnip)',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontSize: 16.5,
+                      fontWeight: FontWeight.w700,
+                      color: HydraTokens.textPrimary,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white70),
+                  onPressed: () => Navigator.of(context).pop(),
+                ),
+              ],
+            ),
+            const Text(
+              'Drivers Mesa Turnip via AdrenoTools (ARM64 rootless). Aplicado automaticamente na próxima sessão Vulkan.',
+              style: TextStyle(
+                fontFamily: 'Rubik',
+                fontSize: 11.5,
+                color: HydraTokens.textSecondary,
+              ),
+            ),
+            if (_statusMessage != null) ...[
+              const SizedBox(height: 10),
+              Container(
+                width: double.infinity,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: HydraTokens.surfaceCatalog,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: HydraTokens.borderSubtle10),
+                ),
+                child: Text(
+                  _statusMessage!,
+                  style: const TextStyle(
+                    fontFamily: 'Rubik',
+                    fontSize: 11.5,
+                    color: HydraTokens.primaryAurora,
+                  ),
+                ),
+              ),
+            ],
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _importingZip ? null : _importZip,
+                    icon: const Icon(Icons.folder_zip_outlined, size: 17),
+                    label: Text(
+                      _importingZip ? 'Importando...' : 'Importar .ZIP Local',
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: HydraTokens.primaryAurora,
+                      side: const BorderSide(color: HydraTokens.borderSubtle10),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                OutlinedButton(
+                  onPressed: isDefault ? null : () => _applyDriver(null),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white,
+                    side: const BorderSide(color: HydraTokens.borderSubtle10),
+                  ),
+                  child: Text(isDefault ? 'Padrão Ativo' : 'Usar Padrão'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            Expanded(
+              child: ListView(
+                children: [
+                  const Text(
+                    'DRIVERS INSTALADOS',
+                    style: TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.7,
+                      color: HydraTokens.textSecondary,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  if (_loadingInstalled)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 12),
+                      child: Center(child: CircularProgressIndicator()),
+                    )
+                  else if (_installed.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 8),
+                      child: Text(
+                        'Nenhum driver customizado instalado. Baixe abaixo ou importe um .zip.',
+                        style: TextStyle(
+                          fontFamily: 'Rubik',
+                          fontSize: 12,
+                          color: HydraTokens.textSecondary,
+                        ),
+                      ),
+                    )
+                  else
+                    ..._installed.map((driver) {
+                      final active = _selectedDir == driver.directoryPath &&
+                          _selectedName == driver.libraryName;
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        decoration: BoxDecoration(
+                          color: HydraTokens.surfaceCatalog,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: active
+                                ? HydraTokens.primaryAurora
+                                : HydraTokens.borderSubtle8,
+                          ),
+                        ),
+                        child: ListTile(
+                          dense: true,
+                          onTap: () => _applyDriver(driver),
+                          leading: Icon(
+                            active
+                                ? Icons.check_circle
+                                : Icons.radio_button_unchecked,
+                            color: active
+                                ? HydraTokens.primaryAurora
+                                : HydraTokens.textSecondary,
+                            size: 20,
+                          ),
+                          title: Text(
+                            '${driver.name} (${driver.driverVersion})',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontFamily: 'ReadexPro',
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                              color: HydraTokens.textPrimary,
+                            ),
+                          ),
+                          subtitle: Text(
+                            driver.libraryName,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontFamily: 'JetBrainsMono',
+                              fontSize: 10.5,
+                              color: HydraTokens.textSecondary,
+                            ),
+                          ),
+                          trailing: IconButton(
+                            tooltip: 'Remover driver',
+                            icon: const Icon(
+                              Icons.delete_outline,
+                              color: Colors.white54,
+                              size: 19,
+                            ),
+                            onPressed: () => _deleteInstalled(driver),
+                          ),
+                        ),
+                      );
+                    }),
+                  const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'BAIXAR TURNIP (GITHUB ADRENOTOOLS)',
+                          style: TextStyle(
+                            fontFamily: 'ReadexPro',
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 0.7,
+                            color: HydraTokens.textSecondary,
+                          ),
+                        ),
+                      ),
+                      if (!_loadingReleases)
+                        TextButton(
+                          onPressed: _loadReleases,
+                          child: const Text('Atualizar'),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  if (_loadingReleases)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 16),
+                      child: Center(child: CircularProgressIndicator()),
+                    )
+                  else if (_releases.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 8),
+                      child: Text(
+                        'Sem resposta das releases do GitHub no momento. Verifique sua internet ou importe um .zip.',
+                        style: TextStyle(
+                          fontFamily: 'Rubik',
+                          fontSize: 12,
+                          color: HydraTokens.textSecondary,
+                        ),
+                      ),
+                    )
+                  else
+                    ..._releases.map((rel) {
+                      final downloadingThis =
+                          _downloadingUrl == rel.downloadUrl;
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
+                        decoration: BoxDecoration(
+                          color: HydraTokens.surfaceCatalog,
+                          borderRadius: BorderRadius.circular(12),
+                          border:
+                              Border.all(color: HydraTokens.borderSubtle8),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        rel.assetName,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          fontFamily: 'ReadexPro',
+                                          fontSize: 12.5,
+                                          fontWeight: FontWeight.w600,
+                                          color: HydraTokens.textPrimary,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        '${rel.repo} • ${rel.tag} • ${rel.formattedSize}',
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          fontFamily: 'JetBrainsMono',
+                                          fontSize: 10.5,
+                                          color: HydraTokens.textSecondary,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                OutlinedButton(
+                                  onPressed: _downloadingUrl != null
+                                      ? null
+                                      : () => _downloadRelease(rel),
+                                  style: OutlinedButton.styleFrom(
+                                    foregroundColor: HydraTokens.primaryAurora,
+                                    side: const BorderSide(
+                                      color: HydraTokens.borderSubtle10,
+                                    ),
+                                  ),
+                                  child: Text(
+                                    downloadingThis
+                                        ? '${(_downloadProgress * 100).round()}%'
+                                        : 'Baixar',
+                                  ),
+                                ),
+                              ],
+                            ),
+                            if (downloadingThis) ...[
+                              const SizedBox(height: 8),
+                              LinearProgressIndicator(
+                                value: _downloadProgress > 0
+                                    ? _downloadProgress
+                                    : null,
+                                backgroundColor: Colors.white12,
+                                color: HydraTokens.primaryAurora,
+                              ),
+                            ],
+                          ],
+                        ),
+                      );
+                    }),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

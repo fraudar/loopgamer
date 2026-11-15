@@ -1,0 +1,57 @@
+name: loopgamer
+description: Frontend de emulação Android em Flutter baseado no RomM e Hydra Launcher.
+publish_to: 'none'
+version: 2.0.0+2
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  archive: ^3.6.1
+  dio: ^5.7.0
+  file_picker: ^8.1.4
+  path_provider: ^2.1.5
+  phosphor_flutter: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/hydra_hero_bg.png
+  fonts:
+    - family: PressStart2P
+      fonts:
+        - asset: assets/fonts/PressStart2P-Regular.ttf
+          weight: 400
+    - family: Silkscreen
+      fonts:
+        - asset: assets/fonts/Silkscreen-Bold.ttf
+          weight: 700
+    - family: ReadexPro
+      fonts:
+        - asset: assets/fonts/ReadexPro-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/ReadexPro-Bold.ttf
+          weight: 700
+    - family: Rubik
+      fonts:
+        - asset: assets/fonts/Rubik-Variable.ttf
+          weight: 400
+        - asset: assets/fonts/Rubik-Variable.ttf
+          weight: 500
+        - asset: assets/fonts/Rubik-Variable.ttf
+          weight: 600
+        - asset: assets/fonts/Rubik-Variable.ttf
+          weight: 700
+    - family: JetBrainsMono
+      fonts:
+        - asset: assets/fonts/JetBrainsMono-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/JetBrainsMono-Bold.ttf
+          weight: 700
