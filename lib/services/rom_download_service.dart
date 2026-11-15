@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:collection';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 import 'package:archive/archive_io.dart';
@@ -98,6 +97,8 @@ class AppStorageBreakdown {
     this.partialDownloadsBytes = 0,
     this.systemAndCoresBytes = 0,
     this.savesAndCoversBytes = 0,
+    this.savesBytes = 0,
+    this.coversBytes = 0,
     this.tempCacheBytes = 0,
     this.ps3FirmwareBytes = 0,
     this.orphanPartCount = 0,
@@ -107,6 +108,8 @@ class AppStorageBreakdown {
   final int partialDownloadsBytes;
   final int systemAndCoresBytes;
   final int savesAndCoversBytes;
+  final int savesBytes;
+  final int coversBytes;
   final int tempCacheBytes;
   final int ps3FirmwareBytes;
   final int orphanPartCount;
@@ -553,9 +556,32 @@ class RomDownloadService {
   }
 
   /// Verifica se a ROM já existe no armazenamento local sem apagar `.zip` válidos importados.
+  /// Quando [knownLocalPath] aponta para uma ISO/ROM externa vinculada diretamente,
+  /// valida o arquivo no local original sem exigir cópia dentro de `roms/`.
   /// Apenas ignora `.part` e limpa stubs inválidos (< 1 KB).
-  Future<String?> resolveExistingRomPath(int igdbId) async {
+  Future<String?> resolveExistingRomPath(
+    int igdbId, {
+    String? knownLocalPath,
+  }) async {
     const int minStubBytes = 1024;
+    if (knownLocalPath != null && knownLocalPath.trim().isNotEmpty) {
+      final candidatePath = knownLocalPath.trim();
+      try {
+        final candidate = File(candidatePath);
+        if (await candidate.exists()) {
+          final lower = candidatePath.toLowerCase();
+          final isCueOrM3u = lower.endsWith('.cue') || lower.endsWith('.m3u');
+          final len = await candidate.length();
+          if (len >= minStubBytes || isCueOrM3u) {
+            return candidatePath;
+          }
+        }
+      } catch (e) {
+        debugPrint(
+          '[RomDownloadService] Falha ao validar caminho conhecido ($igdbId): $e',
+        );
+      }
+    }
     try {
       final dir = await _romsDirectory();
       final gameDir = Directory('${dir.path}/game_$igdbId');
@@ -846,6 +872,60 @@ class RomDownloadService {
     }
   }
 
+  Future<bool> _hasPs3FirmwareInstalled(Directory supportDir) async {
+    try {
+      for (final candidate in [
+        File('${supportDir.path}/PS3UPDAT.PUP'),
+        File('${supportDir.path}/rpcs3/PS3UPDAT.PUP'),
+        File('${supportDir.path}/rpcs3/firmware/PS3UPDAT.PUP'),
+      ]) {
+        if (await candidate.exists() && await candidate.length() > 0) {
+          return true;
+        }
+      }
+      final fwDir = Directory('${supportDir.path}/rpcs3/firmware');
+      if (await fwDir.exists()) {
+        await for (final entity in fwDir.list(followLinks: false)) {
+          if (entity is File && entity.path.toLowerCase().endsWith('.pup')) {
+            return true;
+          }
+        }
+      }
+      final devFlashSys = Directory('${supportDir.path}/rpcs3/dev_flash/sys');
+      if (await devFlashSys.exists()) {
+        await for (final _ in devFlashSys.list(followLinks: false)) {
+          return true;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  Future<bool> _hasPs3SaveFiles(Directory rpcs3Dir) async {
+    final homeDir = Directory('${rpcs3Dir.path}/dev_hdd0/home');
+    try {
+      if (!await homeDir.exists()) return false;
+      await for (final entity
+          in homeDir.list(recursive: true, followLinks: false)) {
+        if (entity is! File) continue;
+        final normalized = entity.path.replaceAll('\\', '/').toLowerCase();
+        if (normalized.contains('/savedata/')) {
+          return true;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  bool _isTempLikeFileName(String baseLower) {
+    return baseLower.contains('.tmp_') ||
+        baseLower.endsWith('.tmp') ||
+        baseLower.endsWith('.part') ||
+        baseLower.contains('.part_') ||
+        baseLower.endsWith('.log') ||
+        baseLower.endsWith('.cache');
+  }
+
   /// Calcula o detalhamento real do espaço em disco usado pelo aplicativo.
   Future<AppStorageBreakdown> getAppStorageBreakdown() async {
     final supportDir = await _safeDir(getApplicationSupportDirectory);
@@ -858,7 +938,8 @@ class RomDownloadService {
     int readyRomsBytes = 0;
     int partialDownloadsBytes = 0;
     int systemAndCoresBytes = 0;
-    int savesAndCoversBytes = 0;
+    int savesBytes = 0;
+    int coversBytes = 0;
     int tempCacheBytes = 0;
     int ps3FirmwareBytes = 0;
     int orphanPartCount = 0;
@@ -899,15 +980,56 @@ class RomDownloadService {
       }
     } catch (_) {}
 
-    // 2. Firmware PS3 (PS3UPDAT.PUP + rpcs3/)
+    // 2. Firmware PS3 (PS3UPDAT.PUP + rpcs3/) separando cache JIT/HDD1/resíduos órfãos
+    final rpcs3Dir = Directory('${supportDir.path}/rpcs3');
+    final hasPs3Firmware = await _hasPs3FirmwareInstalled(supportDir);
     ps3FirmwareBytes += await _sumFileUnique(
       File('${supportDir.path}/PS3UPDAT.PUP'),
       countedKeys,
     );
-    ps3FirmwareBytes += await _sumDirUnique(
-      Directory('${supportDir.path}/rpcs3'),
-      countedKeys,
-    );
+    try {
+      await for (final entity in supportDir.list(followLinks: false)) {
+        if (entity is File &&
+            _basename(entity.path).toLowerCase().endsWith('.pup')) {
+          ps3FirmwareBytes += await _sumFileUnique(entity, countedKeys);
+        }
+      }
+    } catch (_) {}
+    try {
+      if (await rpcs3Dir.exists()) {
+        await for (final entity
+            in rpcs3Dir.list(recursive: true, followLinks: false)) {
+          if (entity is! File) continue;
+          final key = await _uniquePathKey(entity);
+          if (!countedKeys.add(key)) continue;
+          final len = await entity.length();
+          final rel = entity.path
+              .substring(rpcs3Dir.path.length)
+              .replaceAll('\\', '/')
+              .toLowerCase();
+          final isSave =
+              rel.startsWith('/dev_hdd0/home/') && rel.contains('/savedata/');
+          final isCache = rel.startsWith('/cache/') ||
+              rel.startsWith('/dev_hdd1/') ||
+              rel.startsWith('/tmp/') ||
+              rel.startsWith('/dev_hdd0/tmp/') ||
+              rel.startsWith('/logs/') ||
+              rel.endsWith('.log') ||
+              rel.endsWith('.gz') ||
+              rel.contains('.tmp_');
+          final isPup = rel.endsWith('.pup');
+          if (isSave) {
+            savesBytes += len;
+          } else if (isPup) {
+            ps3FirmwareBytes += len;
+          } else if (isCache || !hasPs3Firmware) {
+            tempCacheBytes += len;
+          } else {
+            ps3FirmwareBytes += len;
+          }
+        }
+      }
+    } catch (_) {}
 
     // 3. Sobras .tmp_* / .part em diretórios de suporte
     tempCacheBytes += await _sumFileUnique(
@@ -953,12 +1075,12 @@ class RomDownloadService {
       countedKeys,
     );
 
-    // 5. Saves, capas e manifestos
-    savesAndCoversBytes += await _sumDirUnique(
+    // 5. Saves, save states e capas
+    savesBytes += await _sumDirUnique(
       Directory('${supportDir.path}/saves'),
       countedKeys,
     );
-    savesAndCoversBytes += await _sumDirUnique(
+    coversBytes += await _sumDirUnique(
       Directory('${supportDir.path}/covers'),
       countedKeys,
     );
@@ -969,7 +1091,7 @@ class RomDownloadService {
         countedKeys,
         where: (_, baseLower) => baseLower.contains('.tmp_'),
       );
-      savesAndCoversBytes += await _sumDirUnique(coverCacheDir, countedKeys);
+      coversBytes += await _sumDirUnique(coverCacheDir, countedKeys);
     }
     for (final manifestName in const [
       'library_manifest.json',
@@ -981,7 +1103,7 @@ class RomDownloadService {
       'user_meta.json',
       'user_meta.json.corrupt.bak',
     ]) {
-      savesAndCoversBytes += await _sumFileUnique(
+      systemAndCoresBytes += await _sumFileUnique(
         File('${supportDir.path}/$manifestName'),
         countedKeys,
       );
@@ -1034,11 +1156,148 @@ class RomDownloadService {
       }
     }
 
+    // 8. Varredura abrangente de quaisquer outros diretórios/arquivos não contabilizados
+    // (ex.: caches do Play!, WebView, shaders/logs em supportDir, docsDir e dados Android)
+    final extraSummary = <String>[];
+    void recordExtra(String label, int bytes) {
+      if (bytes >= 1024 * 1024) {
+        extraSummary.add('$label=${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB');
+      }
+    }
+
+    try {
+      await for (final entity in supportDir.list(followLinks: false)) {
+        if (entity is Link) continue;
+        final name = _basename(entity.path);
+        final nameLower = name.toLowerCase();
+        if (entity is File) {
+          final added = await _sumFileUnique(entity, countedKeys);
+          if (added > 0) {
+            if (_isTempLikeFileName(nameLower)) {
+              tempCacheBytes += added;
+            } else {
+              systemAndCoresBytes += added;
+            }
+            recordExtra('sup:$name', added);
+          }
+        } else if (entity is Directory) {
+          final isCacheDir = nameLower == 'cache' ||
+              nameLower == 'tmp' ||
+              nameLower == 'logs' ||
+              nameLower == 'temp' ||
+              nameLower == 'shader_cache';
+          int tempAdded = 0;
+          int sysAdded = 0;
+          await for (final child
+              in entity.list(recursive: true, followLinks: false)) {
+            if (child is! File) continue;
+            final key = await _uniquePathKey(child);
+            if (!countedKeys.add(key)) continue;
+            final len = await child.length();
+            final baseLower = _basename(child.path).toLowerCase();
+            if (isCacheDir || _isTempLikeFileName(baseLower)) {
+              tempCacheBytes += len;
+              tempAdded += len;
+            } else {
+              systemAndCoresBytes += len;
+              sysAdded += len;
+            }
+          }
+          recordExtra('sup/$name', tempAdded + sysAdded);
+        }
+      }
+    } catch (_) {}
+
+    if (docsDir != null && docsDir.path != supportDir.path) {
+      try {
+        await for (final entity in docsDir.list(followLinks: false)) {
+          if (entity is Link) continue;
+          final name = _basename(entity.path);
+          final nameLower = name.toLowerCase();
+          if (entity is File) {
+            final added = await _sumFileUnique(entity, countedKeys);
+            if (added > 0) {
+              if (_isTempLikeFileName(nameLower)) {
+                tempCacheBytes += added;
+              } else {
+                systemAndCoresBytes += added;
+              }
+              recordExtra('doc:$name', added);
+            }
+          } else if (entity is Directory) {
+            int addedDir = 0;
+            await for (final child
+                in entity.list(recursive: true, followLinks: false)) {
+              if (child is! File) continue;
+              final key = await _uniquePathKey(child);
+              if (!countedKeys.add(key)) continue;
+              final len = await child.length();
+              final baseLower = _basename(child.path).toLowerCase();
+              if (nameLower.contains('cache') ||
+                  _isTempLikeFileName(baseLower)) {
+                tempCacheBytes += len;
+              } else {
+                systemAndCoresBytes += len;
+              }
+              addedDir += len;
+            }
+            recordExtra('doc/$name', addedDir);
+          }
+        }
+      } catch (_) {}
+    }
+
+    if (Platform.isAndroid) {
+      try {
+        final appRootDir = supportDir.parent;
+        await for (final entity in appRootDir.list(followLinks: false)) {
+          if (entity is Link || entity is! Directory) continue;
+          final name = _basename(entity.path);
+          final nameLower = name.toLowerCase();
+          if (nameLower == 'lib') continue;
+          final dirKey = await _uniquePathKey(entity);
+          if (dirKey == await _uniquePathKey(supportDir)) continue;
+          if (docsDir != null && dirKey == await _uniquePathKey(docsDir)) {
+            continue;
+          }
+          if (visitedCacheRoots.contains(dirKey)) continue;
+          final isCacheSibling = nameLower == 'code_cache' ||
+              nameLower == 'cache' ||
+              nameLower == 'app_webview' ||
+              nameLower == 'no_backup';
+          final added = await _sumDirUnique(entity, countedKeys);
+          if (added > 0) {
+            if (isCacheSibling) {
+              tempCacheBytes += added;
+            } else {
+              systemAndCoresBytes += added;
+            }
+            recordExtra('data/$name', added);
+          }
+        }
+      } catch (_) {}
+    }
+
+    final savesAndCoversBytes = savesBytes + coversBytes;
+    debugPrint(
+      '[StorageBreakdown] roms=${(readyRomsBytes / 1048576).toStringAsFixed(1)}MB '
+      'part=${(partialDownloadsBytes / 1048576).toStringAsFixed(1)}MB '
+      'ps3Fw=${(ps3FirmwareBytes / 1048576).toStringAsFixed(1)}MB '
+      'sys=${(systemAndCoresBytes / 1048576).toStringAsFixed(1)}MB '
+      'saves=${(savesAndCoversBytes / 1048576).toStringAsFixed(1)}MB '
+      '(savesOnly=${(savesBytes / 1048576).toStringAsFixed(1)}MB '
+      'covers=${(coversBytes / 1048576).toStringAsFixed(1)}MB) '
+      'cache=${(tempCacheBytes / 1048576).toStringAsFixed(1)}MB'
+      '${extraSummary.isNotEmpty ? ' extras=${extraSummary.join(',')}' : ''}',
+    );
+
     return AppStorageBreakdown(
       readyRomsBytes: readyRomsBytes,
       partialDownloadsBytes: partialDownloadsBytes,
       systemAndCoresBytes: systemAndCoresBytes,
       savesAndCoversBytes: savesAndCoversBytes,
+      savesBytes: savesBytes,
+      coversBytes: coversBytes,
       tempCacheBytes: tempCacheBytes,
       ps3FirmwareBytes: ps3FirmwareBytes,
       orphanPartCount: orphanPartCount,
@@ -1164,6 +1423,64 @@ class RomDownloadService {
           }
         } catch (_) {}
       }
+
+      // 2b. Limpeza de caches do RPCS3 (cache JIT/shaders, dev_hdd1, tmp, logs)
+      // e resíduos órfãos deixados quando o firmware PS3 já foi removido.
+      final rpcs3Dir = Directory('${supportDir.path}/rpcs3');
+      if (await rpcs3Dir.exists()) {
+        for (final relCache in const [
+          'cache',
+          'dev_hdd1',
+          'tmp',
+          'dev_hdd0/tmp',
+          'logs',
+        ]) {
+          await deleteDirMeasuring(Directory('${rpcs3Dir.path}/$relCache'));
+        }
+        try {
+          await for (final entity in rpcs3Dir.list(followLinks: false)) {
+            if (entity is File) {
+              final base = _basename(entity.path).toLowerCase();
+              if (_isTempLikeFileName(base) || base.endsWith('.gz')) {
+                await deleteFileMeasuring(entity);
+              }
+            }
+          }
+        } catch (_) {}
+
+        if (!await _hasPs3FirmwareInstalled(supportDir)) {
+          for (final relOrphan in const [
+            'firmware',
+            'dev_flash',
+            'dev_flash2',
+            'dev_flash3',
+            'dev_hdd0/game',
+            'config',
+            'Icons',
+            'captures',
+          ]) {
+            await deleteDirMeasuring(Directory('${rpcs3Dir.path}/$relOrphan'));
+          }
+          if (!await _hasPs3SaveFiles(rpcs3Dir)) {
+            await deleteDirMeasuring(rpcs3Dir);
+          }
+        }
+      }
+
+      // 2c. Pastas/arquivos temporários e logs residuais em supportDir
+      for (final tempSub in const ['logs', 'cache', 'tmp', 'temp', 'shader_cache']) {
+        await deleteDirMeasuring(Directory('${supportDir.path}/$tempSub'));
+      }
+      try {
+        await for (final entity in supportDir.list(followLinks: false)) {
+          if (entity is File) {
+            final base = _basename(entity.path).toLowerCase();
+            if (_isTempLikeFileName(base)) {
+              await deleteFileMeasuring(entity);
+            }
+          }
+        }
+      } catch (_) {}
     }
 
     if (docsDir != null) {
@@ -1226,26 +1543,136 @@ class RomDownloadService {
     return freedBytes;
   }
 
+  /// Remove saves locais (save states / memory cards / `savedata` do PS3) e/ou
+  /// cache de capas de jogos sem apagar ROMs baixadas, núcleos ou configurações.
+  Future<int> cleanSavesAndCovers({
+    bool deleteSaves = true,
+    bool deleteCovers = true,
+  }) async {
+    int freedBytes = 0;
+    final supportDir = await _safeDir(getApplicationSupportDirectory);
+    final docsDir = await _safeDir(getApplicationDocumentsDirectory);
+
+    Future<int> measureAndDeleteDirContents(
+      Directory dir, {
+      bool recreate = false,
+    }) async {
+      int bytes = 0;
+      try {
+        if (!await dir.exists()) return 0;
+        await for (final entity
+            in dir.list(recursive: true, followLinks: false)) {
+          if (entity is File) {
+            try {
+              bytes += await entity.length();
+            } catch (_) {}
+          }
+        }
+        await dir.delete(recursive: true);
+        if (recreate) {
+          await dir.create(recursive: true);
+        }
+      } catch (e) {
+        debugPrint(
+          '[RomDownloadService] Falha ao limpar ${dir.path}: $e',
+        );
+      }
+      return bytes;
+    }
+
+    if (deleteCovers) {
+      if (supportDir != null) {
+        freedBytes += await measureAndDeleteDirContents(
+          Directory('${supportDir.path}/covers'),
+        );
+      }
+      if (docsDir != null) {
+        freedBytes += await measureAndDeleteDirContents(
+          Directory('${docsDir.path}/loop_covers_cache'),
+        );
+      }
+    }
+
+    if (deleteSaves && supportDir != null) {
+      freedBytes += await measureAndDeleteDirContents(
+        Directory('${supportDir.path}/saves'),
+        recreate: true,
+      );
+      final homeDir = Directory('${supportDir.path}/rpcs3/dev_hdd0/home');
+      try {
+        if (await homeDir.exists()) {
+          await for (final profile in homeDir.list(followLinks: false)) {
+            if (profile is! Directory) continue;
+            freedBytes += await measureAndDeleteDirContents(
+              Directory('${profile.path}/savedata'),
+            );
+          }
+        }
+      } catch (_) {}
+    }
+
+    return freedBytes;
+  }
+
+  bool _isPathInsideDirectory(String filePath, Directory parentDir) {
+    String normalize(String p) {
+      var s = p.replaceAll('\\', '/');
+      while (s.length > 1 && s.endsWith('/')) {
+        s = s.substring(0, s.length - 1);
+      }
+      return s;
+    }
+
+    final candidates = <String>{normalize(File(filePath).absolute.path)};
+    try {
+      candidates.add(normalize(File(filePath).resolveSymbolicLinksSync()));
+    } catch (_) {}
+
+    final roots = <String>{normalize(parentDir.absolute.path)};
+    try {
+      roots.add(normalize(parentDir.resolveSymbolicLinksSync()));
+    } catch (_) {}
+
+    for (final c in candidates) {
+      for (final r in roots) {
+        if (c == r || c.startsWith('$r/')) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   /// Remove o arquivo ROM baixado do disco para liberar espaço.
+  /// Arquivos externos vinculados diretamente (fora da pasta `roms/` do app)
+  /// nunca são excluídos ao remover o jogo da Biblioteca.
   Future<void> deleteRomFilesForGame(int igdbId, {String? localPath}) async {
     cancelDownload(igdbId);
     _activeStatuses.remove(igdbId);
     _activeGames.remove(igdbId);
     _pauseRequested.remove(igdbId);
 
-    if (localPath != null) {
-      final f = File(localPath);
-      if (await f.exists()) {
-        try {
-          await f.delete();
-        } catch (e) {
-          debugPrint('[RomDownloadService] Falha ao remover $localPath: $e');
-        }
-      }
-    }
-
     try {
       final dir = await _romsDirectory();
+      if (localPath != null && localPath.trim().isNotEmpty) {
+        if (_isPathInsideDirectory(localPath, dir)) {
+          final f = File(localPath);
+          if (await f.exists()) {
+            try {
+              await f.delete();
+            } catch (e) {
+              debugPrint(
+                '[RomDownloadService] Falha ao remover $localPath: $e',
+              );
+            }
+          }
+        } else {
+          debugPrint(
+            '[RomDownloadService] Mantendo ISO/ROM externa intacta fora de roms/: $localPath',
+          );
+        }
+      }
+
       final gameDir = Directory('${dir.path}/game_$igdbId');
       if (await gameDir.exists()) {
         await gameDir.delete(recursive: true);
@@ -3047,51 +3474,10 @@ class RomDownloadService {
     return fallbackSlug;
   }
 
-  String _sanitizePreservingSpaces(String rawFileName) {
-    final base = _basename(rawFileName);
-    return base.replaceAll('..', '_').replaceAll('\x00', '');
-  }
-
-  Future<void> _copyCueCompanionFiles({
-    required File cueSourceFile,
-    required Directory destDir,
-  }) async {
-    try {
-      final bytes = await cueSourceFile.readAsBytes();
-      final content = utf8.decode(bytes, allowMalformed: true);
-      final quotedDouble =
-          RegExp(r'^\s*FILE\s+"([^"]+)"', caseSensitive: false);
-      final quotedSingle =
-          RegExp(r"^\s*FILE\s+'([^']+)'", caseSensitive: false);
-      final unquoted = RegExp(r'^\s*FILE\s+(\S+)', caseSensitive: false);
-      const companionExts = {'.bin', '.img', '.raw', '.wav'};
-      final copied = <String>{};
-
-      for (final line in content.split(RegExp(r'\r?\n'))) {
-        final match = quotedDouble.firstMatch(line) ??
-            quotedSingle.firstMatch(line) ??
-            unquoted.firstMatch(line);
-        final rawRef = match?.group(1)?.trim();
-        if (rawRef == null || rawRef.isEmpty) continue;
-        final refBase = _sanitizePreservingSpaces(rawRef);
-        if (refBase.isEmpty || refBase == '.' || refBase == '..') continue;
-        final lowerRef = refBase.toLowerCase();
-        if (!companionExts.any(lowerRef.endsWith)) continue;
-        if (!copied.add(refBase)) continue;
-
-        final candidate = File('${cueSourceFile.parent.path}/$refBase');
-        if (await candidate.exists()) {
-          await candidate.copy('${destDir.path}/$refBase');
-        }
-      }
-    } catch (e) {
-      debugPrint(
-        '[RomDownloadService] Aviso ao copiar companions .cue (${cueSourceFile.path}): $e',
-      );
-    }
-  }
-
-  /// Importa um arquivo ROM/ISO externo a partir de [sourcePath], incluindo faixas companion de `.cue`.
+  /// Vincula diretamente um arquivo ROM/ISO externo a partir de [sourcePath] sem
+  /// copiar ou duplicar arquivos no armazenamento do app.
+  /// Apenas `.zip` comprimidos de consoles (não arcade) são extraídos para
+  /// a pasta do jogo, mantendo o `.zip` externo intacto sem duplicação.
   Future<({String localPath, int totalBytes})?> importExternalRomFile({
     required int igdbId,
     required String sourcePath,
@@ -3100,70 +3486,46 @@ class RomDownloadService {
     final sourceFile = File(sourcePath);
     if (!await sourceFile.exists()) return null;
 
+    var usedFilePickerCacheCopy = false;
     try {
       final dir = await _romsDirectory();
       final rawName = _basename(sourcePath);
-      final safeName = rawName.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+      final lowerName = rawName.toLowerCase();
       late final String targetPath;
 
-      if (_isArcadePlatform(platformSlug)) {
-        final arcadeDir = Directory('${dir.path}/arcade_$igdbId');
-        if (!await arcadeDir.exists()) {
-          await arcadeDir.create(recursive: true);
-        }
-        targetPath = '${arcadeDir.path}/$safeName';
-        if (sourceFile.absolute.path != File(targetPath).absolute.path) {
-          await sourceFile.copy(targetPath);
-        }
-      } else if (rawName.toLowerCase().endsWith('.zip')) {
-        final tempZipPath = '${dir.path}/rom_${igdbId}_$safeName';
-        if (sourceFile.absolute.path != File(tempZipPath).absolute.path) {
-          await sourceFile.copy(tempZipPath);
-        }
+      if (!_isArcadePlatform(platformSlug) && lowerName.endsWith('.zip')) {
         final gameDir = Directory('${dir.path}/game_$igdbId');
         final extracted = await extractAndPickRomFromZip(
-          zipPath: tempZipPath,
+          zipPath: sourcePath,
           extractDir: gameDir,
           platformSlug: platformSlug,
         );
         if (extracted != null) {
-          try {
-            final tempZipFile = File(tempZipPath);
-            if (await tempZipFile.exists()) {
-              await tempZipFile.delete();
-            }
-          } catch (_) {}
           targetPath = extracted;
+          usedFilePickerCacheCopy = sourcePath
+              .replaceAll('\\', '/')
+              .contains('/file_picker/');
         } else {
           try {
             if (await gameDir.exists()) {
               await gameDir.delete(recursive: true);
             }
           } catch (_) {}
-          targetPath = tempZipPath;
+          targetPath = sourceFile.path;
         }
-      } else if (rawName.toLowerCase().endsWith('.cue')) {
-        final gameDir = Directory('${dir.path}/game_$igdbId');
-        if (!await gameDir.exists()) {
-          await gameDir.create(recursive: true);
-        }
-        final preservedCueName = _sanitizePreservingSpaces(rawName);
-        targetPath = '${gameDir.path}/$preservedCueName';
-        await sourceFile.copy(targetPath);
-        await _copyCueCompanionFiles(
-          cueSourceFile: sourceFile,
-          destDir: gameDir,
-        );
       } else {
-        targetPath = '${dir.path}/rom_${igdbId}_$safeName';
-        await sourceFile.copy(targetPath);
+        // Execução direta no local original (ISO, CHD, CSO, PBP, RVZ, CUE+BIN,
+        // ROMs soltas e conjuntos arcade ZIP/7z) sem copiar nem duplicar dados.
+        targetPath = sourceFile.path;
       }
 
       final totalBytes =
           await LibraryStorageService.resolveInstalledRomSizeBytes(targetPath);
       return (localPath: targetPath, totalBytes: totalBytes);
     } finally {
-      await EmulatorService.cleanFilePickerTempCache(pickedPath: sourcePath);
+      if (usedFilePickerCacheCopy) {
+        await EmulatorService.cleanFilePickerTempCache(pickedPath: sourcePath);
+      }
     }
   }
 

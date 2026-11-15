@@ -227,6 +227,11 @@ class AppSettings {
     this.autoLoadOnStart = false,
     this.hapticVibration = true,
     this.buttonStyle = GamepadButtonStyle.gamehubGlass,
+    this.dpadButtonStyle,
+    this.stickButtonStyle,
+    this.actionButtonStyle,
+    this.shoulderButtonStyle,
+    this.selectStartButtonStyle,
     this.shoulderStyle = ShoulderTriggerStyle.compactTogether,
     this.gamepadScale = 1.0,
     this.gamepadOpacity = 0.82,
@@ -319,7 +324,21 @@ class AppSettings {
   // Controles Touch (Personalização Global e Individual por Botão/Grupo)
   final bool hapticVibration;
   final GamepadButtonStyle buttonStyle;
+  final GamepadButtonStyle? dpadButtonStyle;
+  final GamepadButtonStyle? stickButtonStyle;
+  final GamepadButtonStyle? actionButtonStyle;
+  final GamepadButtonStyle? shoulderButtonStyle;
+  final GamepadButtonStyle? selectStartButtonStyle;
   final ShoulderTriggerStyle shoulderStyle;
+
+  GamepadButtonStyle get effectiveDpadStyle => dpadButtonStyle ?? buttonStyle;
+  GamepadButtonStyle get effectiveStickStyle => stickButtonStyle ?? buttonStyle;
+  GamepadButtonStyle get effectiveActionStyle =>
+      actionButtonStyle ?? buttonStyle;
+  GamepadButtonStyle get effectiveShoulderStyle =>
+      shoulderButtonStyle ?? buttonStyle;
+  GamepadButtonStyle get effectiveSelectStartStyle =>
+      selectStartButtonStyle ?? buttonStyle;
   final double gamepadScale; // 0.65 .. 1.45
   final double gamepadOpacity; // 0.20 .. 1.0
 
@@ -499,7 +518,7 @@ class AppSettings {
             : (performanceBoost && !frameDuplication ? '1' : 'disabled'),
         'ppsspp_inflight_frames': 'Up to 2',
         'ppsspp_cpu_core': 'JIT',
-        'ppsspp_fast_memory': 'disabled',
+        'ppsspp_fast_memory': 'enabled',
         'ppsspp_ignore_bad_memory_access': 'enabled',
         'ppsspp_io_timing_method': 'Fast',
         'ppsspp_lazy_texture_caching':
@@ -511,6 +530,53 @@ class AppSettings {
             hardwareTransform ? 'enabled' : 'disabled',
         'ppsspp_software_skinning':
             softwareSkinning ? 'enabled' : 'disabled',
+        // Play! (PS2): 2x padrão evita visual pixelado em 640x448 e
+        // bilinear suaviza polígonos 3D sem cintilação.
+        'play_res_multi': switch (renderResolution) {
+          RenderResolutionPreset.x1 || RenderResolutionPreset.x2 => '2x',
+          RenderResolutionPreset.x3 ||
+          RenderResolutionPreset.x4 ||
+          RenderResolutionPreset.p1080 =>
+            '4x',
+          _ => '8x',
+        },
+        'play_bilinear_filtering': 'true',
+        'play_presentation_mode': 'Fit Screen',
+        // RPCS3 (PS3) — ajustes estáveis para Android: mantém HLE lwmutex, SPU
+        // verification e streaming de texturas nos padrões seguros do núcleo
+        // e limita threads LLVM/shader para evitar OOM ao finalizar compilação.
+        'rpcs3_database_override': 'disabled',
+        'rpcs3_ppu_decoder': 'llvm',
+        'rpcs3_spu_decoder': 'llvm',
+        'rpcs3_ppu_threads': '2',
+        'rpcs3_llvm_threads': '2',
+        'rpcs3_llvm_precompilation': 'enabled',
+        'rpcs3_shader_mode': 'async',
+        'rpcs3_shader_compiler_threads': '1',
+        'rpcs3_shader_quality': 'low',
+        'rpcs3_spu_block_size': 'safe',
+        'rpcs3_spu_cache': 'enabled',
+        'rpcs3_spu_verification': 'enabled',
+        'rpcs3_spu_loop_detection': 'disabled',
+        'rpcs3_strict_rendering': 'disabled',
+        'rpcs3_write_color_buffers': 'disabled',
+        'rpcs3_async_texture_streaming': 'disabled',
+        'rpcs3_emulate_hdd_speed': 'disabled',
+        'rpcs3_emulate_bdvd_speed': 'disabled',
+        'rpcs3_hle_lwmutex': 'disabled',
+        'rpcs3_multithreaded_rsx': 'disabled',
+        'rpcs3_thread_scheduler': 'os',
+        'rpcs3_silence_all_logs': 'disabled',
+        'rpcs3_resolution_scale': '100',
+        'rpcs3_default_resolution': '720p',
+        'rpcs3_frame_limit': 'auto',
+        'rpcs3_driver_wakeup_delay': '0',
+        'rpcs3_driver_recovery_timeout': '1000',
+        'rpcs3_sleep_timers_accuracy': 'auto',
+        'rpcs3_max_spurs_threads': '4',
+        'rpcs3_disk_cache_size': '1gb',
+        'rpcs3_show_ppu_compilation_hint': 'enabled',
+        'rpcs3_show_shader_compilation_hint': 'enabled',
       };
 
   AppSettings copyWith({
@@ -553,6 +619,12 @@ class AppSettings {
     bool? autoLoadOnStart,
     bool? hapticVibration,
     GamepadButtonStyle? buttonStyle,
+    GamepadButtonStyle? dpadButtonStyle,
+    GamepadButtonStyle? stickButtonStyle,
+    GamepadButtonStyle? actionButtonStyle,
+    GamepadButtonStyle? shoulderButtonStyle,
+    GamepadButtonStyle? selectStartButtonStyle,
+    bool clearElementButtonStyles = false,
     ShoulderTriggerStyle? shoulderStyle,
     double? gamepadScale,
     double? gamepadOpacity,
@@ -630,6 +702,21 @@ class AppSettings {
       autoLoadOnStart: autoLoadOnStart ?? this.autoLoadOnStart,
       hapticVibration: hapticVibration ?? this.hapticVibration,
       buttonStyle: buttonStyle ?? this.buttonStyle,
+      dpadButtonStyle: clearElementButtonStyles
+          ? null
+          : (dpadButtonStyle ?? this.dpadButtonStyle),
+      stickButtonStyle: clearElementButtonStyles
+          ? null
+          : (stickButtonStyle ?? this.stickButtonStyle),
+      actionButtonStyle: clearElementButtonStyles
+          ? null
+          : (actionButtonStyle ?? this.actionButtonStyle),
+      shoulderButtonStyle: clearElementButtonStyles
+          ? null
+          : (shoulderButtonStyle ?? this.shoulderButtonStyle),
+      selectStartButtonStyle: clearElementButtonStyles
+          ? null
+          : (selectStartButtonStyle ?? this.selectStartButtonStyle),
       shoulderStyle: shoulderStyle ?? this.shoulderStyle,
       gamepadScale: gamepadScale ?? this.gamepadScale,
       gamepadOpacity: gamepadOpacity ?? this.gamepadOpacity,
@@ -671,6 +758,7 @@ class AppSettings {
   AppSettings resetGamepadLayout() {
     return copyWith(
       buttonStyle: GamepadButtonStyle.gamehubGlass,
+      clearElementButtonStyles: true,
       shoulderStyle: ShoulderTriggerStyle.compactTogether,
       gamepadScale: 1.0,
       gamepadOpacity: 0.82,
@@ -742,6 +830,14 @@ class AppSettings {
       'autoLoadOnStart': autoLoadOnStart,
       'hapticVibration': hapticVibration,
       'buttonStyle': buttonStyle.name,
+      if (dpadButtonStyle != null) 'dpadButtonStyle': dpadButtonStyle!.name,
+      if (stickButtonStyle != null) 'stickButtonStyle': stickButtonStyle!.name,
+      if (actionButtonStyle != null)
+        'actionButtonStyle': actionButtonStyle!.name,
+      if (shoulderButtonStyle != null)
+        'shoulderButtonStyle': shoulderButtonStyle!.name,
+      if (selectStartButtonStyle != null)
+        'selectStartButtonStyle': selectStartButtonStyle!.name,
       'shoulderStyle': shoulderStyle.name,
       'gamepadScale': gamepadScale,
       'gamepadOpacity': gamepadOpacity,
@@ -803,6 +899,18 @@ class AppSettings {
   ) {
     final v = map[key];
     return v is String ? v : fallback;
+  }
+
+  static GamepadButtonStyle? _asOptionalButtonStyle(
+    Map<String, dynamic> map,
+    String key,
+  ) {
+    final raw = map[key];
+    if (raw is! String || raw.isEmpty) return null;
+    for (final style in GamepadButtonStyle.values) {
+      if (style.name == raw) return style;
+    }
+    return null;
   }
 
   factory AppSettings.fromJson(Map<String, dynamic> map) {
@@ -881,6 +989,14 @@ class AppSettings {
       buttonStyle: GamepadButtonStyle.values.firstWhere(
         (e) => e.name == map['buttonStyle'],
         orElse: () => GamepadButtonStyle.gamehubGlass,
+      ),
+      dpadButtonStyle: _asOptionalButtonStyle(map, 'dpadButtonStyle'),
+      stickButtonStyle: _asOptionalButtonStyle(map, 'stickButtonStyle'),
+      actionButtonStyle: _asOptionalButtonStyle(map, 'actionButtonStyle'),
+      shoulderButtonStyle: _asOptionalButtonStyle(map, 'shoulderButtonStyle'),
+      selectStartButtonStyle: _asOptionalButtonStyle(
+        map,
+        'selectStartButtonStyle',
       ),
       shoulderStyle: ShoulderTriggerStyle.values.firstWhere(
         (e) => e.name == map['shoulderStyle'],

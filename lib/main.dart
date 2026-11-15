@@ -40,7 +40,9 @@ void main() async {
 }
 
 class LoopGamerApp extends StatefulWidget {
-  const LoopGamerApp({super.key});
+  const LoopGamerApp({super.key, this.emulatorService});
+
+  final EmulatorService? emulatorService;
 
   @override
   State<LoopGamerApp> createState() => _LoopGamerAppState();
@@ -52,7 +54,8 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
   final RomDownloadService _downloadService = RomDownloadService();
   final LibraryStorageService _libraryStorage = LibraryStorageService();
   final SettingsStorageService _settingsStorage = SettingsStorageService();
-  final EmulatorService _emulatorService = EmulatorService();
+  late final EmulatorService _emulatorService =
+      widget.emulatorService ?? EmulatorService();
   final CoverCacheService _coverCacheService = CoverCacheService.instance;
 
   final ValueNotifier<Map<int, RomDownloadStatus>> _downloadStatusesNotifier =
@@ -64,7 +67,6 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
       ValueNotifier<bool>(false);
 
   StreamSubscription<RomDownloadEvent>? _downloadEventsSub;
-  StreamSubscription<void>? _gamepadSub;
   StreamSubscription<bool>? _gamepadStateSub;
   StreamSubscription<Map<String, dynamic>>? _gamepadUiSub;
 
@@ -94,17 +96,10 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
     _downloadEventsSub = _downloadService.downloadEvents.listen((event) {
       unawaited(_handleStatusUpdated(event.game, event.status));
     });
-    if (!Platform.environment.containsKey('FLUTTER_TEST')) {
+    if (widget.emulatorService != null ||
+        !Platform.environment.containsKey('FLUTTER_TEST')) {
       _hardwareGamepadNotifier.value =
           _emulatorService.isHardwareGamepadConnected;
-      _gamepadSub = _emulatorService.hardwareGamepadStream.listen(
-        (_) {
-          if (mounted && !_hardwareGamepadNotifier.value) {
-            _hardwareGamepadNotifier.value = true;
-          }
-        },
-        onError: (_) {},
-      );
       _gamepadStateSub = _emulatorService.hardwareGamepadStateStream.listen(
         (connected) {
           if (mounted && _hardwareGamepadNotifier.value != connected) {
@@ -127,10 +122,6 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
     if (dlSub != null) {
       unawaited(dlSub.cancel());
     }
-    final gpSub = _gamepadSub;
-    if (gpSub != null) {
-      unawaited(gpSub.cancel());
-    }
     final gpStateSub = _gamepadStateSub;
     if (gpStateSub != null) {
       unawaited(gpStateSub.cancel());
@@ -139,7 +130,9 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
     if (gpUiSub != null) {
       unawaited(gpUiSub.cancel());
     }
-    _emulatorService.dispose();
+    if (widget.emulatorService == null) {
+      _emulatorService.dispose();
+    }
     _downloadService.dispose();
     _apiService.dispose();
     _coverCacheService.dispose();
@@ -186,19 +179,15 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
 
       for (final g in savedGames) {
         _catalogById[g.igdbId] = g;
-        if (g.localRomPath != null) {
-          nextStatuses[g.igdbId] = RomDownloadStatus(
-            state: RomActionState.readyToPlay,
-            progress: 1.0,
-            localPath: g.localRomPath,
-          );
-        }
       }
 
       final catalogSnapshot = _catalogById.values.toList();
       final resolvedPaths = await Future.wait(
         catalogSnapshot.map(
-          (game) => _downloadService.resolveExistingRomPath(game.igdbId),
+          (game) => _downloadService.resolveExistingRomPath(
+            game.igdbId,
+            knownLocalPath: game.localRomPath,
+          ),
         ),
       );
       final resolvedSizes = await Future.wait(
@@ -213,8 +202,8 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
       );
       for (int i = 0; i < catalogSnapshot.length; i++) {
         final localPath = resolvedPaths[i];
+        final baseGame = catalogSnapshot[i];
         if (localPath != null) {
-          final baseGame = catalogSnapshot[i];
           final sizeBytes = resolvedSizes[i];
           if (sizeBytes > 0 && sizeBytes != baseGame.estimatedSizeBytes ||
               baseGame.localRomPath != localPath) {
@@ -229,6 +218,9 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
             progress: 1.0,
             localPath: localPath,
           );
+        } else if (baseGame.localRomPath != null) {
+          _catalogById[baseGame.igdbId] = baseGame.copyWith(localRomPath: null);
+          nextStatuses.remove(baseGame.igdbId);
         }
       }
 
@@ -453,9 +445,6 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
 
   void _openSettingsFromGuideButton() {
     if (!mounted || _isPlayerActive) return;
-    if (!_hardwareGamepadNotifier.value) {
-      _hardwareGamepadNotifier.value = true;
-    }
     _navigatorKey.currentState?.popUntil((route) => route.isFirst);
     if (_selectedTab != 3) {
       setState(() => _selectedTab = 3);
@@ -466,9 +455,6 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
     if (!mounted || _isPlayerActive) return;
     if (_navigatorKey.currentState?.canPop() ?? false) return;
     if (_isPrimaryFocusTextInput()) return;
-    if (!_hardwareGamepadNotifier.value) {
-      _hardwareGamepadNotifier.value = true;
-    }
     setState(() {
       _selectedTab = (_selectedTab + delta + 4) % 4;
     });
@@ -521,9 +507,6 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
 
   void _handleGlobalGamepadUiAction(Map<String, dynamic> event) {
     if (!mounted || _isPlayerActive) return;
-    if (!_hardwareGamepadNotifier.value) {
-      _hardwareGamepadNotifier.value = true;
-    }
     final action = (event['action'] as String?) ?? '';
     switch (action) {
       case 'guide':
@@ -649,30 +632,117 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
     if (_isImportingExternalIso) return;
     _isImportingExternalIso = true;
     String? pickedPath;
+    var usedDirectAndroidPicker = false;
     var keepPickedPathForCopy = false;
 
     try {
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.any,
-        allowMultiple: false,
-      );
-      final picked = result?.files.single;
-      pickedPath = picked?.path;
-      if (pickedPath == null || !mounted || !navContext.mounted) {
-        return;
+      String? rawFileName;
+
+      if (Platform.isAndroid) {
+        var hasAccess = await EmulatorService.hasDirectStorageAccess();
+        if (!hasAccess && navContext.mounted) {
+          final askPermission = await showDialog<bool>(
+                context: navContext,
+                builder: (ctx) => AlertDialog(
+                  backgroundColor: HydraTokens.bgNearBlack,
+                  shape: HydraTokens.dialogShape,
+                  title: const Text(
+                    'Executar ISOs direto sem copiar',
+                    style: TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: HydraTokens.textPrimary,
+                    ),
+                  ),
+                  content: const Text(
+                    'Para abrir ISOs e ROMs diretamente da pasta onde foram baixadas — sem duplicar arquivos no app nem esperar cópia — conceda acesso de leitura ao armazenamento.',
+                    style: TextStyle(
+                      fontFamily: 'Rubik',
+                      fontSize: 13.5,
+                      color: HydraTokens.textSecondary,
+                      height: 1.4,
+                    ),
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.of(ctx).pop(false),
+                      child: const Text('Cancelar'),
+                    ),
+                    FilledButton(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: HydraTokens.primaryAurora,
+                        foregroundColor: HydraTokens.bgPureBlack,
+                      ),
+                      onPressed: () => Navigator.of(ctx).pop(true),
+                      child: const Text('Permitir acesso'),
+                    ),
+                  ],
+                ),
+              ) ??
+              false;
+          if (!askPermission) return;
+          hasAccess = await EmulatorService.requestDirectStorageAccess();
+        }
+        if (!hasAccess) {
+          if (navContext.mounted) {
+            ScaffoldMessenger.of(navContext).showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'Permissão necessária para abrir ISOs direto do armazenamento sem duplicar.',
+                ),
+              ),
+            );
+          }
+          return;
+        }
+
+        final pickedDirect = await EmulatorService.pickExternalRomDirect();
+        if (pickedDirect == null || !mounted || !navContext.mounted) {
+          return;
+        }
+        if (!pickedDirect.isDirect || pickedDirect.path.isEmpty) {
+          ScaffoldMessenger.of(navContext).showSnackBar(
+            SnackBar(
+              content: Text(
+                'Não foi possível acessar "${pickedDirect.name}" diretamente sem cópia. Selecione um arquivo no Armazenamento Interno / Downloads (não nuvem).',
+              ),
+            ),
+          );
+          return;
+        }
+        usedDirectAndroidPicker = true;
+        keepPickedPathForCopy = true;
+        pickedPath = pickedDirect.path;
+        rawFileName = pickedDirect.name.isNotEmpty
+            ? pickedDirect.name
+            : pickedPath.split(Platform.pathSeparator).last;
+      } else {
+        final result = await FilePicker.platform.pickFiles(
+          type: FileType.any,
+          allowMultiple: false,
+        );
+        final picked = result?.files.single;
+        pickedPath = picked?.path;
+        if (pickedPath == null || !mounted || !navContext.mounted) {
+          return;
+        }
+        rawFileName =
+            (picked?.name ?? pickedPath.split(Platform.pathSeparator).last)
+                .trim();
       }
 
-      final rawFileName =
-          (picked?.name ?? pickedPath.split(Platform.pathSeparator).last)
-              .trim();
-      final dotIdx = rawFileName.lastIndexOf('.');
-      final rawStem = dotIdx > 0 ? rawFileName.substring(0, dotIdx) : rawFileName;
+      rawFileName = rawFileName.trim();
+      final resolvedFileName = rawFileName;
+      final dotIdx = resolvedFileName.lastIndexOf('.');
+      final rawStem =
+          dotIdx > 0 ? resolvedFileName.substring(0, dotIdx) : resolvedFileName;
       final defaultTitle = rawStem
           .replaceAll('_', ' ')
           .replaceAll(RegExp(r'\s+'), ' ')
           .trim();
       final detectedSlug = RomDownloadService.inferPlatformSlugFromExtension(
-        rawFileName,
+        resolvedFileName,
         fallbackSlug: 'ps2',
       );
       var selectedSlug = kRommPlatforms.any((p) => p.slug == detectedSlug)
@@ -687,107 +757,132 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
         confirmed = await showDialog<bool>(
               context: navContext,
               builder: (ctx) => StatefulBuilder(
-                builder: (ctx, setDialogState) => AlertDialog(
-                  backgroundColor: HydraTokens.bgNearBlack,
-                  shape: HydraTokens.dialogShape,
-                  title: const Text(
-                    'Importar ISO / ROM externa',
-                    style: TextStyle(
-                      fontFamily: 'ReadexPro',
-                      fontSize: 16,
-                      fontWeight: FontWeight.w700,
-                      color: HydraTokens.textPrimary,
+                builder: (ctx, setDialogState) {
+                  final lowerExt = resolvedFileName.toLowerCase();
+                  final isConsoleZip = lowerExt.endsWith('.zip') &&
+                      !const {'arcade', 'neogeo', 'fbneo', 'cps1', 'cps2', 'cps3'}
+                          .contains(selectedSlug);
+                  final isArchiveWarning =
+                      lowerExt.endsWith('.7z') || lowerExt.endsWith('.rar');
+                  return AlertDialog(
+                    backgroundColor: HydraTokens.bgNearBlack,
+                    shape: HydraTokens.dialogShape,
+                    title: const Text(
+                      'Adicionar ISO / ROM externa',
+                      style: TextStyle(
+                        fontFamily: 'ReadexPro',
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                        color: HydraTokens.textPrimary,
+                      ),
                     ),
-                  ),
-                  content: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 440),
-                    child: SingleChildScrollView(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            rawFileName,
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontFamily: 'JetBrainsMono',
-                              fontSize: 11,
-                              color: HydraTokens.primaryAurora,
+                    content: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 440),
+                      child: SingleChildScrollView(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              resolvedFileName,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontFamily: 'JetBrainsMono',
+                                fontSize: 11,
+                                color: HydraTokens.primaryAurora,
+                              ),
                             ),
-                          ),
-                          const SizedBox(height: 12),
-                          TextField(
-                            controller: titleController,
-                            style: const TextStyle(
-                              fontFamily: 'Rubik',
-                              fontSize: 13.5,
-                              color: HydraTokens.textPrimary,
+                            const SizedBox(height: 6),
+                            Text(
+                              isArchiveWarning
+                                  ? 'Arquivo compactado (.7z/.rar): descompacte antes para rodar .iso/.chd direto.'
+                                  : isConsoleZip
+                                      ? 'Será extraído para a Biblioteca sem duplicar o .zip original.'
+                                      : 'Execução direta sem cópia (arquivo original mantido em $pickedPath).',
+                              maxLines: 3,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontFamily: 'Rubik',
+                                fontSize: 11.5,
+                                color: isArchiveWarning
+                                    ? const Color(0xFFFFB74D)
+                                    : HydraTokens.textSecondary,
+                              ),
                             ),
-                            decoration: const InputDecoration(
-                              labelText: 'Nome do jogo na Biblioteca',
-                              border: OutlineInputBorder(),
+                            const SizedBox(height: 12),
+                            TextField(
+                              controller: titleController,
+                              style: const TextStyle(
+                                fontFamily: 'Rubik',
+                                fontSize: 13.5,
+                                color: HydraTokens.textPrimary,
+                              ),
+                              decoration: const InputDecoration(
+                                labelText: 'Nome do jogo na Biblioteca',
+                                border: OutlineInputBorder(),
+                              ),
                             ),
-                          ),
-                          const SizedBox(height: 12),
-                          DropdownButtonFormField<String>(
-                            value: selectedSlug,
-                            dropdownColor: HydraTokens.bgNearBlack,
-                            decoration: const InputDecoration(
-                              labelText: 'Console / Plataforma',
-                              border: OutlineInputBorder(),
-                            ),
-                            items: kRommPlatforms
-                                .map(
-                                  (p) => DropdownMenuItem<String>(
-                                    value: p.slug,
-                                    child: Text(
-                                      '${p.fullName} (${p.shortName})',
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        fontFamily: 'Rubik',
-                                        fontSize: 13,
-                                        color: HydraTokens.textPrimary,
+                            const SizedBox(height: 12),
+                            DropdownButtonFormField<String>(
+                              value: selectedSlug,
+                              dropdownColor: HydraTokens.bgNearBlack,
+                              decoration: const InputDecoration(
+                                labelText: 'Console / Plataforma',
+                                border: OutlineInputBorder(),
+                              ),
+                              items: kRommPlatforms
+                                  .map(
+                                    (p) => DropdownMenuItem<String>(
+                                      value: p.slug,
+                                      child: Text(
+                                        '${p.fullName} (${p.shortName})',
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          fontFamily: 'Rubik',
+                                          fontSize: 13,
+                                          color: HydraTokens.textPrimary,
+                                        ),
                                       ),
                                     ),
-                                  ),
-                                )
-                                .toList(),
-                            onChanged: (value) {
-                              if (value != null) {
-                                setDialogState(() => selectedSlug = value);
-                              }
-                            },
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  actions: [
-                    TextButton(
-                      style: TextButton.styleFrom(
-                        minimumSize: const Size(48, 48),
-                      ),
-                      onPressed: () => Navigator.of(ctx).pop(false),
-                      child: const Text('Cancelar'),
-                    ),
-                    FilledButton(
-                      style: FilledButton.styleFrom(
-                        minimumSize: const Size(48, 48),
-                        backgroundColor: HydraTokens.primaryAurora,
-                        foregroundColor: HydraTokens.bgPureBlack,
-                      ),
-                      onPressed: () => Navigator.of(ctx).pop(true),
-                      child: const Text(
-                        'Importar',
-                        style: TextStyle(
-                          fontFamily: 'ReadexPro',
-                          fontWeight: FontWeight.w700,
+                                  )
+                                  .toList(),
+                              onChanged: (value) {
+                                if (value != null) {
+                                  setDialogState(() => selectedSlug = value);
+                                }
+                              },
+                            ),
+                          ],
                         ),
                       ),
                     ),
-                  ],
-                ),
+                    actions: [
+                      TextButton(
+                        style: TextButton.styleFrom(
+                          minimumSize: const Size(48, 48),
+                        ),
+                        onPressed: () => Navigator.of(ctx).pop(false),
+                        child: const Text('Cancelar'),
+                      ),
+                      FilledButton(
+                        style: FilledButton.styleFrom(
+                          minimumSize: const Size(48, 48),
+                          backgroundColor: HydraTokens.primaryAurora,
+                          foregroundColor: HydraTokens.bgPureBlack,
+                        ),
+                        onPressed: () => Navigator.of(ctx).pop(true),
+                        child: const Text(
+                          'Adicionar',
+                          style: TextStyle(
+                            fontFamily: 'ReadexPro',
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  );
+                },
               ),
             ) ??
             false;
@@ -802,10 +897,18 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
             importId++;
           }
           if (navContext.mounted) {
+            final lowerExt = resolvedFileName.toLowerCase();
+            final isConsoleZip = lowerExt.endsWith('.zip') &&
+                !const {'arcade', 'neogeo', 'fbneo', 'cps1', 'cps2', 'cps3'}
+                    .contains(selectedSlug);
             ScaffoldMessenger.of(navContext).showSnackBar(
-              const SnackBar(
-                content: Text('Importando arquivo para a Biblioteca...'),
-                duration: Duration(seconds: 2),
+              SnackBar(
+                content: Text(
+                  isConsoleZip
+                      ? 'Extraindo .zip para a Biblioteca...'
+                      : 'Vinculando ISO/ROM para execução direta (sem copiar)...',
+                ),
+                duration: const Duration(seconds: 2),
               ),
             );
           }
@@ -820,13 +923,13 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
               orElse: () => kRommPlatforms.first,
             );
             final displayTitle = finalTitle.isEmpty
-                ? (defaultTitle.isEmpty ? rawFileName : defaultTitle)
+                ? (defaultTitle.isEmpty ? resolvedFileName : defaultTitle)
                 : finalTitle;
             final importedGame = EmulationGame(
               igdbId: importId,
               name: displayTitle,
               canonicalNoIntroName: displayTitle,
-              summary: 'ROM/ISO importada localmente (${platformSpec.fullName}).',
+              summary: 'ROM/ISO vinculada localmente (${platformSpec.fullName}).',
               genres: const ['Importado'],
               developer: 'Arquivo Local',
               releaseYear: null,
@@ -858,7 +961,7 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
           } else if (navContext.mounted) {
             ScaffoldMessenger.of(navContext).showSnackBar(
               const SnackBar(
-                content: Text('Não foi possível importar o arquivo selecionado.'),
+                content: Text('Não foi possível vincular o arquivo selecionado.'),
               ),
             );
           }
@@ -867,11 +970,11 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
     } catch (e) {
       if (navContext.mounted) {
         ScaffoldMessenger.of(navContext).showSnackBar(
-          SnackBar(content: Text('Falha ao importar ISO/ROM: $e')),
+          SnackBar(content: Text('Falha ao vincular ISO/ROM: $e')),
         );
       }
     } finally {
-      if (!keepPickedPathForCopy) {
+      if (!keepPickedPathForCopy && !usedDirectAndroidPicker) {
         await EmulatorService.cleanFilePickerTempCache(pickedPath: pickedPath);
       }
       _isImportingExternalIso = false;

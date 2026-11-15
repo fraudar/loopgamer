@@ -8,15 +8,20 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -82,10 +87,14 @@ constexpr unsigned RETRO_ENVIRONMENT_GET_FASTFORWARDING = (49 | 0x10000);
 constexpr unsigned RETRO_ENVIRONMENT_GET_INPUT_BITMASKS = 0x10033;
 constexpr unsigned RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION = 52;
 constexpr unsigned RETRO_ENVIRONMENT_SET_CORE_OPTIONS = 53;
+constexpr unsigned RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL = 54;
 constexpr unsigned RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY = 55;
 constexpr unsigned RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER = 56;
 constexpr unsigned RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE = 58;
-constexpr unsigned RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK = 60;
+constexpr unsigned RETRO_ENVIRONMENT_SET_MESSAGE_EXT = 60;
+constexpr unsigned RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2 = 67;
+constexpr unsigned RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL = 68;
+constexpr unsigned RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK = 69;
 constexpr unsigned RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS = (42 | 0x10000);
 constexpr unsigned RETRO_ENVIRONMENT_SET_VARIABLE = 70;
 constexpr unsigned RETRO_ENVIRONMENT_GET_JIT_CAPABLE = 74;
@@ -97,10 +106,204 @@ constexpr unsigned RETRO_ENVIRONMENT_GET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE
     (73 | 0x10000);
 constexpr int RETRO_HW_CONTEXT_NEGOTIATION_INTERFACE_VULKAN = 0;
 
+struct retro_message {
+  const char* msg;
+  unsigned frames;
+};
+
+struct retro_message_ext {
+  const char* msg;
+  unsigned duration;
+  unsigned priority;
+  int level;
+  int target;
+  int type;
+  int8_t progress;
+};
+
 typedef void (*retro_log_printf_t)(int level, const char* fmt, ...);
 struct retro_log_callback {
   retro_log_printf_t log;
 };
+
+std::mutex g_core_diag_mutex;
+std::string g_last_core_error;
+std::string g_last_core_message;
+bool g_last_core_error_fatal = false;
+std::atomic<bool> g_core_shutdown_requested{false};
+std::atomic<bool> g_has_rendered_frame{false};
+std::optional<std::string> g_prev_external_storage;
+bool g_overrode_external_storage = false;
+
+std::string to_lower_ascii(std::string_view s) {
+  std::string out(s);
+  for (char& ch : out) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+  return out;
+}
+
+bool contains_ci(std::string_view haystack, std::string_view needle) {
+  if (needle.empty()) return true;
+  return to_lower_ascii(haystack).find(to_lower_ascii(needle)) != std::string::npos;
+}
+
+bool is_informative_core_failure(std::string_view text) {
+  return contains_ci(text, "decryption") ||
+         contains_ci(text, "redump key") ||
+         contains_ci(text, "firmware_missing") ||
+         contains_ci(text, "Firmware is missing") ||
+         contains_ci(text, "Firmware is too old") ||
+         contains_ci(text, "Permission denied") ||
+         (contains_ci(text, "booting ") && contains_ci(text, " failed:")) ||
+         contains_ci(text, "could not be opened") ||
+         contains_ci(text, "invalid_file_or_folder") ||
+         contains_ci(text, "PS3UPDAT.PUP") ||
+         contains_ci(text, "EBOOT.BIN");
+}
+
+std::string format_friendly_core_error(const std::string& raw) {
+  if (raw.empty()) return {};
+  if (contains_ci(raw, "redump key") ||
+      contains_ci(raw, "decryption_error") ||
+      contains_ci(raw, "decryption key") ||
+      contains_ci(raw, "Decryption failed")) {
+    return "ISO de PS3 criptografada (Redump): o arquivo precisa de descriptografia ou da chave .dkey correspondente (" +
+           raw + ").";
+  }
+  if (contains_ci(raw, "firmware_missing") ||
+      contains_ci(raw, "Firmware is missing") ||
+      contains_ci(raw, "Firmware is too old")) {
+    return "Firmware de PS3 (PS3UPDAT.PUP) ausente, desatualizado ou não instalado corretamente (" +
+           raw + ").";
+  }
+  if (contains_ci(raw, "invalid_file_or_folder")) {
+    return "Estrutura de disco/pasta PS3 inválida para o RPCS3 (" + raw + ").";
+  }
+  return raw;
+}
+
+void clear_core_diagnostics() {
+  std::lock_guard<std::mutex> lock(g_core_diag_mutex);
+  g_last_core_error.clear();
+  g_last_core_message.clear();
+  g_last_core_error_fatal = false;
+  g_core_shutdown_requested.store(false, std::memory_order_release);
+  g_has_rendered_frame.store(false, std::memory_order_release);
+}
+
+void record_core_diagnostic(const char* text, bool is_error, bool fatal) {
+  if (!text || text[0] == '\0') return;
+  std::string msg(text);
+  while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) {
+    msg.pop_back();
+  }
+  if (msg.empty()) return;
+
+  std::lock_guard<std::mutex> lock(g_core_diag_mutex);
+  if (is_error) {
+    const bool prev_informative = is_informative_core_failure(g_last_core_error);
+    const bool curr_informative = is_informative_core_failure(msg);
+    if (g_last_core_error.empty() || curr_informative || !prev_informative) {
+      g_last_core_error = format_friendly_core_error(msg);
+    }
+    if (fatal || curr_informative) {
+      g_last_core_error_fatal = true;
+    }
+  } else {
+    g_last_core_message = msg;
+    if (is_informative_core_failure(msg)) {
+      g_last_core_error = format_friendly_core_error(msg);
+      g_last_core_error_fatal = true;
+    }
+  }
+}
+
+bool ensure_dir_recursive(const std::string& path) {
+  if (path.empty()) return false;
+  std::string cur;
+  cur.reserve(path.size());
+  for (size_t i = 0; i < path.size(); ++i) {
+    cur.push_back(path[i]);
+    if (path[i] == '/' || i + 1 == path.size()) {
+      if (cur == "/") continue;
+      if (::mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST) {
+        return false;
+      }
+    }
+  }
+  struct stat st {};
+  return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+void apply_play_storage_env_locked(const std::string& core_path,
+                                   const std::string& saves_dir) {
+  if (!contains_ci(core_path, "play_libretro") || saves_dir.empty()) return;
+  const std::string play_storage = saves_dir + "/play_storage";
+  if (!ensure_dir_recursive(play_storage)) {
+    __android_log_print(ANDROID_LOG_WARN, "loopgamer-core",
+                        "Falha ao criar diretório play_storage: %s",
+                        play_storage.c_str());
+    return;
+  }
+  if (!g_overrode_external_storage) {
+    const char* prev = std::getenv("EXTERNAL_STORAGE");
+    g_prev_external_storage =
+        prev ? std::optional<std::string>(prev) : std::nullopt;
+    g_overrode_external_storage = true;
+  }
+  ::setenv("EXTERNAL_STORAGE", play_storage.c_str(), 1);
+  __android_log_print(ANDROID_LOG_INFO, "loopgamer-core",
+                      "Play! EXTERNAL_STORAGE redirecionado para %s",
+                      play_storage.c_str());
+}
+
+void restore_external_storage_env_locked() {
+  if (!g_overrode_external_storage) return;
+  if (g_prev_external_storage.has_value()) {
+    ::setenv("EXTERNAL_STORAGE", g_prev_external_storage->c_str(), 1);
+  } else {
+    ::unsetenv("EXTERNAL_STORAGE");
+  }
+  g_prev_external_storage.reset();
+  g_overrode_external_storage = false;
+}
+
+// Eleva RLIMIT_NOFILE e RLIMIT_MEMLOCK para o core PS3 (rpcs3_libretro),
+// evitando falha ao abrir ISOs/PSARCs grandes, dev_flash e mapas JIT LLVM/SPU
+// (abordagem observada no aps3e_emu.cpp).
+void boost_process_rlimits_for_rpcs3(const std::string& core_path) {
+  if (!contains_ci(core_path, "rpcs3_libretro")) return;
+  struct rlimit rlim{};
+  if (::getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+    const rlim_t target = std::min<rlim_t>(rlim.rlim_max, 8192);
+    if (rlim.rlim_cur < target) {
+      struct rlimit next{target, rlim.rlim_max};
+      if (::setrlimit(RLIMIT_NOFILE, &next) == 0) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "loopgamer-core",
+            "RPCS3 RLIMIT_NOFILE elevado de %llu para %llu (max=%llu)",
+            static_cast<unsigned long long>(rlim.rlim_cur),
+            static_cast<unsigned long long>(target),
+            static_cast<unsigned long long>(rlim.rlim_max));
+      } else {
+        __android_log_print(
+            ANDROID_LOG_WARN, "loopgamer-core",
+            "Falha ao elevar RLIMIT_NOFILE para %llu: errno=%d",
+            static_cast<unsigned long long>(target), errno);
+      }
+    }
+  }
+  if (::getrlimit(RLIMIT_MEMLOCK, &rlim) == 0 && rlim.rlim_cur < rlim.rlim_max) {
+    struct rlimit next{rlim.rlim_max, rlim.rlim_max};
+    if (::setrlimit(RLIMIT_MEMLOCK, &next) == 0) {
+      __android_log_print(
+          ANDROID_LOG_INFO, "loopgamer-core",
+          "RPCS3 RLIMIT_MEMLOCK elevado para %llu",
+          static_cast<unsigned long long>(rlim.rlim_max));
+    }
+  }
+}
 
 void core_log_printf(int level, const char* fmt, ...) {
   if (!fmt) return;
@@ -115,6 +318,17 @@ void core_log_printf(int level, const char* fmt, ...) {
   va_end(ap);
   buf[sizeof(buf) - 1] = '\0';
   __android_log_write(prio, "loopgamer-core", buf);
+  if (level >= 3) {
+    record_core_diagnostic(buf, /*is_error=*/true, /*fatal=*/false);
+  } else if (!g_has_rendered_frame.load(std::memory_order_relaxed) &&
+             !is_informative_core_failure(buf) &&
+             (contains_ci(buf, "compiling") ||
+              contains_ci(buf, "llvm") ||
+              contains_ci(buf, "spu cache") ||
+              contains_ci(buf, "building") ||
+              contains_ci(buf, "loading"))) {
+    record_core_diagnostic(buf, /*is_error=*/false, /*fatal=*/false);
+  }
 }
 
 enum retro_pixel_format {
@@ -379,6 +593,30 @@ GLenum g_lastLoggedGlErr = GL_NO_ERROR;
 retro_hw_context_reset_t g_hwCoreReset = nullptr;
 retro_hw_render_callback g_hwCb{};
 
+bool g_isPlayCore = false;
+
+bool is_play_core_path(const std::string& path) {
+  std::string lower;
+  lower.reserve(path.size());
+  for (unsigned char c : path) {
+    lower.push_back(static_cast<char>(std::tolower(c)));
+  }
+  return lower.find("play_libretro") != std::string::npos;
+}
+GLuint g_prevHwTex = 0;
+unsigned g_prevHwW = 0;
+unsigned g_prevHwH = 0;
+bool g_hasPrevHwFrame = false;
+bool g_deintLogged = false;
+GLuint g_deintProgram = 0;
+GLint g_deintPosLoc = -1;
+GLint g_deintUScaleLoc = -1;
+GLint g_deintVScaleLoc = -1;
+GLint g_deintVOffsetLoc = -1;
+GLint g_deintPrevTexelLoc = -1;
+GLint g_deintCurrTexLoc = -1;
+GLint g_deintPrevTexLoc = -1;
+
 std::atomic<bool> g_frameDup{false};
 std::atomic<bool> g_vsyncEnabled{false};
 std::atomic<bool> g_presentedThisStep{false};
@@ -424,13 +662,65 @@ void main() {
 )GLSL";
 
 const char* kBlitFragmentShader = R"GLSL(
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
 precision mediump float;
+#endif
 varying vec2 vUv;
 uniform sampler2D uTex;
 uniform float uSwizzleRB;
 void main() {
   vec4 c = texture2D(uTex, vUv);
   vec3 rgb = uSwizzleRB > 0.5 ? c.bgr : c.rgb;
+  gl_FragColor = vec4(rgb, 1.0);
+}
+)GLSL";
+
+const char* kDeintVertexShader = R"GLSL(
+attribute vec2 aPos;
+varying vec2 vCurrUv;
+varying vec2 vPrevUv;
+uniform float uUScale;
+uniform float uVScale;
+uniform float uVOffset;
+void main() {
+  vec2 unit = aPos * 0.5 + 0.5;
+  vCurrUv = vec2(unit.x * uUScale, aPos.y * 0.5 * uVScale + uVOffset);
+  vPrevUv = unit;
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}
+)GLSL";
+
+// Deinterlacer temporal motion-adaptive com proteção anti-bob vertical:
+// estabiliza oscilação par/ímpar (480i/2x) em HUD/texto/cenário estático
+// mantendo objetos em movimento rápido nítidos sem ghosting.
+const char* kDeintFragmentShader = R"GLSL(
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec2 vCurrUv;
+varying vec2 vPrevUv;
+uniform sampler2D uCurrTex;
+uniform sampler2D uPrevTex;
+uniform vec2 uPrevTexel;
+void main() {
+  vec3 curr = texture2D(uCurrTex, vCurrUv).rgb;
+  float dy = uPrevTexel.y;
+  vec3 p0  = texture2D(uPrevTex, vPrevUv).rgb;
+  vec3 pm1 = texture2D(uPrevTex, clamp(vPrevUv - vec2(0.0, dy), 0.0, 1.0)).rgb;
+  vec3 pp1 = texture2D(uPrevTex, clamp(vPrevUv + vec2(0.0, dy), 0.0, 1.0)).rgb;
+  vec3 pm2 = texture2D(uPrevTex, clamp(vPrevUv - vec2(0.0, 2.0 * dy), 0.0, 1.0)).rgb;
+  vec3 pp2 = texture2D(uPrevTex, clamp(vPrevUv + vec2(0.0, 2.0 * dy), 0.0, 1.0)).rgb;
+  vec3 minP = min(min(p0, min(pm1, pp1)), min(pm2, pp2));
+  vec3 maxP = max(max(p0, max(pm1, pp1)), max(pm2, pp2));
+  vec3 outOfRange = max(max(minP - curr, curr - maxP), vec3(0.0));
+  float diff = max(outOfRange.r, max(outOfRange.g, outOfRange.b));
+  float motion = smoothstep(0.03, 0.14, diff);
+  float blend = 0.5 * (1.0 - motion);
+  vec3 rgb = mix(curr, p0, blend);
   gl_FragColor = vec4(rgb, 1.0);
 }
 )GLSL";
@@ -525,6 +815,7 @@ void gl_shutdown() {
                          g_eglContext) == EGL_TRUE) {
         if (g_swTex != 0) glDeleteTextures(1, &g_swTex);
         if (g_hwColorTex != 0) glDeleteTextures(1, &g_hwColorTex);
+        if (g_prevHwTex != 0) glDeleteTextures(1, &g_prevHwTex);
         if (g_hwDepthRb != 0) glDeleteRenderbuffers(1, &g_hwDepthRb);
         if (g_hwStencilRb != 0) glDeleteRenderbuffers(1, &g_hwStencilRb);
         if (g_hwFbo != 0) glDeleteFramebuffers(1, &g_hwFbo);
@@ -533,13 +824,19 @@ void gl_shutdown() {
         }
         if (g_blitVbo != 0) glDeleteBuffers(1, &g_blitVbo);
         if (g_blitProgram != 0) glDeleteProgram(g_blitProgram);
+        if (g_deintProgram != 0) glDeleteProgram(g_deintProgram);
         glFinish();
       }
       gl_release_context();
     }
-    g_swTex = g_hwColorTex = g_hwDepthRb = g_hwStencilRb = g_hwFbo =
-        g_blitVao = g_blitVbo = g_blitProgram = 0;
+    g_swTex = g_hwColorTex = g_prevHwTex = g_hwDepthRb = g_hwStencilRb = g_hwFbo =
+        g_blitVao = g_blitVbo = g_blitProgram = g_deintProgram = 0;
     g_blitUScaleLoc = -1;
+    g_deintPosLoc = g_deintUScaleLoc = g_deintVScaleLoc = g_deintVOffsetLoc =
+        g_deintPrevTexelLoc = g_deintCurrTexLoc = g_deintPrevTexLoc = -1;
+    g_prevHwW = g_prevHwH = 0;
+    g_hasPrevHwFrame = false;
+    g_deintLogged = false;
     g_glGenVertexArrays = nullptr;
     g_glDeleteVertexArrays = nullptr;
     g_glBindVertexArray = nullptr;
@@ -904,6 +1201,151 @@ bool hw_ensure_fbo() {
   return true;
 }
 
+bool ensure_deint_program() {
+  if (g_deintProgram != 0) return true;
+  GLuint vs = compile_shader(GL_VERTEX_SHADER, kDeintVertexShader);
+  GLuint fs = compile_shader(GL_FRAGMENT_SHADER, kDeintFragmentShader);
+  if (!vs || !fs) {
+    if (vs) glDeleteShader(vs);
+    if (fs) glDeleteShader(fs);
+    return false;
+  }
+  g_deintProgram = glCreateProgram();
+  glAttachShader(g_deintProgram, vs);
+  glAttachShader(g_deintProgram, fs);
+  glBindAttribLocation(g_deintProgram, 0, "aPos");
+  glLinkProgram(g_deintProgram);
+  glDeleteShader(vs);
+  glDeleteShader(fs);
+  GLint linked = GL_FALSE;
+  glGetProgramiv(g_deintProgram, GL_LINK_STATUS, &linked);
+  if (!linked) {
+    glDeleteProgram(g_deintProgram);
+    g_deintProgram = 0;
+    return false;
+  }
+  g_deintPosLoc = glGetAttribLocation(g_deintProgram, "aPos");
+  g_deintUScaleLoc = glGetUniformLocation(g_deintProgram, "uUScale");
+  g_deintVScaleLoc = glGetUniformLocation(g_deintProgram, "uVScale");
+  g_deintVOffsetLoc = glGetUniformLocation(g_deintProgram, "uVOffset");
+  g_deintPrevTexelLoc = glGetUniformLocation(g_deintProgram, "uPrevTexel");
+  g_deintCurrTexLoc = glGetUniformLocation(g_deintProgram, "uCurrTex");
+  g_deintPrevTexLoc = glGetUniformLocation(g_deintProgram, "uPrevTex");
+  return true;
+}
+
+bool ensure_prev_hw_tex(unsigned width, unsigned height) {
+  if (width == 0 || height == 0) return false;
+  if (g_prevHwTex != 0 && g_prevHwW == width && g_prevHwH == height) {
+    return true;
+  }
+  if (g_prevHwTex != 0) {
+    glDeleteTextures(1, &g_prevHwTex);
+    g_prevHwTex = 0;
+  }
+  glActiveTexture(GL_TEXTURE0);
+  glGenTextures(1, &g_prevHwTex);
+  glBindTexture(GL_TEXTURE_2D, g_prevHwTex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(width),
+               static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE,
+               nullptr);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  g_prevHwW = width;
+  g_prevHwH = height;
+  g_hasPrevHwFrame = false;
+  return g_prevHwTex != 0;
+}
+
+void gl_draw_play_deint(GLuint currTex, GLuint prevTex, float uScale,
+                        float vScale, float vOffset, unsigned prevW,
+                        unsigned prevH) {
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  EGLint sw = 0, sh = 0;
+  eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH, &sw);
+  eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &sh);
+  glViewport(0, 0, sw > 0 ? sw : 1, sh > 0 ? sh : 1);
+
+  glDisable(GL_SCISSOR_TEST);
+  glDisable(GL_CULL_FACE);
+  glDisable(GL_STENCIL_TEST);
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_BLEND);
+  glDisable(GL_POLYGON_OFFSET_FILL);
+  glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+  glDisable(GL_SAMPLE_COVERAGE);
+  if (g_eglGlesVersion >= 3) {
+    glDisable(0x8C89 /*GL_RASTERIZER_DISCARD*/);
+  }
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+  glClear(GL_COLOR_BUFFER_BIT);
+
+  GLint prevSampler0 = 0, prevSampler1 = 0;
+  if (g_glBindSampler) {
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(0x8919 /*GL_SAMPLER_BINDING*/, &prevSampler0);
+    g_glBindSampler(0, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glGetIntegerv(0x8919 /*GL_SAMPLER_BINDING*/, &prevSampler1);
+    g_glBindSampler(1, 0);
+  }
+  GLint prevVao = 0;
+  const bool useVao = (g_glBindVertexArray && g_blitVao != 0);
+  if (g_glBindVertexArray) {
+    glGetIntegerv(0x85B5 /*GL_VERTEX_ARRAY_BINDING*/, &prevVao);
+    if (useVao) {
+      g_glBindVertexArray(g_blitVao);
+    } else {
+      g_glBindVertexArray(0);
+      glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    }
+  }
+
+  glUseProgram(g_deintProgram);
+  if (g_deintUScaleLoc >= 0) glUniform1f(g_deintUScaleLoc, uScale);
+  if (g_deintVScaleLoc >= 0) glUniform1f(g_deintVScaleLoc, vScale);
+  if (g_deintVOffsetLoc >= 0) glUniform1f(g_deintVOffsetLoc, vOffset);
+  if (g_deintPrevTexelLoc >= 0) {
+    glUniform2f(g_deintPrevTexelLoc,
+                prevW > 0 ? 1.0f / static_cast<float>(prevW) : 0.0f,
+                prevH > 0 ? 1.0f / static_cast<float>(prevH) : 0.0f);
+  }
+  if (g_deintCurrTexLoc >= 0) glUniform1i(g_deintCurrTexLoc, 0);
+  if (g_deintPrevTexLoc >= 0) glUniform1i(g_deintPrevTexLoc, 1);
+
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, currTex);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, prevTex);
+
+  if (!useVao && g_deintPosLoc >= 0) {
+    glBindBuffer(GL_ARRAY_BUFFER, g_blitVbo);
+    glEnableVertexAttribArray(g_deintPosLoc);
+    glVertexAttribPointer(g_deintPosLoc, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+  }
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  if (!useVao && g_deintPosLoc >= 0) {
+    glDisableVertexAttribArray(g_deintPosLoc);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+  }
+  if (g_glBindVertexArray) {
+    g_glBindVertexArray(static_cast<GLuint>(prevVao));
+  }
+  if (g_glBindSampler) {
+    g_glBindSampler(0, static_cast<GLuint>(prevSampler0));
+    g_glBindSampler(1, static_cast<GLuint>(prevSampler1));
+  }
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  glUseProgram(0);
+}
+
 void present_hw_frame(unsigned width, unsigned height) {
   if (!gl_ensure_current() || g_hwFbo == 0 || g_hwColorTex == 0) return;
   // Não recria o FBO aqui (descartaria a imagem recém-renderizada pelo core);
@@ -916,7 +1358,34 @@ void present_hw_frame(unsigned width, unsigned height) {
       (g_hwFboH > 0 && height > 0 && height < g_hwFboH)
           ? (static_cast<float>(height) / static_cast<float>(g_hwFboH))
           : 1.0f;
-  gl_draw_bound(g_hwColorTex, uScale, vMax, 0.5f * vMax, false);
+
+  const bool usePlayDeint =
+      g_isPlayCore && g_eglGlesVersion >= 3 && width > 0 && height > 0;
+  if (usePlayDeint && ensure_deint_program() &&
+      ensure_prev_hw_tex(width, height) && g_hasPrevHwFrame) {
+    gl_draw_play_deint(g_hwColorTex, g_prevHwTex, uScale, vMax, 0.5f * vMax,
+                       g_prevHwW, g_prevHwH);
+  } else {
+    gl_draw_bound(g_hwColorTex, uScale, vMax, 0.5f * vMax, false);
+  }
+
+  if (usePlayDeint && g_prevHwTex != 0) {
+    glBindFramebuffer(0x8CA8 /*GL_READ_FRAMEBUFFER*/, g_hwFbo);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_prevHwTex);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                        static_cast<GLsizei>(width),
+                        static_cast<GLsizei>(height));
+    glBindFramebuffer(0x8CA8 /*GL_READ_FRAMEBUFFER*/, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    g_hasPrevHwFrame = true;
+    if (!g_deintLogged) {
+      g_deintLogged = true;
+      __android_log_print(ANDROID_LOG_INFO, "loopgamer-core",
+                          "Play! temporal deinterlace ativo (%ux%u)",
+                          width, height);
+    }
+  }
   const GLenum err = glGetError();
   ++g_hwPresentCount;
   if (g_hwPresentCount <= 3 ||
@@ -1260,7 +1729,10 @@ const char* get_core_variable(const char* key) {
   if (k == "ppsspp_frameskiptype") return "Number of frames";
 
   // 6. Memória e IO
-  if (k == "ppsspp_fast_memory") return "disabled"; // Evita SIGSEGV com ART
+  // Keep FastMemory enabled: on ARM64 with FastMemory disabled, upstream PPSSPP's
+  // CompIR_ValidateAddress emits `mov w1, #0x11` (32-bit W17) before ReportBadAddress,
+  // truncating the 64-bit guest memory pointer and crashing in gameplay with SIGSEGV.
+  if (k == "ppsspp_fast_memory") return "enabled";
   if (k == "ppsspp_ignore_bad_memory_access") return "enabled";
   if (k == "ppsspp_io_timing_method") return "Fast";
   if (k == "ppsspp_locked_cpu_speed") return "disabled";
@@ -1294,6 +1766,11 @@ const char* get_core_variable(const char* key) {
   // Snes9x & Genesis Plus GX
   if (k == "snes9x_overclock_superfx") return "100%";
   if (k == "genesis_plus_gx_overclock") return "100%";
+
+  // Play! (PS2)
+  if (k == "play_res_multi") return "2x";
+  if (k == "play_bilinear_filtering") return "true";
+  if (k == "play_presentation_mode") return "Fit Screen";
 
   return nullptr;
 }
@@ -1487,11 +1964,41 @@ bool environment_callback(unsigned cmd, void* data) {
       return true;
     }
     case RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION: {
-      if (data) *static_cast<unsigned*>(data) = 1;
+      if (data) *static_cast<unsigned*>(data) = 2;
+      return true;
+    }
+    case RETRO_ENVIRONMENT_SET_MESSAGE: {
+      const auto* msg = static_cast<const retro_message*>(data);
+      if (msg && msg->msg && msg->msg[0] != '\0') {
+        __android_log_print(ANDROID_LOG_INFO, "loopgamer-core",
+                            "SET_MESSAGE (%u frames): %s", msg->frames,
+                            msg->msg);
+        record_core_diagnostic(msg->msg, /*is_error=*/false, /*fatal=*/false);
+      }
+      return true;
+    }
+    case RETRO_ENVIRONMENT_SET_MESSAGE_EXT: {
+      const auto* msg = static_cast<const retro_message_ext*>(data);
+      if (msg && msg->msg && msg->msg[0] != '\0') {
+        const bool is_err = msg->level >= 3;
+        __android_log_print(is_err ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO,
+                            "loopgamer-core", "SET_MESSAGE_EXT (lvl=%d): %s",
+                            msg->level, msg->msg);
+        record_core_diagnostic(msg->msg, is_err, /*fatal=*/is_err);
+      }
+      return true;
+    }
+    case RETRO_ENVIRONMENT_SHUTDOWN: {
+      __android_log_print(ANDROID_LOG_INFO, "loopgamer-core",
+                          "Core solicitou RETRO_ENVIRONMENT_SHUTDOWN");
+      g_core_shutdown_requested.store(true, std::memory_order_release);
       return true;
     }
     case RETRO_ENVIRONMENT_SET_CORE_OPTIONS:
+    case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL:
     case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY:
+    case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2:
+    case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL:
     case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK:
     case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS:
     case RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE:
@@ -1601,6 +2108,8 @@ void video_refresh_callback(const void* data, unsigned width, unsigned height, s
   // Frames de HW (especialmente Vulkan) não devem pular present para não
   // deixar swapchain/semáforos do retro_run órfãos.
   if (!is_hw_frame && should_skip_present()) return;
+
+  g_has_rendered_frame.store(true, std::memory_order_release);
 
   if (is_hw_frame) {
     if (vkfe::is_active()) {
@@ -1723,6 +2232,9 @@ void unload_core_locked() {
   g_hwIsVulkan = false;
   g_hwCoreReset = nullptr;
   g_hwCb = retro_hw_render_callback{};
+  g_isPlayCore = false;
+  g_hasPrevHwFrame = false;
+  g_deintLogged = false;
   g_configured_width = 0;
   g_configured_height = 0;
   g_configured_win_format = 0;
@@ -1736,6 +2248,7 @@ void unload_core_locked() {
     ANativeWindow_release(g_window);
     g_window = nullptr;
   }
+  restore_external_storage_env_locked();
   {
     std::lock_guard<std::mutex> state_lock(g_state_mutex);
     g_returnedVarStrings.clear();
@@ -1762,6 +2275,7 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
 
   // Garante limpeza completa de sessão anterior antes de sobrescrever handles
   unload_core_locked();
+  clear_core_diagnostics();
 
   if (!env || !surface_j) {
     __android_log_print(ANDROID_LOG_ERROR, "loopgamer-core",
@@ -1801,6 +2315,22 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
                         dlerror());
     unload_core_locked();
     return JNI_FALSE;
+  }
+
+  // Cores carregados via dlopen() não recebem JNI_OnLoad automaticamente pela ART.
+  // O Play! (PS2) depende de Framework::CJavaVM::m_vm preenchido antes da thread
+  // PS2VM chamar AttachCurrentThread; inicializamos via símbolo exportado se existir.
+  JavaVM* jvm = nullptr;
+  if (env->GetJavaVM(&jvm) == JNI_OK && jvm != nullptr) {
+    using SetJavaVMFn = void (*)(JavaVM*);
+    auto set_java_vm = reinterpret_cast<SetJavaVMFn>(
+        dlsym(g_core.handle, "_ZN9Framework7CJavaVM9SetJavaVMEP7_JavaVM"));
+    if (set_java_vm) {
+      set_java_vm(jvm);
+      __android_log_print(ANDROID_LOG_INFO, "loopgamer-core",
+                          "Play! Framework::CJavaVM::SetJavaVM(%p) inicializado",
+                          static_cast<void*>(jvm));
+    }
   }
 
   #define LOAD_SYM(name) \
@@ -1863,6 +2393,9 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
   g_hwFbo = g_hwColorTex = g_hwDepthRb = g_hwStencilRb = 0;
   g_hwFboW = g_hwFboH = 0;
   g_hwMaxW = g_hwMaxH = 0;
+  g_isPlayCore = is_play_core_path(core_path);
+  g_hasPrevHwFrame = false;
+  g_deintLogged = false;
   g_swTex = 0;
   g_swTexW = g_swTexH = 0;
   g_videoCbThisStep = false;
@@ -1886,6 +2419,8 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
   g_core.retro_set_audio_sample_batch(audio_sample_batch_callback);
   g_core.retro_set_input_poll(input_poll_callback);
   g_core.retro_set_input_state(input_state_callback);
+  apply_play_storage_env_locked(core_path, g_saves_dir);
+  boost_process_rlimits_for_rpcs3(core_path);
   g_core.retro_init();
 
   retro_system_info sys_info{};
@@ -1967,6 +2502,18 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
     if (g_hwIsVulkan) {
       if (vkfe::is_active()) {
         if (g_hwCoreReset) g_hwCoreReset();
+        bool fatal_after_reset = false;
+        {
+          std::lock_guard<std::mutex> diag_lock(g_core_diag_mutex);
+          fatal_after_reset = g_last_core_error_fatal;
+        }
+        if (fatal_after_reset || g_core_shutdown_requested.load(std::memory_order_acquire)) {
+          __android_log_print(
+              ANDROID_LOG_ERROR, "loopgamer-core",
+              "HW context_reset reportou erro fatal de boot/core — abortando");
+          unload_core_locked();
+          return JNI_FALSE;
+        }
         g_hwActive = true;
         __android_log_print(
             ANDROID_LOG_INFO, "loopgamer-core",
@@ -2275,6 +2822,40 @@ extern "C" JNIEXPORT jint JNICALL
 Java_org_loopgamer_emulator_MainActivity_nativeGetFrameHeight(JNIEnv*, jobject) {
   std::lock_guard<std::mutex> state_lock(g_state_mutex);
   return static_cast<jint>(g_last_height);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_loopgamer_emulator_MainActivity_nativeGetLastCoreError(
+    JNIEnv* env, jobject) {
+  if (!env) return nullptr;
+  std::lock_guard<std::mutex> lock(g_core_diag_mutex);
+  const std::string& chosen =
+      !g_last_core_error.empty() ? g_last_core_error : g_last_core_message;
+  if (chosen.empty()) return nullptr;
+  return env->NewStringUTF(chosen.c_str());
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_loopgamer_emulator_MainActivity_nativeIsCoreErrorFatal(
+    JNIEnv*, jobject) {
+  std::lock_guard<std::mutex> lock(g_core_diag_mutex);
+  return g_last_core_error_fatal ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_loopgamer_emulator_MainActivity_nativeIsCoreShutdownRequested(
+    JNIEnv*, jobject) {
+  return g_core_shutdown_requested.load(std::memory_order_acquire)
+             ? JNI_TRUE
+             : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_loopgamer_emulator_MainActivity_nativeHasRenderedFrame(
+    JNIEnv*, jobject) {
+  return g_has_rendered_frame.load(std::memory_order_acquire)
+             ? JNI_TRUE
+             : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
