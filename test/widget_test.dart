@@ -37,6 +37,9 @@ void main() {
     expect(find.text('ROMs'), findsOneWidget);
     expect(find.text('Biblioteca'), findsOneWidget);
     expect(find.text('Ajustes'), findsOneWidget);
+    expect(find.bySemanticsLabel('Wi-Fi conectado'), findsOneWidget);
+    expect(find.bySemanticsLabel('Buscar ROMs'), findsOneWidget);
+    expect(find.bySemanticsLabel('Abrir Biblioteca'), findsAtLeastNWidgets(1));
 
     // Navega pelas abas em Landscape
     await tester.tap(find.text('ROMs'));
@@ -59,5 +62,7 @@ void main() {
     await tester.pump();
     expect(find.text('Encontre seu jogo...'), findsOneWidget);
     expect(find.text('Player Rating'), findsOneWidget);
+    final portraitTitle = tester.widget<Text>(find.text('LOOPGAMER'));
+    expect(portraitTitle.style?.fontFamily, 'PressStart2P');
   });
 }

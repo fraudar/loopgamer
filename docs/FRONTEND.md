@@ -40,8 +40,8 @@ android/...                          # Lado nativo (ver docs/BACKEND.md)
 
 ## Shell principal (`lib/main.dart`) e UI
 
-- **Tema e Localização**: `HydraTokens.buildAppTheme()` usa apenas pesos declarados no `pubspec.yaml` (`ReadexPro` 600/700, `Rubik` 400–700, `JetBrainsMono` 400/700) com contraste WCAG em `textMuted` (`0xFF9391A6`). `localizationsDelegates` configura `pt-BR`.
-- **Responsividade**: `HydraTokens.isWideLayout(context)` (`width >= 600 && width > height`) alterna entre barra superior em landscape (`_GameHubLandscapeTopBar` com relógio em tempo real `_LiveTopBarClock` sem ícones estáticos falsos) e dock inferior em portrait (`_GameHubPortraitDockBar`).
+- **Tema e Localização**: `HydraTokens.buildAppTheme()` usa apenas pesos declarados no `pubspec.yaml` (`PressStart2P` para logo retrô na Home, `Silkscreen`, `ReadexPro` 600/700, `Rubik` 400–700, `JetBrainsMono` 400/700) com contraste WCAG em `textMuted` (`0xFF9391A6`). `localizationsDelegates` configura `pt-BR`.
+- **Responsividade**: `HydraTokens.isWideLayout(context)` (`width >= 600 && width > height`) alterna entre barra superior flutuante em landscape (`_GameHubLandscapeTopBar`, cápsulas translúcidas estilo iOS sobre o conteúdo em tela cheia, com relógio em tempo real `_LiveTopBarClock` e status real de Wi-Fi `_LiveTopBarWifi`) e dock inferior em portrait (`_GameHubPortraitDockBar`).
 - **Abas em `IndexedStack`**: Home, Explorar, Biblioteca e Configurações recebem `isActive` para evitar disputa de foco de gamepad em abas ocultas (`handleGamepadNavigationKey`).
 - **Notifiers reativos**: `_downloadStatusesNotifier`, `_libraryBadgeCountNotifier`, `_hasActiveDownloadNotifier` e `_hardwareGamepadNotifier` isolam reconstruções de UI.
 - **Ciclo de vida**: serviços compartilhados (incluindo `_emulatorService` passado à `SettingsScreen`) têm `dispose()` explícito; abrir o player executa `navigator.popUntil((r) => r.isFirst)` e `SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky)` é restaurado ao retornar.

@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:loopgamer/main.dart';
 import 'package:loopgamer/models/app_settings.dart';
 import 'package:loopgamer/models/emulation_game.dart';
 import 'package:loopgamer/models/user_library_meta.dart';
@@ -1041,6 +1042,115 @@ void main() {
         expect(find.byType(LibretroPlayerScreen), findsNothing);
         expect(find.text('Launch Player'), findsOneWidget);
         expect(stopSessionCalls, greaterThanOrEqualTo(1));
+      },
+    );
+
+    testWidgets('LibraryScreen portrait renders compact single-row cards', (
+      WidgetTester tester,
+    ) async {
+      tester.view.physicalSize = const Size(412, 915);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final readyGame = _makeTestGame(
+        id: 101,
+        name: 'Chrono Adventure',
+        localRomPath: '/tmp/chrono.gba',
+      );
+      final downloadingGame = _makeTestGame(
+        id: 102,
+        name: 'Tactics Advance',
+      );
+
+      EmulationGame? launchedGame;
+      String? launchedPath;
+      const meta = UserLibraryMeta(
+        favorites: {101},
+        playtime: {
+          101: PlaytimeRecord(totalSeconds: 42 * 60, sessions: 1),
+        },
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: HydraTokens.buildAppTheme(),
+          home: LibraryScreen(
+            downloadedGames: [readyGame],
+            downloadingGames: [downloadingGame],
+            downloadStatuses: const {
+              102: RomDownloadStatus(
+                state: RomActionState.downloading,
+                progress: 0.45,
+                speedLabel: '2.4 MB/s',
+              ),
+            },
+            userMeta: meta,
+            onImportNewRomPressed: () {},
+            onLaunchGame: (g, p) {
+              launchedGame = g;
+              launchedPath = p;
+            },
+            onRemoveGame: (_) async {},
+            onCancelDownload: (_) {},
+          ),
+        ),
+      );
+
+      expect(find.text('Chrono Adventure'), findsOneWidget);
+      expect(find.text('Tactics Advance'), findsOneWidget);
+      expect(find.text('Jogar'), findsOneWidget);
+      expect(find.text('Cancelar'), findsOneWidget);
+
+      final cardFinder = find.ancestor(
+        of: find.text('Chrono Adventure'),
+        matching: find.byType(HydraTexturedCard),
+      );
+      expect(cardFinder, findsOneWidget);
+      expect(tester.getSize(cardFinder).height, lessThanOrEqualTo(112.0));
+
+      await tester.tap(find.text('Jogar'));
+      await tester.pump();
+      expect(launchedGame?.igdbId, 101);
+      expect(launchedPath, '/tmp/chrono.gba');
+    });
+
+    testWidgets(
+      'LoopGamerApp landscape floating top bar reflects native Wi-Fi status',
+      (WidgetTester tester) async {
+        tester.view.physicalSize = const Size(915, 412);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+
+        const methodsChannel = MethodChannel('org.loopgamer.libretro/methods');
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(methodsChannel, (call) async {
+          if (call.method == 'getNetworkStatus') {
+            return <String, dynamic>{'connected': true, 'wifi': false};
+          }
+          return null;
+        });
+        addTearDown(() {
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+              .setMockMethodCallHandler(methodsChannel, null);
+        });
+
+        await tester.pumpWidget(const LoopGamerApp());
+        await tester.pump();
+
+        expect(find.bySemanticsLabel('Sem Wi-Fi (dados móveis)'), findsOneWidget);
+        expect(find.bySemanticsLabel('Buscar ROMs'), findsOneWidget);
+        expect(find.bySemanticsLabel('Abrir Biblioteca'), findsOneWidget);
+        final titleText = tester.widget<Text>(find.text('LOOPGAMER'));
+        expect(titleText.style?.fontFamily, 'PressStart2P');
+        expect(
+          find.ancestor(
+            of: find.text('LOOPGAMER'),
+            matching: find.byType(Center),
+          ),
+          findsOneWidget,
+        );
       },
     );
   });

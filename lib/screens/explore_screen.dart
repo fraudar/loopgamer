@@ -569,6 +569,7 @@ class _ExploreScreenState extends State<ExploreScreen> {
     return Scaffold(
       backgroundColor: HydraTokens.bgPureBlack,
       body: SafeArea(
+        top: !isLandscape,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -582,7 +583,7 @@ class _ExploreScreenState extends State<ExploreScreen> {
               ),
               padding: EdgeInsets.fromLTRB(
                 18,
-                isLandscape ? 8 : 14,
+                isLandscape ? MediaQuery.paddingOf(context).top + 58 : 14,
                 18,
                 isLandscape ? 8 : 12,
               ),
@@ -1417,7 +1418,7 @@ class _RomListRowCard extends StatelessWidget {
                           fontFamily: 'JetBrainsMono',
                           fontSize: 11,
                           color: isDownloading
-                              ? HydraTokens.accentAmber
+                              ? HydraTokens.primaryAurora
                               : HydraTokens.textSecondary,
                         ),
                       ),
@@ -1949,7 +1950,7 @@ class _GameDetailSheetState extends State<GameDetailSheet> {
                                           Navigator.of(context).pop(),
                                       style: TextButton.styleFrom(
                                         foregroundColor:
-                                            HydraTokens.accentAmber,
+                                            HydraTokens.primaryAurora,
                                         minimumSize: const Size(48, 48),
                                       ),
                                       child: const Text(

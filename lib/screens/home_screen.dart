@@ -304,12 +304,31 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
 
-          // 2. Conteúdo rolável em Landscape (padding inferior 84 evita sobreposição com barra de atalhos)
+          // 2. Conteúdo rolável em Landscape (padding superior libera barra iOS flutuante; inferior evita barra de atalhos)
           SafeArea(
             top: false,
             child: ListView(
-              padding: const EdgeInsets.fromLTRB(28, 12, 28, 84),
+              padding: EdgeInsets.fromLTRB(
+                28,
+                MediaQuery.paddingOf(context).top + 60,
+                28,
+                84,
+              ),
               children: [
+                const Center(
+                  child: Text(
+                    'LOOPGAMER',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontFamily: 'PressStart2P',
+                      fontSize: 13.5,
+                      letterSpacing: 1.6,
+                      color: HydraTokens.primaryAurora,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
                 SizedBox(
                   width: double.infinity,
                   child: Wrap(
@@ -318,34 +337,16 @@ class _HomeScreenState extends State<HomeScreen> {
                     spacing: 10,
                     runSpacing: 6,
                     children: [
-                      const Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Text(
-                            'LOOPGAMER',
-                            style: TextStyle(
-                              fontFamily: 'ReadexPro',
-                              fontSize: 11,
-                              fontWeight: FontWeight.w700,
-                              letterSpacing: 1.6,
-                              color: HydraTokens.textSecondary,
-                            ),
-                          ),
-                          SizedBox(width: 10),
-                          Flexible(
-                            child: Text(
-                              'Destaques da Coleção',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontFamily: 'ReadexPro',
-                                fontSize: 13,
-                                fontWeight: FontWeight.w600,
-                                color: HydraTokens.textPrimary,
-                              ),
-                            ),
-                          ),
-                        ],
+                      const Text(
+                        'Destaques da Coleção',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontFamily: 'ReadexPro',
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: HydraTokens.textPrimary,
+                        ),
                       ),
                       if (widget.isLoadingCatalog) const _CatalogSyncBadge(),
                     ],
@@ -462,7 +463,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 // Seção dedicada: Favoritos
                 _SectionHeaderRow(
                   icon: PhosphorIcons.star(PhosphorIconsStyle.fill),
-                  iconColor: HydraTokens.accentAmber,
+                  iconColor: HydraTokens.primaryAurora,
                   title: 'Favoritos',
                   trailing: favoriteGames.isNotEmpty
                       ? '${favoriteGames.length} jogos'
@@ -733,31 +734,30 @@ class _HomeScreenState extends State<HomeScreen> {
                         );
                         final hasBadges =
                             widget.isLoadingCatalog || hasDownloading;
-                        return SizedBox(
-                          width: double.infinity,
-                          child: Wrap(
-                            alignment: hasBadges
-                                ? WrapAlignment.spaceBetween
-                                : WrapAlignment.start,
-                            crossAxisAlignment: WrapCrossAlignment.center,
-                            spacing: 8,
-                            runSpacing: 6,
-                            children: [
-                              const Text(
+                        return Column(
+                          children: [
+                            const Center(
+                              child: Text(
                                 'LOOPGAMER',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
-                                  fontFamily: 'ReadexPro',
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w700,
-                                  letterSpacing: 1.5,
-                                  color: HydraTokens.textPrimary,
+                                  fontFamily: 'PressStart2P',
+                                  fontSize: 15,
+                                  letterSpacing: 1.8,
+                                  color: HydraTokens.primaryAurora,
                                 ),
                               ),
-                              if (hasBadges)
-                                Wrap(
+                            ),
+                            if (hasBadges) ...[
+                              const SizedBox(height: 8),
+                              Center(
+                                child: Wrap(
+                                  alignment: WrapAlignment.center,
                                   spacing: 8,
                                   runSpacing: 6,
-                                  crossAxisAlignment: WrapCrossAlignment.center,
+                                  crossAxisAlignment:
+                                      WrapCrossAlignment.center,
                                   children: [
                                     if (widget.isLoadingCatalog)
                                       const _CatalogSyncBadge(),
@@ -779,13 +779,13 @@ class _HomeScreenState extends State<HomeScreen> {
                                               vertical: 8,
                                             ),
                                             decoration: BoxDecoration(
-                                              color: HydraTokens.accentAmber
-                                                  .withOpacity(0.18),
+                                              color:
+                                                  HydraTokens.surfaceElevated1,
                                               borderRadius:
                                                   BorderRadius.circular(14),
                                               border: Border.all(
-                                                color: HydraTokens.accentAmber
-                                                    .withOpacity(0.5),
+                                                color:
+                                                    HydraTokens.borderSubtle10,
                                               ),
                                             ),
                                             child: const Row(
@@ -797,8 +797,8 @@ class _HomeScreenState extends State<HomeScreen> {
                                                   child:
                                                       CircularProgressIndicator(
                                                     strokeWidth: 2,
-                                                    color:
-                                                        HydraTokens.accentAmber,
+                                                    color: HydraTokens
+                                                        .primaryAurora,
                                                   ),
                                                 ),
                                                 SizedBox(width: 6),
@@ -814,7 +814,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                                       fontWeight:
                                                           FontWeight.w600,
                                                       color: HydraTokens
-                                                          .accentAmber,
+                                                          .primaryAurora,
                                                     ),
                                                   ),
                                                 ),
@@ -825,8 +825,9 @@ class _HomeScreenState extends State<HomeScreen> {
                                       ),
                                   ],
                                 ),
+                              ),
                             ],
-                          ),
+                          ],
                         );
                       },
                     ),
@@ -883,6 +884,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         Semantics(
                           button: true,
                           label: 'Abrir Biblioteca',
+                          excludeSemantics: true,
                           child: Tooltip(
                             message: 'Abrir Biblioteca',
                             child: InkWell(
@@ -1123,11 +1125,15 @@ class _HomeScreenState extends State<HomeScreen> {
                                                     vertical: 3.5,
                                                   ),
                                                   decoration: BoxDecoration(
-                                                    color:
-                                                        const Color(0xFF332411),
+                                                    color: Colors.black
+                                                        .withOpacity(0.68),
                                                     borderRadius:
                                                         BorderRadius.circular(
                                                       12,
+                                                    ),
+                                                    border: Border.all(
+                                                      color: Colors.white
+                                                          .withOpacity(0.14),
                                                     ),
                                                   ),
                                                   child: Row(
@@ -1287,7 +1293,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   children: [
                     _SectionHeaderRow(
                       icon: PhosphorIcons.star(PhosphorIconsStyle.fill),
-                      iconColor: HydraTokens.accentAmber,
+                      iconColor: HydraTokens.primaryAurora,
                       title: 'Favoritos',
                       trailing: favoriteGames.isNotEmpty
                           ? '${favoriteGames.length} jogos'
@@ -1557,7 +1563,7 @@ class _CatalogSyncBadge extends StatelessWidget {
             height: 11,
             child: CircularProgressIndicator(
               strokeWidth: 2,
-              color: HydraTokens.accentAmber,
+              color: HydraTokens.primaryAurora,
             ),
           ),
           SizedBox(width: 6),
@@ -1663,15 +1669,15 @@ class _HomeFavoriteCardState extends State<_HomeFavoriteCard> {
             borderRadius: BorderRadius.circular(12),
             border: Border.all(
               color: _focused
-                  ? HydraTokens.accentAmber
+                  ? HydraTokens.primaryAurora
                   : HydraTokens.borderSubtle10,
               width: _focused ? 2.0 : 1.0,
             ),
             boxShadow: _focused
                 ? HydraTokens.neonBoxGlow(
-                    opacity: 0.28,
+                    opacity: 0.22,
                     blur: 12,
-                    color: HydraTokens.accentAmber,
+                    color: HydraTokens.primaryAurora,
                   )
                 : null,
           ),
@@ -1722,7 +1728,7 @@ class _HomeFavoriteCardState extends State<_HomeFavoriteCard> {
                                 PhosphorIcon(
                                   PhosphorIcons.star(PhosphorIconsStyle.fill),
                                   size: 11,
-                                  color: HydraTokens.accentAmber,
+                                  color: HydraTokens.primaryAurora,
                                 ),
                                 const SizedBox(width: 4),
                                 Flexible(
@@ -1834,15 +1840,15 @@ class _GameHubLandscapeHeroCard extends StatelessWidget {
           borderRadius: BorderRadius.circular(14),
           border: Border.all(
             color: isFocused
-                ? HydraTokens.accentAmber
+                ? HydraTokens.primaryAurora.withOpacity(0.90)
                 : Colors.white.withOpacity(0.14),
-            width: isFocused ? 2.2 : 1.0,
+            width: isFocused ? 2.0 : 1.0,
           ),
           boxShadow: isFocused
               ? HydraTokens.neonBoxGlow(
-                  opacity: 0.32,
-                  blur: 18,
-                  color: HydraTokens.accentAmber,
+                  opacity: 0.20,
+                  blur: 16,
+                  color: HydraTokens.primaryAurora,
                 )
               : [
                   BoxShadow(
@@ -2153,15 +2159,15 @@ class _GameHubPortraitPosterItem extends StatelessWidget {
                     borderRadius: BorderRadius.circular(14),
                     border: Border.all(
                       color: isSelected
-                          ? HydraTokens.accentAmber
+                          ? HydraTokens.primaryAurora.withOpacity(0.88)
                           : Colors.white.withOpacity(0.10),
-                      width: isSelected ? 2.0 : 1.0,
+                      width: isSelected ? 1.8 : 1.0,
                     ),
                     boxShadow: isSelected
                         ? HydraTokens.neonBoxGlow(
-                            opacity: 0.28,
-                            blur: 12,
-                            color: HydraTokens.accentAmber,
+                            opacity: 0.16,
+                            blur: 10,
+                            color: HydraTokens.primaryAurora,
                           )
                         : null,
                   ),
@@ -2279,7 +2285,7 @@ class RommCoverGridCard extends StatelessWidget {
     } else if (isPaused) {
       actionTooltip = 'Continuar download';
       actionIcon = PhosphorIcons.play(PhosphorIconsStyle.fill);
-      actionColor = HydraTokens.accentAmber;
+      actionColor = HydraTokens.primaryAurora;
     } else {
       actionTooltip = 'Baixar ROM';
       actionIcon = PhosphorIcons.downloadSimple(PhosphorIconsStyle.bold);

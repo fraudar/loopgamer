@@ -364,6 +364,7 @@ class _SettingsScreenState extends State<SettingsScreen>
     return Scaffold(
       backgroundColor: HydraTokens.bgPureBlack,
       body: SafeArea(
+        top: !isLandscape,
         child: isLandscape
             ? _buildLandscapeSplitSettings(s)
             : _buildPortraitSettings(s),
@@ -385,7 +386,12 @@ class _SettingsScreenState extends State<SettingsScreen>
               right: BorderSide(color: HydraTokens.borderSubtle8),
             ),
           ),
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+          padding: EdgeInsets.fromLTRB(
+            16,
+            MediaQuery.paddingOf(context).top + 58,
+            16,
+            16,
+          ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -518,7 +524,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                         fontFamily: 'JetBrainsMono',
                         fontSize: 11.5,
                         fontWeight: FontWeight.w700,
-                        color: HydraTokens.accentAmber,
+                        color: HydraTokens.primaryAurora,
                       ),
                     ),
                   ],
@@ -529,7 +535,12 @@ class _SettingsScreenState extends State<SettingsScreen>
         ),
         Expanded(
           child: ListView(
-            padding: const EdgeInsets.fromLTRB(24, 18, 24, 28),
+            padding: EdgeInsets.fromLTRB(
+              24,
+              MediaQuery.paddingOf(context).top + 58,
+              24,
+              28,
+            ),
             children: [
               if (_selectedCategory == 0) _buildHudTelemetrySection(s),
               if (_selectedCategory == 1) _buildGamepadSection(s),
@@ -592,7 +603,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                     fontFamily: 'JetBrainsMono',
                     fontSize: 11,
                     fontWeight: FontWeight.w700,
-                    color: HydraTokens.accentAmber,
+                    color: HydraTokens.primaryAurora,
                   ),
                 ),
               ),

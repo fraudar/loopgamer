@@ -27,6 +27,14 @@ flutter:
   assets:
     - assets/images/hydra_hero_bg.png
   fonts:
+    - family: PressStart2P
+      fonts:
+        - asset: assets/fonts/PressStart2P-Regular.ttf
+          weight: 400
+    - family: Silkscreen
+      fonts:
+        - asset: assets/fonts/Silkscreen-Bold.ttf
+          weight: 700
     - family: ReadexPro
       fonts:
         - asset: assets/fonts/ReadexPro-SemiBold.ttf

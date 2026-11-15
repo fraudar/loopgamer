@@ -526,7 +526,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                         style: TextStyle(
                           fontFamily: 'Rubik',
                           fontSize: 11.5,
-                          color: HydraTokens.accentAmber,
+                          color: HydraTokens.textSecondary,
                         ),
                       ),
                     ],
@@ -1542,7 +1542,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                 style: const TextStyle(
                   fontFamily: 'JetBrainsMono',
                   fontSize: 10,
-                  color: HydraTokens.accentAmber,
+                  color: HydraTokens.primaryAurora,
                 ),
               ),
             ],
@@ -1858,7 +1858,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
                           fontFamily: 'Rubik',
                           fontSize: 11,
                           fontWeight: FontWeight.w600,
-                          color: HydraTokens.accentAmber,
+                          color: HydraTokens.primaryAurora,
                         ),
                       ),
                       const SizedBox(height: 2),
