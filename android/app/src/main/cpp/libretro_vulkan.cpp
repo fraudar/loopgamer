@@ -237,6 +237,7 @@ void clear_instance_and_device_fns() {
   g_fn.queuePresent = nullptr;
 }
 
+std::mutex g_vkConfigMutex;
 std::string g_hookLibDir;
 std::string g_tmpDir;
 std::string g_customDriverDir;
@@ -284,19 +285,29 @@ void apply_freedreno_env() {
   }
 }
 
+void close_loader_lib() {
+  if (g_fn.lib) {
+    dlclose(g_fn.lib);
+  }
+  g_fn = VulkanFns{};
+  g_loadedDriverKey.clear();
+  g_bcnPatchAttempted = false;
+}
+
 bool load_loader() {
   apply_freedreno_env();
   const std::string desiredKey =
       g_customDriverDir + "|" + g_customDriverName;
-  if (g_fn.lib && g_loadedDriverKey == desiredKey) {
+  if (g_fn.lib && g_fn.gipa && g_fn.createInstance && g_fn.destroyInstance &&
+      g_loadedDriverKey == desiredKey) {
 #if defined(LOOPGAMER_HAS_ADRENOTOOLS)
     adrenotools_set_turbo(g_adrenoTurbo);
 #endif
     return true;
   }
-  g_fn = VulkanFns{};
-  g_loadedDriverKey = desiredKey;
-  g_bcnPatchAttempted = false;
+
+  // Fecha o handle anterior antes de carregar um novo driver/loader
+  close_loader_lib();
 
 #if defined(LOOPGAMER_HAS_ADRENOTOOLS)
   if (!g_customDriverName.empty() && !g_customDriverDir.empty() &&
@@ -341,12 +352,14 @@ bool load_loader() {
   }
   if (!g_fn.lib) {
     VK_LOGW("dlopen(libvulkan.so) falhou");
+    close_loader_lib();
     return false;
   }
   g_fn.gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
       dlsym(g_fn.lib, "vkGetInstanceProcAddr"));
   if (!g_fn.gipa) {
     VK_LOGW("vkGetInstanceProcAddr ausente em libvulkan.so");
+    close_loader_lib();
     return false;
   }
   g_fn.createInstance = reinterpret_cast<PFN_vkCreateInstance>(
@@ -359,7 +372,15 @@ bool load_loader() {
   g_fn.enumInstVersion =
       reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
           g_fn.gipa(nullptr, "vkEnumerateInstanceVersion"));
-  return g_fn.createInstance && g_fn.destroyInstance;
+  if (!g_fn.createInstance || !g_fn.destroyInstance) {
+    VK_LOGW("Ponteiros essenciais Vulkan ausentes (createInstance=%p destroyInstance=%p)",
+            reinterpret_cast<void*>(g_fn.createInstance),
+            reinterpret_cast<void*>(g_fn.destroyInstance));
+    close_loader_lib();
+    return false;
+  }
+  g_loadedDriverKey = desiredKey;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +397,7 @@ struct VkFe {
   bool wanted = false;
   bool probed = false;
   bool probeOk = false;
-  bool active = false;
+  std::atomic<bool> active{false};
   std::atomic<bool> vsync{false};
 
   bool frameValid = false;
@@ -384,6 +405,8 @@ struct VkFe {
   bool hasAcquired = false;
   bool needsRecreate = false;
   bool suboptimalTried = false;
+  bool surfaceLost = false;
+  bool deviceLost = false;
   bool deviceFromNegotiation = false;
 
   ANativeWindow* window = nullptr;
@@ -426,13 +449,15 @@ struct VkFe {
   retro_vulkan_image curImage{};
   uint32_t srcQueueFamily = VK_QUEUE_FAMILY_IGNORED;
   VkSemaphore signalSem = VK_NULL_HANDLE;
-  uint32_t pendingSemCount = 0;
-  VkSemaphore pendingSems[8]{};
-  VkCommandBuffer pendingCmds[16]{};
-  uint32_t pendingCmdCount = 0;
+  std::vector<VkSemaphore> pendingSems;
+  std::vector<VkCommandBuffer> pendingCmds;
+  std::vector<VkSemaphore> waitSemsScratch;
+  std::vector<VkPipelineStageFlags> waitStagesScratch;
+  std::vector<VkCommandBuffer> cmdsScratch;
 
-  std::mutex queueMutex;
+  std::recursive_mutex queueMutex;
   std::mutex fenceMutex;
+  std::mutex stateMutex;
   retro_hw_render_interface_vulkan_local iface{};
 };
 
@@ -519,9 +544,13 @@ bool load_device_fns() {
 // Probe: confirma loader, extensões Android e ao menos 1 GPU Vulkan utilizável
 // ---------------------------------------------------------------------------
 bool do_probe() {
-  if (g_fe.probed) return g_fe.probeOk;
-  g_fe.probed = true;
-  if (!load_loader()) return false;
+  if (g_fe.probed && g_fe.probeOk) return true;
+  if (g_fe.probed && !g_fe.probeOk) return false;
+  g_fe.probeOk = false;
+  if (!load_loader()) {
+    g_fe.probed = false;
+    return false;
+  }
 
   uint32_t loaderApi = VK_API_VERSION_1_0;
   if (g_fn.enumInstVersion) {
@@ -544,6 +573,7 @@ bool do_probe() {
   VkResult res = g_fn.createInstance(&ci, nullptr, &inst);
   if (res != VK_SUCCESS || inst == VK_NULL_HANDLE) {
     VK_LOGW("Probe vkCreateInstance falhou: %d", static_cast<int>(res));
+    g_fe.probed = false;
     return false;
   }
 
@@ -592,6 +622,7 @@ bool do_probe() {
   }
 
   g_fn.destroyInstance(inst, nullptr);
+  g_fe.probed = true;
   g_fe.probeOk = ok;
   VK_LOGI("Probe Vulkan: %s", ok ? "OK" : "indisponível");
   return ok;
@@ -762,8 +793,18 @@ VkPresentModeKHR choose_present_mode() {
   return VK_PRESENT_MODE_FIFO_KHR;
 }
 
-void free_sync_objects() {
-  if (!g_fe.device) return;
+void free_sync_objects_locked() {
+  if (!g_fe.device) {
+    g_fe.slots.clear();
+    g_fe.renderSems.clear();
+    g_fe.imageLastSlot.clear();
+    g_fe.hasAcquired = false;
+    g_fe.frameValid = false;
+    g_fe.curSlot = 0;
+    g_fe.acquiredIdx = 0;
+    g_fe.acquiredSlot = 0;
+    return;
+  }
   if (!g_fe.slots.empty()) {
     std::vector<VkCommandBuffer> cbufs;
     cbufs.reserve(g_fe.slots.size());
@@ -793,6 +834,11 @@ void free_sync_objects() {
   g_fe.curSlot = 0;
   g_fe.acquiredIdx = 0;
   g_fe.acquiredSlot = 0;
+}
+
+void free_sync_objects() {
+  std::lock_guard<std::mutex> lock(g_fe.fenceMutex);
+  free_sync_objects_locked();
 }
 
 bool create_swapchain() {
@@ -880,46 +926,53 @@ bool create_swapchain() {
   g_fe.syncMask = 0;
   for (uint32_t i = 0; i < imgCount && i < 32; ++i) g_fe.syncMask |= (1u << i);
 
-  free_sync_objects();
-  const uint32_t slotCount = std::max(imgCount + 1, 4u);
-  g_fe.slots.resize(slotCount);
-  std::vector<VkCommandBuffer> allocCmds(slotCount, VK_NULL_HANDLE);
-  VkCommandBufferAllocateInfo cai{
-      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-  cai.commandPool = g_fe.cmdPool;
-  cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  cai.commandBufferCount = slotCount;
-  if (g_fn.allocateCommandBuffers(g_fe.device, &cai, allocCmds.data()) !=
-      VK_SUCCESS) {
-    free_sync_objects();
-    return false;
-  }
-
-  VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-  VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-  for (uint32_t i = 0; i < slotCount; ++i) {
-    g_fe.slots[i].cmd = allocCmds[i];
-    g_fe.slots[i].fenceSubmitted = false;
-    if (g_fn.createFence(g_fe.device, &fi, nullptr, &g_fe.slots[i].fence) !=
-            VK_SUCCESS ||
-        g_fn.createSemaphore(g_fe.device, &si, nullptr,
-                             &g_fe.slots[i].acquireSem) != VK_SUCCESS) {
-      free_sync_objects();
-      return false;
-    }
-  }
-
-  g_fe.renderSems.resize(imgCount, VK_NULL_HANDLE);
-  g_fe.imageLastSlot.assign(imgCount, -1);
-  for (uint32_t i = 0; i < imgCount; ++i) {
-    if (g_fn.createSemaphore(g_fe.device, &si, nullptr, &g_fe.renderSems[i]) !=
+  {
+    std::lock_guard<std::mutex> flock(g_fe.fenceMutex);
+    free_sync_objects_locked();
+    const uint32_t slotCount = std::max(imgCount + 1, 4u);
+    g_fe.slots.resize(slotCount);
+    std::vector<VkCommandBuffer> allocCmds(slotCount, VK_NULL_HANDLE);
+    VkCommandBufferAllocateInfo cai{
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = g_fe.cmdPool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = slotCount;
+    if (g_fn.allocateCommandBuffers(g_fe.device, &cai, allocCmds.data()) !=
         VK_SUCCESS) {
-      free_sync_objects();
+      free_sync_objects_locked();
       return false;
+    }
+
+    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    for (uint32_t i = 0; i < slotCount; ++i) {
+      g_fe.slots[i].cmd = allocCmds[i];
+      g_fe.slots[i].fenceSubmitted = false;
+      if (g_fn.createFence(g_fe.device, &fi, nullptr, &g_fe.slots[i].fence) !=
+              VK_SUCCESS ||
+          g_fn.createSemaphore(g_fe.device, &si, nullptr,
+                               &g_fe.slots[i].acquireSem) != VK_SUCCESS) {
+        free_sync_objects_locked();
+        return false;
+      }
+    }
+
+    g_fe.renderSems.resize(imgCount, VK_NULL_HANDLE);
+    g_fe.imageLastSlot.assign(imgCount, -1);
+    for (uint32_t i = 0; i < imgCount; ++i) {
+      if (g_fn.createSemaphore(g_fe.device, &si, nullptr,
+                               &g_fe.renderSems[i]) != VK_SUCCESS) {
+        free_sync_objects_locked();
+        return false;
+      }
     }
   }
 
-  g_fe.needsRecreate = false;
+  {
+    std::lock_guard<std::mutex> slock(g_fe.stateMutex);
+    g_fe.needsRecreate = false;
+    g_fe.surfaceLost = false;
+  }
   VK_LOGI(
       "Swapchain criado: %ux%u, imagens=%u, format=%d, presentMode=%d",
       ext.width, ext.height, imgCount, static_cast<int>(g_fe.swapFormat),
@@ -929,7 +982,7 @@ bool create_swapchain() {
 
 bool destroy_swapchain() {
   if (g_fe.device) {
-    std::lock_guard<std::mutex> lock(g_fe.queueMutex);
+    std::lock_guard<std::recursive_mutex> lock(g_fe.queueMutex);
     if (g_fn.deviceWaitIdle) g_fn.deviceWaitIdle(g_fe.device);
   }
   free_sync_objects();
@@ -941,8 +994,58 @@ bool destroy_swapchain() {
   return true;
 }
 
+bool recreate_surface_if_lost() {
+  if (!g_fe.instance || !g_fe.window || !g_fn.createAndroidSurface) {
+    return false;
+  }
+  bool needSurf = false;
+  {
+    std::lock_guard<std::mutex> slock(g_fe.stateMutex);
+    needSurf = g_fe.surfaceLost || (g_fe.surface == VK_NULL_HANDLE);
+  }
+  if (!needSurf) return true;
+
+  if (g_fe.device) {
+    std::lock_guard<std::recursive_mutex> qlock(g_fe.queueMutex);
+    if (g_fn.deviceWaitIdle) g_fn.deviceWaitIdle(g_fe.device);
+  }
+  if (g_fe.surface != VK_NULL_HANDLE && g_fn.destroySurface) {
+    g_fn.destroySurface(g_fe.instance, g_fe.surface, nullptr);
+    g_fe.surface = VK_NULL_HANDLE;
+  }
+
+  VkAndroidSurfaceCreateInfoKHR sci{
+      VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
+  sci.window = g_fe.window;
+  VkResult surfRes =
+      g_fn.createAndroidSurface(g_fe.instance, &sci, nullptr, &g_fe.surface);
+  if (surfRes != VK_SUCCESS || g_fe.surface == VK_NULL_HANDLE) {
+    VK_LOGE("Recriação de VkSurfaceKHR falhou: %d", static_cast<int>(surfRes));
+    return false;
+  }
+
+  if (g_fn.surfaceSupport && g_fe.gpu != VK_NULL_HANDLE) {
+    VkBool32 supported = VK_FALSE;
+    if (g_fn.surfaceSupport(g_fe.gpu, g_fe.presentQueueFamily, g_fe.surface,
+                            &supported) != VK_SUCCESS ||
+        !supported) {
+      VK_LOGW("Present queue %u não suporta superfície recriada",
+              g_fe.presentQueueFamily);
+    }
+  }
+
+  std::lock_guard<std::mutex> slock(g_fe.stateMutex);
+  g_fe.surfaceLost = false;
+  return true;
+}
+
 bool recreate_swapchain() {
+  {
+    std::lock_guard<std::mutex> slock(g_fe.stateMutex);
+    if (g_fe.deviceLost) return false;
+  }
   destroy_swapchain();
+  if (!recreate_surface_if_lost()) return false;
   return choose_swapchain_format() && create_swapchain();
 }
 
@@ -983,9 +1086,15 @@ void cb_set_image(void* handle, const retro_vulkan_image* image,
   fe.curImage = *image;
   fe.hasImage = true;
   fe.srcQueueFamily = src_queue_family;
-  fe.pendingSemCount = num_semaphores > 8 ? 8 : num_semaphores;
-  for (uint32_t i = 0; i < fe.pendingSemCount; ++i)
-    fe.pendingSems[i] = semaphores[i];
+  fe.pendingSems.clear();
+  if (semaphores && num_semaphores > 0) {
+    fe.pendingSems.reserve(num_semaphores);
+    for (uint32_t i = 0; i < num_semaphores; ++i) {
+      if (semaphores[i] != VK_NULL_HANDLE) {
+        fe.pendingSems.push_back(semaphores[i]);
+      }
+    }
+  }
 }
 
 uint32_t cb_get_sync_index(void* handle) {
@@ -999,9 +1108,15 @@ uint32_t cb_get_sync_index_mask(void* handle) {
 void cb_set_command_buffers(void* handle, uint32_t num_cmd,
                             const VkCommandBuffer* cmd) {
   VkFe& fe = *static_cast<VkFe*>(handle);
-  fe.pendingCmdCount = num_cmd > 16 ? 16 : num_cmd;
-  for (uint32_t i = 0; i < fe.pendingCmdCount; ++i)
-    fe.pendingCmds[i] = cmd[i];
+  fe.pendingCmds.clear();
+  if (cmd && num_cmd > 0) {
+    fe.pendingCmds.reserve(num_cmd);
+    for (uint32_t i = 0; i < num_cmd; ++i) {
+      if (cmd[i] != VK_NULL_HANDLE) {
+        fe.pendingCmds.push_back(cmd[i]);
+      }
+    }
+  }
 }
 
 void cb_wait_sync_index(void* handle) {
@@ -1161,14 +1276,46 @@ bool record_present_cmd(VkCommandBuffer cmd, uint32_t idx, unsigned frameW,
 // ---------------------------------------------------------------------------
 // Ciclo de frame
 // ---------------------------------------------------------------------------
-void acquire_frame() {
+void consume_signal_semaphore() {
+  VkFe& fe = g_fe;
+  VkSemaphore sem = fe.signalSem;
+  fe.signalSem = VK_NULL_HANDLE;
+  if (sem == VK_NULL_HANDLE) return;
+  if (!fe.active.load(std::memory_order_acquire) ||
+      fe.device == VK_NULL_HANDLE || fe.queue == VK_NULL_HANDLE ||
+      !g_fn.queueSubmit) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> slock(fe.stateMutex);
+    if (fe.deviceLost) return;
+  }
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.signalSemaphoreCount = 1;
+  si.pSignalSemaphores = &sem;
+  std::lock_guard<std::recursive_mutex> qlock(fe.queueMutex);
+  VkResult res = g_fn.queueSubmit(fe.queue, 1, &si, VK_NULL_HANDLE);
+  if (res == VK_ERROR_DEVICE_LOST) {
+    VK_LOGE("VK_ERROR_DEVICE_LOST ao sinalizar signalSem");
+    std::lock_guard<std::mutex> slock(fe.stateMutex);
+    fe.deviceLost = true;
+    fe.needsRecreate = true;
+  } else if (res != VK_SUCCESS) {
+    VK_LOGW("vkQueueSubmit(signalSem) falhou: %d", static_cast<int>(res));
+  }
+}
+
+bool acquire_frame() {
   VkFe& fe = g_fe;
   fe.frameValid = false;
   fe.hasImage = false;
-  fe.pendingCmdCount = 0;
-  fe.pendingSemCount = 0;
+  fe.pendingCmds.clear();
+  fe.pendingSems.clear();
   fe.signalSem = VK_NULL_HANDLE;
-  if (!fe.active || fe.swapchain == VK_NULL_HANDLE || fe.slots.empty()) return;
+  if (!fe.active.load(std::memory_order_acquire) ||
+      fe.swapchain == VK_NULL_HANDLE || fe.slots.empty()) {
+    return false;
+  }
 
   // Detecta mudança de tamanho do SurfaceTexture (setDefaultBufferSize pós-load)
   if (fe.window) {
@@ -1176,13 +1323,23 @@ void acquire_frame() {
     const int32_t h = ANativeWindow_getHeight(fe.window);
     if (w > 0 && h > 0 &&
         (w != fe.winWidthAtCreate || h != fe.winHeightAtCreate)) {
+      std::lock_guard<std::mutex> slock(fe.stateMutex);
       fe.needsRecreate = true;
       fe.suboptimalTried = false;
     }
   }
 
-  if (fe.needsRecreate) {
-    if (!recreate_swapchain()) return;
+  bool needRec = false;
+  bool subTried = false;
+  {
+    std::lock_guard<std::mutex> slock(fe.stateMutex);
+    if (fe.deviceLost) return false;
+    needRec = fe.needsRecreate || fe.surfaceLost;
+    subTried = fe.suboptimalTried;
+  }
+
+  if (needRec) {
+    if (!recreate_swapchain()) return false;
   }
 
   // Se o frame anterior não apresentou (boot, skip, frame nulo), reutiliza a
@@ -1191,7 +1348,7 @@ void acquire_frame() {
   if (fe.hasAcquired) {
     fe.syncIndex = fe.acquiredIdx;
     fe.frameValid = true;
-    return;
+    return true;
   }
 
   uint32_t slot = fe.curSlot % static_cast<uint32_t>(fe.slots.size());
@@ -1201,18 +1358,45 @@ void acquire_frame() {
   VkResult res = g_fn.acquireNextImage(fe.device, fe.swapchain, 1000000000ull,
                                        fe.slots[slot].acquireSem,
                                        VK_NULL_HANDLE, &idx);
-  if (res == VK_ERROR_OUT_OF_DATE_KHR ||
-      (res == VK_SUBOPTIMAL_KHR && !fe.suboptimalTried)) {
+  if (res == VK_ERROR_SURFACE_LOST_KHR || res == VK_ERROR_OUT_OF_DATE_KHR ||
+      (res == VK_SUBOPTIMAL_KHR && !subTried)) {
     const bool wasSuboptimal = (res == VK_SUBOPTIMAL_KHR);
-    if (!recreate_swapchain()) return;
-    fe.suboptimalTried = wasSuboptimal;
+    if (res == VK_ERROR_SURFACE_LOST_KHR) {
+      std::lock_guard<std::mutex> slock(fe.stateMutex);
+      fe.surfaceLost = true;
+    }
+    if (!recreate_swapchain()) return false;
+    {
+      std::lock_guard<std::mutex> slock(fe.stateMutex);
+      fe.suboptimalTried = wasSuboptimal;
+    }
     slot = 0;
     wait_and_reset_slot_fence(slot);
     res = g_fn.acquireNextImage(fe.device, fe.swapchain, 1000000000ull,
                                 fe.slots[slot].acquireSem, VK_NULL_HANDLE, &idx);
   }
-  if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) return;
-  if (res == VK_SUCCESS) fe.suboptimalTried = false;
+  if (res == VK_ERROR_DEVICE_LOST) {
+    VK_LOGE("VK_ERROR_DEVICE_LOST em vkAcquireNextImageKHR");
+    std::lock_guard<std::mutex> slock(fe.stateMutex);
+    fe.deviceLost = true;
+    fe.needsRecreate = true;
+    return false;
+  }
+  if (res == VK_ERROR_SURFACE_LOST_KHR) {
+    VK_LOGW("VK_ERROR_SURFACE_LOST_KHR recorrente em vkAcquireNextImageKHR");
+    std::lock_guard<std::mutex> slock(fe.stateMutex);
+    fe.surfaceLost = true;
+    fe.needsRecreate = true;
+    return false;
+  }
+  if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
+    VK_LOGW("vkAcquireNextImageKHR falhou: %d", static_cast<int>(res));
+    return false;
+  }
+  if (res == VK_SUCCESS) {
+    std::lock_guard<std::mutex> slock(fe.stateMutex);
+    fe.suboptimalTried = false;
+  }
 
   fe.hasAcquired = true;
   fe.acquiredIdx = idx;
@@ -1220,15 +1404,47 @@ void acquire_frame() {
   fe.curSlot = (slot + 1u) % static_cast<uint32_t>(fe.slots.size());
   fe.syncIndex = idx;
   fe.frameValid = true;
+  return true;
 }
 
 void present_frame(unsigned frameW, unsigned frameH) {
   VkFe& fe = g_fe;
-  if (!fe.active || !fe.hasAcquired || !fe.frameValid || !fe.hasImage) return;
+  if (!fe.active.load(std::memory_order_acquire) ||
+      fe.device == VK_NULL_HANDLE) {
+    fe.signalSem = VK_NULL_HANDLE;
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> slock(fe.stateMutex);
+    if (fe.deviceLost) {
+      fe.signalSem = VK_NULL_HANDLE;
+      fe.hasAcquired = false;
+      fe.frameValid = false;
+      fe.hasImage = false;
+      fe.pendingSems.clear();
+      fe.pendingCmds.clear();
+      return;
+    }
+  }
+  if (!fe.hasAcquired || !fe.frameValid || !fe.hasImage) {
+    consume_signal_semaphore();
+    fe.hasImage = false;
+    fe.pendingSems.clear();
+    fe.pendingCmds.clear();
+    return;
+  }
 
   const uint32_t idx = fe.acquiredIdx;
   const uint32_t slot = fe.acquiredSlot;
-  if (idx >= fe.swapImages.size() || slot >= fe.slots.size()) return;
+  if (idx >= fe.swapImages.size() || slot >= fe.slots.size()) {
+    consume_signal_semaphore();
+    fe.hasAcquired = false;
+    fe.frameValid = false;
+    fe.hasImage = false;
+    fe.pendingSems.clear();
+    fe.pendingCmds.clear();
+    return;
+  }
   FrameSlot& fs = fe.slots[slot];
 
   // Garante que o renderSems[idx] de apresentações antigas já completou
@@ -1237,92 +1453,155 @@ void present_frame(unsigned frameW, unsigned frameH) {
     wait_image_in_flight(idx);
   }
 
-  if (!record_present_cmd(fs.cmd, idx, frameW, frameH)) return;
+  if (!record_present_cmd(fs.cmd, idx, frameW, frameH)) {
+    consume_signal_semaphore();
+    fe.hasImage = false;
+    fe.pendingSems.clear();
+    fe.pendingCmds.clear();
+    return;
+  }
 
-  VkSemaphore waits[16];
-  VkPipelineStageFlags waitStages[16];
-  uint32_t waitCount = 0;
-  waits[waitCount] = fs.acquireSem;
-  waitStages[waitCount] = VK_PIPELINE_STAGE_TRANSFER_BIT;
-  ++waitCount;
+  fe.waitSemsScratch.clear();
+  fe.waitStagesScratch.clear();
+  fe.waitSemsScratch.reserve(1 + fe.pendingSems.size());
+  fe.waitStagesScratch.reserve(1 + fe.pendingSems.size());
+  fe.waitSemsScratch.push_back(fs.acquireSem);
+  fe.waitStagesScratch.push_back(VK_PIPELINE_STAGE_TRANSFER_BIT);
 
   const VkPipelineStageFlags coreSemStage =
-      fe.pendingCmdCount > 0
+      !fe.pendingCmds.empty()
           ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
           : (VK_PIPELINE_STAGE_TRANSFER_BIT |
              VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT);
-  for (uint32_t i = 0; i < fe.pendingSemCount && waitCount < 16; ++i) {
-    waits[waitCount] = fe.pendingSems[i];
-    waitStages[waitCount] = coreSemStage;
-    ++waitCount;
+  for (VkSemaphore sem : fe.pendingSems) {
+    fe.waitSemsScratch.push_back(sem);
+    fe.waitStagesScratch.push_back(coreSemStage);
   }
 
-  VkSemaphore signals[16];
+  VkSemaphore signals[2];
   uint32_t sigCount = 0;
   signals[sigCount++] = fe.renderSems[idx];
   if (fe.signalSem != VK_NULL_HANDLE) signals[sigCount++] = fe.signalSem;
 
   // Ordem correta: command buffers do core PRIMEIRO, blit do frontend DEPOIS
-  VkCommandBuffer cmds[17];
-  uint32_t cmdCount = 0;
-  for (uint32_t i = 0; i < fe.pendingCmdCount && cmdCount < 16; ++i)
-    cmds[cmdCount++] = fe.pendingCmds[i];
-  cmds[cmdCount++] = fs.cmd;
+  fe.cmdsScratch.clear();
+  fe.cmdsScratch.reserve(fe.pendingCmds.size() + 1);
+  for (VkCommandBuffer cbuf : fe.pendingCmds) {
+    fe.cmdsScratch.push_back(cbuf);
+  }
+  fe.cmdsScratch.push_back(fs.cmd);
 
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-  si.waitSemaphoreCount = waitCount;
-  si.pWaitSemaphores = waits;
-  si.pWaitDstStageMask = waitStages;
-  si.commandBufferCount = cmdCount;
-  si.pCommandBuffers = cmds;
+  si.waitSemaphoreCount = static_cast<uint32_t>(fe.waitSemsScratch.size());
+  si.pWaitSemaphores = fe.waitSemsScratch.data();
+  si.pWaitDstStageMask = fe.waitStagesScratch.data();
+  si.commandBufferCount = static_cast<uint32_t>(fe.cmdsScratch.size());
+  si.pCommandBuffers = fe.cmdsScratch.data();
   si.signalSemaphoreCount = sigCount;
   si.pSignalSemaphores = signals;
 
   VkResult pres = VK_SUCCESS;
-  bool submitOk = false;
+  bool needConsumeSignal = false;
+  bool fatalDeviceLost = false;
   {
     // queueMutex protege VkQueue contra corrida com threads de render do core
     // (ex.: Worker Vulkan do PPSSPP via lock_queue/unlock_queue).
-    std::lock_guard<std::mutex> lock(fe.queueMutex);
+    std::lock_guard<std::recursive_mutex> lock(fe.queueMutex);
     VkResult subRes = g_fn.queueSubmit(fe.queue, 1, &si, fs.fence);
     if (subRes != VK_SUCCESS) {
       VK_LOGE("vkQueueSubmit falhou: %d", static_cast<int>(subRes));
       fe.hasAcquired = false;
       fe.frameValid = false;
       fe.hasImage = false;
-      fe.needsRecreate = true;
-      return;
-    }
-    submitOk = true;
+      fe.pendingSems.clear();
+      fe.pendingCmds.clear();
+      if (subRes == VK_ERROR_DEVICE_LOST) {
+        fe.signalSem = VK_NULL_HANDLE;
+        std::lock_guard<std::mutex> slock(fe.stateMutex);
+        fe.deviceLost = true;
+        fe.needsRecreate = true;
+        fatalDeviceLost = true;
+      } else {
+        // Limpa estado pendente de fs.acquireSem (sinalizado pelo acquire, não consumido)
+        if (g_fn.deviceWaitIdle) g_fn.deviceWaitIdle(fe.device);
+        {
+          std::lock_guard<std::mutex> flock(fe.fenceMutex);
+          if (fs.acquireSem != VK_NULL_HANDLE && g_fn.destroySemaphore) {
+            g_fn.destroySemaphore(fe.device, fs.acquireSem, nullptr);
+            fs.acquireSem = VK_NULL_HANDLE;
+          }
+          VkSemaphoreCreateInfo semInfo{
+              VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+          if (g_fn.createSemaphore &&
+              g_fn.createSemaphore(fe.device, &semInfo, nullptr,
+                                   &fs.acquireSem) != VK_SUCCESS) {
+            fs.acquireSem = VK_NULL_HANDLE;
+          }
+          fs.fenceSubmitted = false;
+        }
+        {
+          std::lock_guard<std::mutex> slock(fe.stateMutex);
+          fe.needsRecreate = true;
+          if (subRes == VK_ERROR_SURFACE_LOST_KHR) fe.surfaceLost = true;
+        }
+        needConsumeSignal = true;
+      }
+    } else {
+      {
+        std::lock_guard<std::mutex> flock(fe.fenceMutex);
+        fs.fenceSubmitted = true;
+        fe.imageLastSlot[idx] = static_cast<int>(slot);
+      }
+      // signalSem foi consumido e será sinalizado por este submit
+      fe.signalSem = VK_NULL_HANDLE;
 
-    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-    pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &fe.renderSems[idx];
-    pi.swapchainCount = 1;
-    pi.pSwapchains = &fe.swapchain;
-    pi.pImageIndices = &idx;
-    pres = g_fn.queuePresent(fe.presentQueue, &pi);
+      VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+      pi.waitSemaphoreCount = 1;
+      pi.pWaitSemaphores = &fe.renderSems[idx];
+      pi.swapchainCount = 1;
+      pi.pSwapchains = &fe.swapchain;
+      pi.pImageIndices = &idx;
+      pres = g_fn.queuePresent(fe.presentQueue, &pi);
+    }
   }
 
-  if (submitOk) {
-    std::lock_guard<std::mutex> flock(fe.fenceMutex);
-    fs.fenceSubmitted = true;
-    fe.imageLastSlot[idx] = static_cast<int>(slot);
+  if (fatalDeviceLost) return;
+  if (needConsumeSignal) {
+    consume_signal_semaphore();
+    return;
   }
 
   fe.hasAcquired = false;
   fe.frameValid = false;
-  fe.signalSem = VK_NULL_HANDLE;
-  fe.pendingSemCount = 0;
-  fe.pendingCmdCount = 0;
+  fe.pendingSems.clear();
+  fe.pendingCmds.clear();
   fe.hasImage = false;
 
-  if (pres == VK_ERROR_OUT_OF_DATE_KHR) {
+  if (pres == VK_ERROR_DEVICE_LOST) {
+    VK_LOGE("VK_ERROR_DEVICE_LOST em vkQueuePresentKHR");
+    std::lock_guard<std::mutex> slock(fe.stateMutex);
+    fe.deviceLost = true;
+    fe.needsRecreate = true;
+  } else if (pres == VK_ERROR_SURFACE_LOST_KHR) {
+    VK_LOGW("VK_ERROR_SURFACE_LOST_KHR em vkQueuePresentKHR");
+    std::lock_guard<std::mutex> slock(fe.stateMutex);
+    fe.surfaceLost = true;
     fe.needsRecreate = true;
     fe.suboptimalTried = false;
-  } else if (pres == VK_SUBOPTIMAL_KHR && !fe.suboptimalTried) {
+  } else if (pres == VK_ERROR_OUT_OF_DATE_KHR) {
+    std::lock_guard<std::mutex> slock(fe.stateMutex);
     fe.needsRecreate = true;
-    fe.suboptimalTried = true;
+    fe.suboptimalTried = false;
+  } else if (pres == VK_SUBOPTIMAL_KHR) {
+    std::lock_guard<std::mutex> slock(fe.stateMutex);
+    if (!fe.suboptimalTried) {
+      fe.needsRecreate = true;
+      fe.suboptimalTried = true;
+    }
+  } else if (pres != VK_SUCCESS) {
+    VK_LOGW("vkQueuePresentKHR falhou: %d", static_cast<int>(pres));
+    std::lock_guard<std::mutex> slock(fe.stateMutex);
+    fe.needsRecreate = true;
   }
 }
 
@@ -1458,12 +1737,18 @@ bool create_default_device(retro_vulkan_context* ctx, VkPhysicalDevice gpu) {
 // ---------------------------------------------------------------------------
 void shutdown_internal(bool force) {
   VkFe& fe = g_fe;
-  if (!force && !fe.active && fe.instance == VK_NULL_HANDLE &&
-      fe.device == VK_NULL_HANDLE)
+  if (!force && !fe.active.load(std::memory_order_acquire) &&
+      fe.instance == VK_NULL_HANDLE && fe.device == VK_NULL_HANDLE) {
     return;
+  }
+
+  fe.active.store(false, std::memory_order_release);
 
   if (fe.device != VK_NULL_HANDLE) {
-    if (g_fn.deviceWaitIdle) g_fn.deviceWaitIdle(fe.device);
+    {
+      std::lock_guard<std::recursive_mutex> qlock(fe.queueMutex);
+      if (g_fn.deviceWaitIdle) g_fn.deviceWaitIdle(fe.device);
+    }
     free_sync_objects();
     if (fe.swapchain != VK_NULL_HANDLE && g_fn.destroySwapchain) {
       g_fn.destroySwapchain(fe.device, fe.swapchain, nullptr);
@@ -1496,12 +1781,22 @@ void shutdown_internal(bool force) {
   fe.instance = VK_NULL_HANDLE;
   clear_instance_and_device_fns();
 
-  fe.active = false;
+  {
+    std::lock_guard<std::mutex> slock(fe.stateMutex);
+    fe.needsRecreate = false;
+    fe.suboptimalTried = false;
+    fe.surfaceLost = false;
+    fe.deviceLost = false;
+  }
   fe.hasImage = false;
   fe.frameValid = false;
   fe.hasAcquired = false;
-  fe.needsRecreate = false;
-  fe.suboptimalTried = false;
+  fe.signalSem = VK_NULL_HANDLE;
+  fe.pendingSems.clear();
+  fe.pendingCmds.clear();
+  fe.waitSemsScratch.clear();
+  fe.waitStagesScratch.clear();
+  fe.cmdsScratch.clear();
   fe.gpu = VK_NULL_HANDLE;
   fe.queue = VK_NULL_HANDLE;
   fe.presentQueue = VK_NULL_HANDLE;
@@ -1716,7 +2011,7 @@ bool init_from_negotiation(
   fe.iface.unlock_queue = cb_unlock_queue;
   fe.iface.set_signal_semaphore = cb_set_signal_semaphore;
 
-  fe.active = true;
+  fe.active.store(true, std::memory_order_release);
   return true;
 }
 
@@ -1732,29 +2027,32 @@ void set_custom_driver(const char* hook_lib_dir,
                        const char* custom_driver_dir,
                        const char* custom_driver_name,
                        bool adreno_turbo) {
+  std::lock_guard<std::mutex> lock(g_vkConfigMutex);
   const std::string nextHook = ensure_trailing_slash(hook_lib_dir);
   const std::string nextTmp = ensure_trailing_slash(tmp_dir);
   const std::string nextDir = ensure_trailing_slash(custom_driver_dir);
   const std::string nextName = custom_driver_name ? custom_driver_name : "";
   const bool changed =
-      (nextDir != g_customDriverDir || nextName != g_customDriverName);
+      (nextHook != g_hookLibDir || nextTmp != g_tmpDir ||
+       nextDir != g_customDriverDir || nextName != g_customDriverName);
   g_hookLibDir = nextHook;
   g_tmpDir = nextTmp;
   g_customDriverDir = nextDir;
   g_customDriverName = nextName;
   g_adrenoTurbo = adreno_turbo;
-  if (changed && !g_fe.active) {
+  if (changed && !g_fe.active.load(std::memory_order_acquire)) {
     g_fe.probed = false;
     g_fe.probeOk = false;
   }
 }
 
 void set_freedreno_preset(const char* preset) {
+  std::lock_guard<std::mutex> lock(g_vkConfigMutex);
   const std::string next = preset ? preset : "";
   if (next != g_freedrenoPreset) {
     g_freedrenoPreset = next;
     apply_freedreno_env();
-    if (!g_fe.active) {
+    if (!g_fe.active.load(std::memory_order_acquire)) {
       g_fe.probed = false;
       g_fe.probeOk = false;
     }
@@ -1762,39 +2060,52 @@ void set_freedreno_preset(const char* preset) {
 }
 
 void set_backend(int mode) {
+  std::lock_guard<std::mutex> lock(g_vkConfigMutex);
   g_fe.wanted = (mode == 2);
   if (g_fe.wanted) do_probe();
 }
 
 void set_vsync(bool enabled) {
   const bool prev = g_fe.vsync.exchange(enabled, std::memory_order_relaxed);
-  if (g_fe.active && prev != enabled) {
+  if (g_fe.active.load(std::memory_order_acquire) && prev != enabled) {
+    std::lock_guard<std::mutex> slock(g_fe.stateMutex);
     g_fe.needsRecreate = true;
     g_fe.suboptimalTried = false;
   }
 }
 
-bool vulkan_requested() { return g_fe.wanted && g_fe.probeOk; }
-bool is_active() { return g_fe.active; }
+bool vulkan_requested() {
+  std::lock_guard<std::mutex> lock(g_vkConfigMutex);
+  return g_fe.wanted && g_fe.probeOk;
+}
+bool is_active() { return g_fe.active.load(std::memory_order_acquire); }
 
 bool on_negotiation_iface(const void* iface, ANativeWindow* window) {
+  std::lock_guard<std::mutex> lock(g_vkConfigMutex);
   auto* neg =
       static_cast<const retro_hw_render_context_negotiation_interface_vulkan*>(
           iface);
-  if (!neg || neg->interface_type != 0 || !vulkan_requested()) return false;
+  if (!neg || neg->interface_type != 0 || !g_fe.wanted || !g_fe.probeOk) {
+    return false;
+  }
   return init_from_negotiation(neg, window);
 }
 
 bool get_render_interface(void** out) {
-  if (!g_fe.active) return false;
+  std::lock_guard<std::mutex> lock(g_vkConfigMutex);
+  if (!g_fe.active.load(std::memory_order_acquire) || !out) return false;
   *out = &g_fe.iface;
   return true;
 }
 
 void context_reset() {}
 void context_destroy() {}
-void begin_frame() { acquire_frame(); }
+bool begin_frame() { return acquire_frame(); }
+void consume_signal_semaphore() { ::consume_signal_semaphore(); }
 void present(unsigned w, unsigned h) { present_frame(w, h); }
-void shutdown_public() { shutdown_internal(false); }
+void shutdown_public() {
+  std::lock_guard<std::mutex> lock(g_vkConfigMutex);
+  shutdown_internal(false);
+}
 
 } // namespace vkfe

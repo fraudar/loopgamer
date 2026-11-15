@@ -48,11 +48,16 @@ echo "==> Compilando LoopGamer APK Release (Gradle 8.7 + NDK 27 + Libretro JNI).
 flutter pub get
 
 flutter build apk --release \
+  --target-platform android-arm64 \
+  --split-per-abi \
   --dart-define=IGDB_CLIENT_ID="${IGDB_CLIENT_ID:-}" \
   --dart-define=IGDB_CLIENT_SECRET="${IGDB_CLIENT_SECRET:-}" \
   --dart-define=SGDB_API_KEY="${SGDB_API_KEY:-}"
 
-APK_OUT="$PROJECT_DIR/build/app/outputs/flutter-apk/app-release.apk"
+APK_OUT="$PROJECT_DIR/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk"
+if [ ! -f "$APK_OUT" ]; then
+  APK_OUT="$PROJECT_DIR/build/app/outputs/flutter-apk/app-release.apk"
+fi
 if [ -f "$APK_OUT" ]; then
   cp "$APK_OUT" "$PROJECT_DIR/loopgamer-release.apk"
   echo ""
@@ -60,4 +65,7 @@ if [ -f "$APK_OUT" ]; then
   echo " APK GERADO COM SUCESSO:"
   echo " $PROJECT_DIR/loopgamer-release.apk"
   echo "=================================================================="
+else
+  echo "ERRO: APK release não encontrado em $PROJECT_DIR/build/app/outputs/flutter-apk/" >&2
+  exit 1
 fi

@@ -1,8 +1,10 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'package:archive/archive.dart';
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
 class TurnipDriverRelease {
@@ -48,6 +50,17 @@ class InstalledGpuDriver {
 /// Todos os binários ficam em storage interno do app (`filesDir/gpu_drivers/`)
 /// para permitir `dlopen`/injeção rootless em dispositivos ARM64.
 class GpuDriverService {
+  GpuDriverService({Dio? dio})
+      : _ownsDio = dio == null,
+        _dio = dio ??
+            Dio(
+              BaseOptions(
+                connectTimeout: const Duration(seconds: 12),
+                receiveTimeout: const Duration(seconds: 40),
+                headers: const {'User-Agent': 'LoopGamer-Emulator/2.4'},
+              ),
+            );
+
   // Repositórios Turnip AdrenoTools usados no ecossistema Eden/Android
   static const List<String> _repos = [
     'K11MCH1/AdrenoToolsDrivers',
@@ -59,13 +72,22 @@ class GpuDriverService {
   static List<TurnipDriverRelease>? _cachedReleases;
   static DateTime? _cachedAt;
 
-  final Dio _dio = Dio(
-    BaseOptions(
-      connectTimeout: const Duration(seconds: 12),
-      receiveTimeout: const Duration(seconds: 40),
-      headers: const {'User-Agent': 'LoopGamer-Emulator/2.4'},
-    ),
-  );
+  final bool _ownsDio;
+  final Dio _dio;
+
+  /// Valida um identificador de driver impedindo traversal (`..`, `/`, `\`, NUL).
+  static bool isValidDriverId(String driverId) {
+    final trimmed = driverId.trim();
+    if (trimmed.isEmpty || trimmed != driverId) return false;
+    if (driverId == '.' || driverId == '..') return false;
+    if (driverId.contains('..') ||
+        driverId.contains('/') ||
+        driverId.contains('\\') ||
+        driverId.contains('\x00')) {
+      return false;
+    }
+    return true;
+  }
 
   Future<Directory> _driversRootDir() async {
     final baseDir = await getApplicationSupportDirectory();
@@ -96,6 +118,13 @@ class GpuDriverService {
             'https://api.github.com/repos/$repo/releases',
             queryParameters: {'per_page': 5},
           );
+          final code = res.statusCode ?? 200;
+          if (code < 200 || code >= 300) {
+            debugPrint(
+              '[GpuDriverService] HTTP $code ao consultar releases de $repo',
+            );
+            return repoReleases;
+          }
           final list = res.data ?? const [];
           for (final item in list.whereType<Map<String, dynamic>>()) {
             final tag = (item['tag_name'] as String?) ?? '';
@@ -118,7 +147,9 @@ class GpuDriverService {
               );
             }
           }
-        } catch (_) {}
+        } catch (e) {
+          debugPrint('[GpuDriverService] Falha ao buscar releases de $repo: $e');
+        }
         return repoReleases;
       }),
     );
@@ -138,22 +169,31 @@ class GpuDriverService {
     final root = await _driversRootDir();
     final safeId = '${release.tag}_${release.assetName}'
         .replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
-    final tmpZip = File('${root.path}/$safeId.part');
-    await _dio.download(
-      release.downloadUrl,
-      tmpZip.path,
-      onReceiveProgress: (rec, total) {
-        if (total > 0 && onProgress != null) {
-          onProgress(rec / total);
-        }
-      },
+    final tmpZip = File(
+      '${root.path}/$safeId.part_${DateTime.now().microsecondsSinceEpoch}',
     );
     try {
-      final bytes = await tmpZip.readAsBytes();
-      return await _installFromZipBytes(safeId, bytes);
+      final res = await _dio.download(
+        release.downloadUrl,
+        tmpZip.path,
+        onReceiveProgress: (rec, total) {
+          if (total > 0 && onProgress != null) {
+            onProgress(rec / total);
+          }
+        },
+      );
+      final code = res.statusCode ?? 200;
+      if (code < 200 || code >= 300) {
+        throw StateError('Falha ao baixar driver (HTTP $code).');
+      }
+      return await _installFromZipFile(safeId, tmpZip.path);
     } finally {
-      if (await tmpZip.exists()) {
-        await tmpZip.delete();
+      try {
+        if (await tmpZip.exists()) {
+          await tmpZip.delete();
+        }
+      } catch (e) {
+        debugPrint('[GpuDriverService] Falha ao limpar zip temporário: $e');
       }
     }
   }
@@ -173,14 +213,35 @@ class GpuDriverService {
     final safeId = result!.files.single.name
         .replaceAll(RegExp(r'\.zip$', caseSensitive: false), '')
         .replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
-    final bytes = await file.readAsBytes();
-    return _installFromZipBytes(safeId, bytes);
+    return _installFromZipFile(safeId, file.path);
   }
 
-  Future<InstalledGpuDriver> _installFromZipBytes(
+  Future<InstalledGpuDriver> _installFromZipFile(
     String driverId,
-    List<int> zipBytes,
+    String zipPath,
   ) async {
+    final normalizedId = driverId.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+    if (!isValidDriverId(normalizedId)) {
+      throw ArgumentError.value(driverId, 'driverId', 'ID de driver inválido.');
+    }
+    final root = await _driversRootDir();
+    final rootPath = root.path;
+
+    return Isolate.run(
+      () => _extractDriverZipSync(
+        zipPath: zipPath,
+        rootPath: rootPath,
+        driverId: normalizedId,
+      ),
+    );
+  }
+
+  static InstalledGpuDriver _extractDriverZipSync({
+    required String zipPath,
+    required String rootPath,
+    required String driverId,
+  }) {
+    final zipBytes = File(zipPath).readAsBytesSync();
     final archive = ZipDecoder().decodeBytes(zipBytes);
     Map<String, dynamic>? meta;
     String? detectedSoName;
@@ -195,38 +256,52 @@ class GpuDriverService {
           if (decoded is Map<String, dynamic>) {
             meta = decoded;
           }
-        } catch (_) {}
+        } catch (e) {
+          debugPrint('[GpuDriverService] meta.json inválido em $driverId: $e');
+        }
       } else if (base.toLowerCase().endsWith('.so') &&
           detectedSoName == null) {
         detectedSoName = base;
       }
     }
 
-    final libraryName =
+    final rawLibraryName =
         ((meta?['libraryName'] as String?)?.trim().isNotEmpty == true)
             ? (meta!['libraryName'] as String).trim()
             : detectedSoName;
-    if (libraryName == null || libraryName.isEmpty) {
+    if (rawLibraryName == null ||
+        rawLibraryName.isEmpty ||
+        rawLibraryName.contains('..') ||
+        rawLibraryName.contains('/') ||
+        rawLibraryName.contains('\\')) {
       throw StateError(
         'Pacote inválido: nenhuma biblioteca .so ou meta.json de driver Adreno foi encontrada.',
       );
     }
 
-    final root = await _driversRootDir();
-    final targetDir = Directory('${root.path}/$driverId');
-    if (await targetDir.exists()) {
-      await targetDir.delete(recursive: true);
+    final targetDir = Directory('$rootPath/$driverId');
+    if (targetDir.existsSync()) {
+      targetDir.deleteSync(recursive: true);
     }
-    await targetDir.create(recursive: true);
+    targetDir.createSync(recursive: true);
+
+    final canonicalTarget = targetDir.resolveSymbolicLinksSync();
+    final targetPrefix = canonicalTarget.endsWith(Platform.pathSeparator)
+        ? canonicalTarget
+        : '$canonicalTarget${Platform.pathSeparator}';
 
     for (final entry in archive) {
       if (!entry.isFile) continue;
       final normalized = entry.name.replaceAll('\\', '/');
       if (normalized.contains('..')) continue;
       final fileName = normalized.split('/').last;
-      if (fileName.isEmpty) continue;
+      if (fileName.isEmpty || fileName == '.' || fileName == '..') continue;
       final outFile = File('${targetDir.path}/$fileName');
-      await outFile.writeAsBytes(entry.content as List<int>, flush: true);
+      outFile.writeAsBytesSync(entry.content as List<int>, flush: true);
+      final canonicalOut = outFile.resolveSymbolicLinksSync();
+      if (!canonicalOut.startsWith(targetPrefix)) {
+        outFile.deleteSync();
+      }
     }
 
     final name = (meta?['name'] as String?)?.trim();
@@ -234,12 +309,12 @@ class GpuDriverService {
     final desc = (meta?['description'] as String?)?.trim();
 
     if (meta == null) {
-      await File('${targetDir.path}/meta.json').writeAsString(
+      File('${targetDir.path}/meta.json').writeAsStringSync(
         jsonEncode({
           'name': driverId,
           'driverVersion': 'Custom',
           'description': 'Driver Vulkan importado',
-          'libraryName': libraryName,
+          'libraryName': rawLibraryName,
         }),
         flush: true,
       );
@@ -252,7 +327,7 @@ class GpuDriverService {
       description: (desc != null && desc.isNotEmpty)
           ? desc
           : 'Driver Vulkan AdrenoTools',
-      libraryName: libraryName,
+      libraryName: rawLibraryName,
       directoryPath: '${targetDir.path}/',
     );
   }
@@ -270,7 +345,12 @@ class GpuDriverService {
         final decoded =
             jsonDecode(await metaFile.readAsString()) as Map<String, dynamic>;
         final libName = (decoded['libraryName'] as String?)?.trim() ?? '';
-        if (libName.isEmpty) continue;
+        if (libName.isEmpty ||
+            libName.contains('..') ||
+            libName.contains('/') ||
+            libName.contains('\\')) {
+          continue;
+        }
         if (!await File('${entity.path}/$libName').exists()) continue;
         final id = entity.path.split(Platform.pathSeparator).last;
         result.add(
@@ -284,17 +364,47 @@ class GpuDriverService {
             directoryPath: '${entity.path}/',
           ),
         );
-      } catch (_) {}
+      } catch (e) {
+        debugPrint(
+          '[GpuDriverService] Falha ao ler metadados de driver em ${entity.path}: $e',
+        );
+      }
     }
     result.sort((a, b) => a.name.compareTo(b.name));
     return result;
   }
 
   Future<void> deleteDriver(String driverId) async {
+    if (!isValidDriverId(driverId)) {
+      throw ArgumentError.value(
+        driverId,
+        'driverId',
+        'ID de driver inválido para remoção.',
+      );
+    }
     final root = await _driversRootDir();
+    final rootCanonical = await root.resolveSymbolicLinks();
     final dir = Directory('${root.path}/$driverId');
-    if (await dir.exists()) {
-      await dir.delete(recursive: true);
+    if (!await dir.exists()) return;
+
+    final targetCanonical = await dir.resolveSymbolicLinks();
+    final expectedPrefix = rootCanonical.endsWith(Platform.pathSeparator)
+        ? rootCanonical
+        : '$rootCanonical${Platform.pathSeparator}';
+    if (targetCanonical == rootCanonical ||
+        !targetCanonical.startsWith(expectedPrefix)) {
+      throw ArgumentError.value(
+        driverId,
+        'driverId',
+        'Caminho do driver resolve fora do diretório gpu_drivers.',
+      );
+    }
+    await dir.delete(recursive: true);
+  }
+
+  void dispose() {
+    if (_ownsDio) {
+      _dio.close(force: true);
     }
   }
 }

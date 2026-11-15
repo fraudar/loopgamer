@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:loopgamer/main.dart';
+import 'package:loopgamer/screens/home_screen.dart';
 
 void main() {
   testWidgets('LoopGamer GameHub Portrait & Landscape smoke test', (
@@ -15,7 +16,23 @@ void main() {
     await tester.pumpWidget(const LoopGamerApp());
     expect(find.text('LOOPGAMER'), findsOneWidget);
     expect(find.text('Destaques da Coleção'), findsOneWidget);
+    expect(find.text('Continuar jogando'), findsOneWidget);
+
+    final homeVerticalScrollable = find
+        .descendant(
+          of: find.byType(HomeScreen),
+          matching: find.byWidgetPredicate(
+            (w) => w is Scrollable && w.axisDirection == AxisDirection.down,
+          ),
+        )
+        .first;
+    await tester.scrollUntilVisible(
+      find.text('Catálogo por Console'),
+      200,
+      scrollable: homeVerticalScrollable,
+    );
     expect(find.text('Catálogo por Console'), findsOneWidget);
+
     expect(find.text('Início'), findsOneWidget);
     expect(find.text('ROMs'), findsOneWidget);
     expect(find.text('Biblioteca'), findsOneWidget);

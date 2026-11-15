@@ -6,16 +6,79 @@
 // 4. Descoberta ao vivo no Internet Archive + Libretro Official Thumbnails CDN
 // ============================================================================
 
+import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import '../models/emulation_game.dart';
 import 'rom_download_service.dart';
+
+class _AsyncSemaphore {
+  _AsyncSemaphore(this.maxConcurrent);
+
+  final int maxConcurrent;
+  int _active = 0;
+  final Queue<Completer<void>> _waiters = Queue<Completer<void>>();
+
+  Future<T> run<T>(
+    Future<T> Function() task, {
+    CancelToken? cancelToken,
+  }) async {
+    await _acquire(cancelToken: cancelToken);
+    try {
+      return await task();
+    } finally {
+      _release();
+    }
+  }
+
+  Future<void> _acquire({CancelToken? cancelToken}) async {
+    if (cancelToken?.isCancelled == true) {
+      throw DioException.requestCancelled(
+        requestOptions: RequestOptions(path: ''),
+        reason: cancelToken?.cancelError?.error,
+      );
+    }
+    if (_active < maxConcurrent) {
+      _active++;
+      return;
+    }
+    final waiter = Completer<void>();
+    _waiters.addLast(waiter);
+    if (cancelToken != null) {
+      unawaited(
+        cancelToken.whenCancel.then((err) {
+          if (!waiter.isCompleted) {
+            _waiters.remove(waiter);
+            waiter.completeError(
+              DioException.requestCancelled(
+                requestOptions: RequestOptions(path: ''),
+                reason: err.error,
+              ),
+            );
+          }
+        }),
+      );
+    }
+    await waiter.future;
+  }
+
+  void _release() {
+    while (_waiters.isNotEmpty) {
+      final next = _waiters.removeFirst();
+      if (!next.isCompleted) {
+        next.complete();
+        return;
+      }
+    }
+    _active--;
+  }
+}
 
 class IgdbSteamGridService {
   IgdbSteamGridService({
     Dio? dio,
-    this.igdbClientId = const String.fromEnvironment('IGDB_CLIENT_ID'),
-    this.igdbClientSecret = const String.fromEnvironment('IGDB_CLIENT_SECRET'),
     this.steamGridDbApiKey = const String.fromEnvironment('SGDB_API_KEY'),
   })  : _hasCustomDio = dio != null,
         _dio = dio ??
@@ -28,18 +91,32 @@ class IgdbSteamGridService {
 
   final bool _hasCustomDio;
   final Dio _dio;
-  final String igdbClientId;
-  final String igdbClientSecret;
   final String steamGridDbApiKey;
 
-  String? _cachedIgdbAccessToken;
-  DateTime? _tokenExpiry;
+  CancelToken? _activeSearchCancelToken;
+  bool _isDisposed = false;
+  final _AsyncSemaphore _sgdbSemaphore = _AsyncSemaphore(3);
+  final _AsyncSemaphore _retroApiSemaphore = _AsyncSemaphore(4);
+  final _AsyncSemaphore _archiveMetaSemaphore = _AsyncSemaphore(4);
 
   /// Cache em memória das respostas da RetroAPI (retroapi.konsumer.workers.dev)
   static final Map<String, List<EmulationGame>> _retroApiCache = {};
 
-  /// Limpa o cache em memória da RetroAPI (útil para isolamento em testes).
-  static void clearCacheForTesting() => _retroApiCache.clear();
+  /// Cache em memória de artes SteamGridDB por título normalizado (evita chamadas duplicadas)
+  static final Map<String, ({String? grid, String? hero, String? logo})>
+      _sgdbArtCache = {};
+  static final Map<String, Future<({String? grid, String? hero, String? logo})?>>
+      _sgdbInFlight = {};
+
+  /// Limpa os caches em memória (útil para isolamento em testes).
+  static void clearCacheForTesting() {
+    _retroApiCache.clear();
+    _sgdbArtCache.clear();
+    _sgdbInFlight.clear();
+  }
+
+  static bool _isSuccessStatus(int? statusCode) =>
+      statusCode != null && statusCode >= 200 && statusCode < 300;
 
   static const Set<String> _validRomExtensions = {
     '.gba',
@@ -97,6 +174,7 @@ class IgdbSteamGridService {
     String platformSlug, {
     int maxPerPlatform = 36,
     int offset = 0,
+    CancelToken? cancelToken,
   }) async {
     if (Platform.environment.containsKey('FLUTTER_TEST') && !_hasCustomDio) {
       return const [];
@@ -113,7 +191,16 @@ class IgdbSteamGridService {
     if (querySpec == null) return const [];
 
     try {
-      final res = await _dio.get<dynamic>(querySpec.url);
+      final res = await _dio.get<dynamic>(
+        querySpec.url,
+        cancelToken: cancelToken,
+      );
+      if (!_isSuccessStatus(res.statusCode)) {
+        debugPrint(
+          '[IgdbSteamGridService] RetroAPI retornou HTTP ${res.statusCode} para $slug.',
+        );
+        return const [];
+      }
       final data = res.data;
       if (data is! List) return const [];
 
@@ -196,7 +283,7 @@ class IgdbSteamGridService {
                   ? 'EUR'
                   : 'WORLD';
 
-          final idSeed = '${slug}_$rawName'.hashCode.abs() % 800000 + 100000;
+          final idSeed = EmulationGame.stableIdFromKey('${slug}_$rawName');
 
           final item = EmulationGame(
             igdbId: idSeed,
@@ -236,7 +323,14 @@ class IgdbSteamGridService {
       _retroApiCache[slug] = parsed;
       if (offset >= parsed.length) return const [];
       return parsed.skip(offset).take(maxPerPlatform).toList();
-    } catch (_) {
+    } on DioException catch (e) {
+      if (e.type == DioExceptionType.cancel) rethrow;
+      debugPrint(
+        '[IgdbSteamGridService] Erro RetroAPI ($slug): HTTP ${e.response?.statusCode ?? e.type}',
+      );
+      return const [];
+    } catch (e) {
+      debugPrint('[IgdbSteamGridService] Falha RetroAPI ($slug): $e');
       return const [];
     }
   }
@@ -448,6 +542,7 @@ class IgdbSteamGridService {
     String apiToken = '',
     String? platformSlug,
     String? searchTerm,
+    CancelToken? cancelToken,
   }) async {
     final cleanBase = serverUrl.trim().replaceAll(RegExp(r'/+$'), '');
     if (cleanBase.isEmpty) return const [];
@@ -471,8 +566,15 @@ class IgdbSteamGridService {
       final res = await _dio.get<dynamic>(
         '$cleanBase/api/roms',
         queryParameters: queryParams,
+        cancelToken: cancelToken,
         options: Options(headers: headers),
       );
+      if (!_isSuccessStatus(res.statusCode)) {
+        debugPrint(
+          '[IgdbSteamGridService] RomM retornou HTTP ${res.statusCode} em $cleanBase/api/roms.',
+        );
+        return const [];
+      }
 
       final rawItems = res.data is Map<String, dynamic>
           ? ((res.data as Map<String, dynamic>)['items'] as List<dynamic>? ??
@@ -481,7 +583,10 @@ class IgdbSteamGridService {
 
       final List<EmulationGame> rommGames = [];
       for (final raw in rawItems.whereType<Map<String, dynamic>>()) {
-        final id = (raw['id'] as num?)?.toInt() ?? raw.hashCode.abs();
+        final id = (raw['id'] as num?)?.toInt() ??
+            EmulationGame.stableIdFromKey(
+              'romm|$cleanBase|${raw['fs_name'] ?? raw['name'] ?? rommGames.length}',
+            );
         final name = (raw['name'] as String?) ??
             (raw['fs_name_no_ext'] as String?) ??
             'ROM #$id';
@@ -540,7 +645,14 @@ class IgdbSteamGridService {
         );
       }
       return rommGames;
-    } catch (_) {
+    } on DioException catch (e) {
+      if (e.type == DioExceptionType.cancel) rethrow;
+      debugPrint(
+        '[IgdbSteamGridService] RomM HTTP error (${e.response?.statusCode}): ${e.message}',
+      );
+      return const [];
+    } catch (e) {
+      debugPrint('[IgdbSteamGridService] RomM unexpected error: $e');
       return const [];
     }
   }
@@ -624,28 +736,6 @@ class IgdbSteamGridService {
     return (name: 'GBA', slug: 'gba');
   }
 
-  Future<String> _getIgdbBearerToken() async {
-    if (_cachedIgdbAccessToken != null &&
-        _tokenExpiry != null &&
-        DateTime.now().isBefore(_tokenExpiry!)) {
-      return _cachedIgdbAccessToken!;
-    }
-
-    final response = await _dio.post<Map<String, dynamic>>(
-      'https://id.twitch.tv/oauth2/token',
-      queryParameters: {
-        'client_id': igdbClientId,
-        'client_secret': igdbClientSecret,
-        'grant_type': 'client_credentials',
-      },
-    );
-
-    final data = response.data!;
-    _cachedIgdbAccessToken = data['access_token'] as String;
-    final expiresIn = (data['expires_in'] as num?)?.toInt() ?? 3600;
-    _tokenExpiry = DateTime.now().add(Duration(seconds: expiresIn - 60));
-    return _cachedIgdbAccessToken!;
-  }
 
   static String _canonicalPlatformSlug(String raw) {
     final s = raw.trim().toLowerCase();
@@ -748,112 +838,164 @@ class IgdbSteamGridService {
     String? platformFilter,
     String rommServerUrl = '',
     String rommApiToken = '',
+    CancelToken? cancelToken,
   }) async {
-    final sanitized = query.replaceAll('"', '').trim();
-    final normQuery = EmulationGame.normalizeSearchText(sanitized);
-    final queryTokens =
-        normQuery.split(' ').where((t) => t.isNotEmpty).toList();
+    if (_isDisposed) return const [];
 
-    final Map<String, ({EmulationGame game, int score})> byKey = {};
-
-    void addOrMerge(EmulationGame candidate, {int sourceBonus = 0}) {
-      if (!_matchesPlatformFilter(candidate, platformFilter)) return;
-      final score = _searchRelevanceScore(
-        candidate,
-        normQuery,
-        queryTokens,
-        sourceBonus: sourceBonus,
-      );
-      if (score <= 0) return;
-
-      final baseTitle = _baseComparableTitle(candidate.name);
-      final key =
-          '${_canonicalPlatformSlug(candidate.platformSlug)}|${baseTitle.isNotEmpty ? baseTitle : EmulationGame.normalizeSearchText(candidate.name)}';
-
-      final existing = byKey[key];
-      if (existing == null) {
-        byKey[key] = (game: candidate, score: score);
-        return;
-      }
-
-      var merged = existing.game;
-      var bestScore = existing.score;
-      if (!merged.hasKnownSize && candidate.hasKnownSize) {
-        merged = merged.copyWith(
-          estimatedSizeBytes: candidate.estimatedSizeBytes,
-        );
-      } else if (score > existing.score &&
-          (candidate.hasKnownSize || !merged.hasKnownSize)) {
-        merged = candidate;
-        bestScore = score;
-      }
-      byKey[key] = (game: merged, score: bestScore);
+    final previousToken = _activeSearchCancelToken;
+    if (previousToken != null && !previousToken.isCancelled) {
+      previousToken.cancel('Superseded by new search');
     }
 
-    // 1. Servidor RomM próprio (se configurado)
-    if (rommServerUrl.trim().isNotEmpty) {
-      final fromRomm = await fetchFromRommServer(
-        serverUrl: rommServerUrl,
-        apiToken: rommApiToken,
-        platformSlug: platformFilter,
-        searchTerm: sanitized,
-      );
-      for (final g in fromRomm) {
-        addOrMerge(g, sourceBonus: 120);
-      }
-    }
-
-    // 2. Catálogo local + cache completo da RetroAPI
-    for (final g in kVerifiedRealGamesCatalog) {
-      addOrMerge(g, sourceBonus: 100);
-    }
-    for (final list in _retroApiCache.values) {
-      for (final g in list) {
-        addOrMerge(g, sourceBonus: 80);
-      }
-    }
-
-    // 3. Se uma plataforma específica estiver selecionada e ainda não estiver no cache,
-    // carrega toda a plataforma na RetroAPI e busca em todo o catálogo em cache
-    if (platformFilter != null && platformFilter.toLowerCase() != 'todos') {
-      final slug = platformFilter.toLowerCase();
-      if (!_retroApiCache.containsKey(slug)) {
-        await fetchFromRetroApiPlatform(slug, maxPerPlatform: 260);
-      }
-      final cachedPlatformGames = _retroApiCache[slug] ?? const [];
-      for (final g in cachedPlatformGames) {
-        addOrMerge(g, sourceBonus: 80);
-      }
-    }
-
-    // 4. Se houver termo de busca, consulta também o Internet Archive desbloqueado
-    if (sanitized.isNotEmpty &&
-        (!Platform.environment.containsKey('FLUTTER_TEST') || _hasCustomDio)) {
-      if (igdbClientId.isNotEmpty && igdbClientSecret.isNotEmpty) {
-        try {
-          await _getIgdbBearerToken();
-        } catch (_) {}
-      }
-      final archiveMatches = await _searchArchiveOrgRoms(
-        sanitized,
-        platformFilter: platformFilter,
-      );
-      for (final m in archiveMatches) {
-        addOrMerge(m, sourceBonus: 0);
-      }
-    }
-
-    final ranked = byKey.values.toList()
-      ..sort((a, b) {
-        final scoreCmp = b.score.compareTo(a.score);
-        if (scoreCmp != 0) return scoreCmp;
-        if (a.game.hasKnownSize != b.game.hasKnownSize) {
-          return a.game.hasKnownSize ? -1 : 1;
+    final searchToken = CancelToken();
+    _activeSearchCancelToken = searchToken;
+    if (cancelToken != null) {
+      if (cancelToken.isCancelled) {
+        if (!searchToken.isCancelled) {
+          searchToken.cancel(cancelToken.cancelError?.error ?? 'Cancelled');
         }
-        return a.game.name.compareTo(b.game.name);
-      });
+        return const [];
+      }
+      unawaited(
+        cancelToken.whenCancel.then((err) {
+          if (!searchToken.isCancelled) {
+            searchToken.cancel(err.error);
+          }
+        }),
+      );
+    }
 
-    return Future.wait(ranked.map((e) => enrichWithSteamGridDbArt(e.game)));
+    try {
+      final sanitized = query.replaceAll('"', '').trim();
+      final normQuery = EmulationGame.normalizeSearchText(sanitized);
+      final queryTokens =
+          normQuery.split(' ').where((t) => t.isNotEmpty).toList();
+
+      final Map<String, ({EmulationGame game, int score})> byKey = {};
+
+      void addOrMerge(EmulationGame candidate, {int sourceBonus = 0}) {
+        if (!_matchesPlatformFilter(candidate, platformFilter)) return;
+        final score = _searchRelevanceScore(
+          candidate,
+          normQuery,
+          queryTokens,
+          sourceBonus: sourceBonus,
+        );
+        if (score <= 0) return;
+
+        final baseTitle = _baseComparableTitle(candidate.name);
+        final key =
+            '${_canonicalPlatformSlug(candidate.platformSlug)}|${baseTitle.isNotEmpty ? baseTitle : EmulationGame.normalizeSearchText(candidate.name)}';
+
+        final existing = byKey[key];
+        if (existing == null) {
+          byKey[key] = (game: candidate, score: score);
+          return;
+        }
+
+        var merged = existing.game;
+        var bestScore = existing.score;
+        if (!merged.hasKnownSize && candidate.hasKnownSize) {
+          merged = merged.copyWith(
+            estimatedSizeBytes: candidate.estimatedSizeBytes,
+          );
+        } else if (score > existing.score &&
+            (candidate.hasKnownSize || !merged.hasKnownSize)) {
+          merged = candidate;
+          bestScore = score;
+        }
+        byKey[key] = (game: merged, score: bestScore);
+      }
+
+      // 1. Servidor RomM próprio (se configurado)
+      if (rommServerUrl.trim().isNotEmpty) {
+        final fromRomm = await fetchFromRommServer(
+          serverUrl: rommServerUrl,
+          apiToken: rommApiToken,
+          platformSlug: platformFilter,
+          searchTerm: sanitized,
+          cancelToken: searchToken,
+        );
+        for (final g in fromRomm) {
+          addOrMerge(g, sourceBonus: 120);
+        }
+      }
+      if (searchToken.isCancelled || _isDisposed) return const [];
+
+      // 2. Catálogo local + cache completo da RetroAPI
+      for (final g in kVerifiedRealGamesCatalog) {
+        addOrMerge(g, sourceBonus: 100);
+      }
+      for (final list in _retroApiCache.values) {
+        for (final g in list) {
+          addOrMerge(g, sourceBonus: 80);
+        }
+      }
+
+      // 3. Se uma plataforma específica estiver selecionada e ainda não estiver no cache,
+      // carrega toda a plataforma na RetroAPI e busca em todo o catálogo em cache
+      if (platformFilter != null && platformFilter.toLowerCase() != 'todos') {
+        final slug = platformFilter.toLowerCase();
+        if (!_retroApiCache.containsKey(slug)) {
+          await fetchFromRetroApiPlatform(
+            slug,
+            maxPerPlatform: 260,
+            cancelToken: searchToken,
+          );
+        }
+        if (searchToken.isCancelled || _isDisposed) return const [];
+        final cachedPlatformGames = _retroApiCache[slug] ?? const [];
+        for (final g in cachedPlatformGames) {
+          addOrMerge(g, sourceBonus: 80);
+        }
+      }
+
+      // 4. Se houver termo de busca, consulta também o Internet Archive desbloqueado
+      if (sanitized.isNotEmpty &&
+          (!Platform.environment.containsKey('FLUTTER_TEST') ||
+              _hasCustomDio)) {
+        final archiveMatches = await _searchArchiveOrgRoms(
+          sanitized,
+          platformFilter: platformFilter,
+          cancelToken: searchToken,
+        );
+        for (final m in archiveMatches) {
+          addOrMerge(m, sourceBonus: 0);
+        }
+      }
+      if (searchToken.isCancelled || _isDisposed) return const [];
+
+      final ranked = byKey.values.toList()
+        ..sort((a, b) {
+          final scoreCmp = b.score.compareTo(a.score);
+          if (scoreCmp != 0) return scoreCmp;
+          if (a.game.hasKnownSize != b.game.hasKnownSize) {
+            return a.game.hasKnownSize ? -1 : 1;
+          }
+          return a.game.name.compareTo(b.game.name);
+        });
+
+      return await Future.wait(
+        ranked.map(
+          (e) => enrichWithSteamGridDbArt(e.game, cancelToken: searchToken),
+        ),
+      );
+    } on DioException catch (e) {
+      if (e.type == DioExceptionType.cancel) {
+        return const [];
+      }
+      debugPrint(
+        '[IgdbSteamGridService] searchGames Dio error (${e.response?.statusCode}): ${e.message}',
+      );
+      return const [];
+    } catch (e) {
+      debugPrint('[IgdbSteamGridService] searchGames unexpected error: $e');
+      return const [];
+    } finally {
+      if (identical(_activeSearchCancelToken, searchToken)) {
+        _activeSearchCancelToken = null;
+      }
+    }
   }
 
   String? _archiveSearchHint(String? platformFilter) {
@@ -893,7 +1035,9 @@ class IgdbSteamGridService {
   Future<List<EmulationGame>> _searchArchiveOrgRoms(
     String query, {
     String? platformFilter,
+    CancelToken? cancelToken,
   }) async {
+    if (_isDisposed || cancelToken?.isCancelled == true) return const [];
     if (Platform.environment.containsKey('FLUTTER_TEST') && !_hasCustomDio) {
       return const [];
     }
@@ -913,7 +1057,14 @@ class IgdbSteamGridService {
             'page': '1',
             'output': 'json',
           },
+          cancelToken: cancelToken,
         );
+        if (!_isSuccessStatus(res.statusCode)) {
+          debugPrint(
+            '[IgdbSteamGridService] Archive.org search HTTP ${res.statusCode} for "$searchQuery"',
+          );
+          return const [];
+        }
         return (res.data?['response'] as Map<String, dynamic>?)?['docs']
                 as List<dynamic>? ??
             const [];
@@ -931,14 +1082,33 @@ class IgdbSteamGridService {
         docMaps.map((doc) async {
           final id = doc['identifier'] as String?;
           if (id == null) return null;
-          try {
-            final metaRes = await _dio.get<Map<String, dynamic>>(
-              'https://archive.org/metadata/$id',
-            );
-            return (doc: doc, id: id, data: metaRes.data);
-          } catch (_) {
-            return null;
-          }
+          return _archiveMetaSemaphore.run(() async {
+            if (_isDisposed || cancelToken?.isCancelled == true) return null;
+            try {
+              final metaRes = await _dio.get<Map<String, dynamic>>(
+                'https://archive.org/metadata/$id',
+                cancelToken: cancelToken,
+              );
+              if (!_isSuccessStatus(metaRes.statusCode)) {
+                debugPrint(
+                  '[IgdbSteamGridService] Archive.org metadata HTTP ${metaRes.statusCode} for $id',
+                );
+                return null;
+              }
+              return (doc: doc, id: id, data: metaRes.data);
+            } on DioException catch (e) {
+              if (e.type == DioExceptionType.cancel) rethrow;
+              debugPrint(
+                '[IgdbSteamGridService] Archive.org metadata error for $id (${e.response?.statusCode}): ${e.message}',
+              );
+              return null;
+            } catch (e) {
+              debugPrint(
+                '[IgdbSteamGridService] Archive.org metadata unexpected error for $id: $e',
+              );
+              return null;
+            }
+          }, cancelToken: cancelToken);
         }),
       );
 
@@ -1010,7 +1180,9 @@ class IgdbSteamGridService {
 
         found.add(
           EmulationGame(
-            igdbId: entry.id.hashCode.abs(),
+            igdbId: EmulationGame.stableIdFromKey(
+              'archive|${picked.platform.slug}|${entry.id}',
+            ),
             name: cleanTitle,
             canonicalNoIntroName: picked.fileName
                 .split('/')
@@ -1031,7 +1203,14 @@ class IgdbSteamGridService {
         );
       }
       return found;
-    } catch (_) {
+    } on DioException catch (e) {
+      if (e.type == DioExceptionType.cancel) rethrow;
+      debugPrint(
+        '[IgdbSteamGridService] Archive.org HTTP error (${e.response?.statusCode}): ${e.message}',
+      );
+      return const [];
+    } catch (e) {
+      debugPrint('[IgdbSteamGridService] Archive.org unexpected error: $e');
       return const [];
     }
   }
@@ -1332,52 +1511,157 @@ class IgdbSteamGridService {
     return null;
   }
 
-  Future<EmulationGame> enrichWithSteamGridDbArt(EmulationGame game) async {
-    if (steamGridDbApiKey.isEmpty) return game;
+  Future<EmulationGame> enrichWithSteamGridDbArt(
+    EmulationGame game, {
+    CancelToken? cancelToken,
+  }) async {
+    if (steamGridDbApiKey.isEmpty || _isDisposed) return game;
+    if (cancelToken?.isCancelled == true) {
+      throw DioException.requestCancelled(
+        requestOptions: RequestOptions(path: ''),
+        reason: cancelToken?.cancelError?.error,
+      );
+    }
 
-    try {
+    final norm = EmulationGame.normalizeSearchText(game.name);
+    final cacheKey = norm.isNotEmpty ? norm : game.name.toLowerCase();
+
+    final cached = _sgdbArtCache[cacheKey];
+    if (cached != null) {
+      return game.copyWith(
+        gridCoverUrl: cached.grid,
+        heroBannerUrl: cached.hero,
+        logoUrl: cached.logo,
+      );
+    }
+
+    final inFlight = _sgdbInFlight[cacheKey];
+    if (inFlight != null) {
+      try {
+        final art = await (cancelToken != null
+            ? Future.any([
+                inFlight,
+                cancelToken.whenCancel
+                    .then<({String? grid, String? hero, String? logo})?>(
+                  (err) => throw err,
+                ),
+              ])
+            : inFlight);
+        if (art == null) return game;
+        return game.copyWith(
+          gridCoverUrl: art.grid,
+          heroBannerUrl: art.hero,
+          logoUrl: art.logo,
+        );
+      } on DioException catch (e) {
+        if (e.type == DioExceptionType.cancel &&
+            cancelToken?.isCancelled == true) {
+          rethrow;
+        }
+        return game;
+      } catch (e) {
+        debugPrint('[IgdbSteamGridService] SteamGridDB in-flight error: $e');
+        return game;
+      }
+    }
+
+    final Future<({String? grid, String? hero, String? logo})?> future =
+        _sgdbSemaphore.run(() async {
+      if (_isDisposed || cancelToken?.isCancelled == true) {
+        if (cancelToken?.isCancelled == true) {
+          throw DioException.requestCancelled(
+            requestOptions: RequestOptions(path: ''),
+            reason: cancelToken?.cancelError?.error,
+          );
+        }
+        return null;
+      }
       final headers = {'Authorization': 'Bearer $steamGridDbApiKey'};
       final encodedName = Uri.encodeComponent(game.name);
 
       final searchRes = await _dio.get<Map<String, dynamic>>(
         'https://www.steamgriddb.com/api/v2/search/autocomplete/$encodedName',
         options: Options(headers: headers),
+        cancelToken: cancelToken,
       );
+      if (!_isSuccessStatus(searchRes.statusCode)) {
+        debugPrint(
+          '[IgdbSteamGridService] SteamGridDB search HTTP ${searchRes.statusCode} for ${game.name}',
+        );
+        return null;
+      }
 
       final searchData = searchRes.data?['data'] as List<dynamic>?;
-      if (searchData == null || searchData.isEmpty) return game;
+      if (searchData == null || searchData.isEmpty) {
+        const emptyArt = (grid: null, hero: null, logo: null);
+        _sgdbArtCache[cacheKey] = emptyArt;
+        return emptyArt;
+      }
 
-      final sgdbGameId =
-          (searchData.first as Map<String, dynamic>)['id'] as int;
+      final firstMatch = searchData.first as Map<String, dynamic>?;
+      final sgdbGameId = (firstMatch?['id'] as num?)?.toInt();
+      if (sgdbGameId == null) {
+        const emptyArt = (grid: null, hero: null, logo: null);
+        _sgdbArtCache[cacheKey] = emptyArt;
+        return emptyArt;
+      }
 
       final results = await Future.wait([
         _dio.get<Map<String, dynamic>>(
           'https://www.steamgriddb.com/api/v2/grids/game/$sgdbGameId?dimensions=600x900',
           options: Options(headers: headers),
+          cancelToken: cancelToken,
         ),
         _dio.get<Map<String, dynamic>>(
           'https://www.steamgriddb.com/api/v2/heroes/game/$sgdbGameId',
           options: Options(headers: headers),
+          cancelToken: cancelToken,
         ),
         _dio.get<Map<String, dynamic>>(
           'https://www.steamgriddb.com/api/v2/logos/game/$sgdbGameId',
           options: Options(headers: headers),
+          cancelToken: cancelToken,
         ),
       ]);
 
       String? firstUrl(Response<Map<String, dynamic>> res) {
+        if (!_isSuccessStatus(res.statusCode)) return null;
         final list = res.data?['data'] as List<dynamic>?;
         if (list == null || list.isEmpty) return null;
-        return (list.first as Map<String, dynamic>)['url'] as String?;
+        return (list.first as Map<String, dynamic>?)?['url'] as String?;
       }
 
-      return game.copyWith(
-        gridCoverUrl: firstUrl(results[0]),
-        heroBannerUrl: firstUrl(results[1]),
-        logoUrl: firstUrl(results[2]),
+      final art = (
+        grid: firstUrl(results[0]),
+        hero: firstUrl(results[1]),
+        logo: firstUrl(results[2]),
       );
-    } catch (_) {
+      _sgdbArtCache[cacheKey] = art;
+      return art;
+    }, cancelToken: cancelToken);
+
+    _sgdbInFlight[cacheKey] = future;
+    try {
+      final art = await future;
+      if (art == null) return game;
+      return game.copyWith(
+        gridCoverUrl: art.grid,
+        heroBannerUrl: art.hero,
+        logoUrl: art.logo,
+      );
+    } on DioException catch (e) {
+      if (e.type == DioExceptionType.cancel && cancelToken != null) rethrow;
+      debugPrint(
+        '[IgdbSteamGridService] SteamGridDB HTTP error (${e.response?.statusCode}): ${e.message}',
+      );
       return game;
+    } catch (e) {
+      debugPrint('[IgdbSteamGridService] SteamGridDB unexpected error: $e');
+      return game;
+    } finally {
+      if (identical(_sgdbInFlight[cacheKey], future)) {
+        unawaited(_sgdbInFlight.remove(cacheKey));
+      }
     }
   }
 
@@ -1401,7 +1685,10 @@ class IgdbSteamGridService {
   Future<List<EmulationGame>> fetchRealCatalog({
     String rommServerUrl = '',
     String rommApiToken = '',
+    CancelToken? cancelToken,
   }) async {
+    if (_isDisposed || cancelToken?.isCancelled == true) return const [];
+
     final List<EmulationGame> combined = [];
     final Set<String> seenKeys = {};
 
@@ -1412,63 +1699,104 @@ class IgdbSteamGridService {
       }
     }
 
-    if (rommServerUrl.trim().isNotEmpty) {
-      final remote = await fetchFromRommServer(
-        serverUrl: rommServerUrl,
-        apiToken: rommApiToken,
+    try {
+      if (rommServerUrl.trim().isNotEmpty) {
+        final remote = await fetchFromRommServer(
+          serverUrl: rommServerUrl,
+          apiToken: rommApiToken,
+          cancelToken: cancelToken,
+        );
+        for (final g in remote) {
+          addIfNew(g);
+        }
+      }
+
+      for (final g in kVerifiedRealGamesCatalog) {
+        addIfNew(g);
+      }
+
+      if (_isDisposed || cancelToken?.isCancelled == true) return combined;
+
+      // Busca com concorrência limitada na RetroAPI para restaurar catálogo completo (3.000+ jogos)
+      const targetPlatforms = [
+        'psp',
+        'ps1',
+        'ps2',
+        'gamecube',
+        'wii',
+        '3ds',
+        'ps3',
+        'snes',
+        'gba',
+        'nds',
+        'n64',
+        'md',
+        'saturn',
+        'pce',
+        'nes',
+        'gbc',
+        'gb',
+        'gamegear',
+        'mastersystem',
+        'neogeo',
+        'cps1',
+        'mame',
+        'dreamcast',
+      ];
+
+      final retroBatches = await Future.wait(
+        targetPlatforms.map(
+          (slug) => _retroApiSemaphore.run(
+            () => fetchFromRetroApiPlatform(
+              slug,
+              maxPerPlatform: 260,
+              cancelToken: cancelToken,
+            ),
+            cancelToken: cancelToken,
+          ),
+        ),
       );
-      for (final g in remote) {
-        addIfNew(g);
+
+      for (final batch in retroBatches) {
+        for (final g in batch) {
+          addIfNew(g);
+        }
       }
-    }
 
-    for (final g in kVerifiedRealGamesCatalog) {
-      addIfNew(g);
-    }
-
-    // Busca em paralelo lotes reais da RetroAPI para restaurar catálogo completo (3.000+ jogos)
-    const targetPlatforms = [
-      'psp',
-      'ps1',
-      'ps2',
-      'gamecube',
-      'wii',
-      '3ds',
-      'ps3',
-      'snes',
-      'gba',
-      'nds',
-      'n64',
-      'md',
-      'saturn',
-      'pce',
-      'nes',
-      'gbc',
-      'gb',
-      'gamegear',
-      'mastersystem',
-      'neogeo',
-      'cps1',
-      'mame',
-      'dreamcast',
-    ];
-
-    final retroBatches = await Future.wait(
-      targetPlatforms.map(
-        (slug) => fetchFromRetroApiPlatform(slug, maxPerPlatform: 260),
-      ),
-    );
-
-    for (final batch in retroBatches) {
-      for (final g in batch) {
-        addIfNew(g);
+      if (steamGridDbApiKey.isEmpty ||
+          _isDisposed ||
+          cancelToken?.isCancelled == true) {
+        return combined;
       }
-    }
-
-    if (steamGridDbApiKey.isEmpty) {
+      return await Future.wait(
+        combined.map(
+          (g) => enrichWithSteamGridDbArt(g, cancelToken: cancelToken),
+        ),
+      );
+    } on DioException catch (e) {
+      if (e.type == DioExceptionType.cancel) return combined;
+      debugPrint(
+        '[IgdbSteamGridService] fetchRealCatalog HTTP error (${e.response?.statusCode}): ${e.message}',
+      );
+      return combined;
+    } catch (e) {
+      debugPrint('[IgdbSteamGridService] fetchRealCatalog unexpected error: $e');
       return combined;
     }
-    return Future.wait(combined.map(enrichWithSteamGridDbArt));
+  }
+
+  /// Libera recursos de rede e cancela buscas em andamento.
+  void dispose() {
+    if (_isDisposed) return;
+    _isDisposed = true;
+    final activeToken = _activeSearchCancelToken;
+    _activeSearchCancelToken = null;
+    if (activeToken != null && !activeToken.isCancelled) {
+      activeToken.cancel('Service disposed');
+    }
+    if (!_hasCustomDio) {
+      _dio.close(force: true);
+    }
   }
 }
 

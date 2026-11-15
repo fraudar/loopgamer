@@ -153,7 +153,40 @@ enum TouchOverlayMode {
   final String description;
 }
 
+enum HudOverlayToggleKind {
+  masterBar,
+  fps,
+  resolution,
+  consoleName,
+  frameTime,
+}
+
+/// Especificação única dos toggles do HUD em jogo, compartilhada entre
+/// configurações globais e sidebar/modal do player.
+class HudOverlayToggleSpec {
+  const HudOverlayToggleSpec({
+    required this.kind,
+    required this.title,
+    required this.subtitle,
+    required this.isMaster,
+    required this.readValue,
+    required this.applyValue,
+  });
+
+  final HudOverlayToggleKind kind;
+  final String title;
+  final String subtitle;
+  final bool isMaster;
+  final bool Function(AppSettings settings) readValue;
+  final AppSettings Function(AppSettings settings, bool value) applyValue;
+
+  bool isEnabled(AppSettings settings) =>
+      isMaster || settings.showFpsTelemetry;
+}
+
 class AppSettings {
+  static const int currentSchemaVersion = 2;
+
   const AppSettings({
     this.fastForwardSpeed = 2,
     this.fastForwardHold = false,
@@ -346,6 +379,85 @@ class AppSettings {
 
   static bool isSingleTriggerPlatform(String platformSlug) =>
       singleTriggerPlatforms.contains(platformSlug.trim().toLowerCase());
+
+  /// Valida se [raw] é uma URL HTTP/HTTPS bem formada com host não vazio.
+  /// Para limpar/desconectar o servidor RomM, o chamador pode tratar string vazia antes.
+  static bool isValidRommServerUrl(String raw) {
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty || trimmed.contains(RegExp(r'\s'))) {
+      return false;
+    }
+    final uri = Uri.tryParse(trimmed);
+    if (uri == null || !uri.hasScheme) {
+      return false;
+    }
+    final scheme = uri.scheme.toLowerCase();
+    if (scheme != 'http' && scheme != 'https') {
+      return false;
+    }
+    return uri.hasAuthority && uri.host.trim().isNotEmpty;
+  }
+
+  static bool _readShowFpsTelemetry(AppSettings s) => s.showFpsTelemetry;
+  static bool _readHudShowFps(AppSettings s) => s.hudShowFps;
+  static bool _readHudShowResolution(AppSettings s) => s.hudShowResolution;
+  static bool _readHudShowConsole(AppSettings s) => s.hudShowConsole;
+  static bool _readHudShowFrameTime(AppSettings s) => s.hudShowFrameTime;
+
+  static AppSettings _writeShowFpsTelemetry(AppSettings s, bool v) =>
+      s.copyWith(showFpsTelemetry: v);
+  static AppSettings _writeHudShowFps(AppSettings s, bool v) =>
+      s.copyWith(hudShowFps: v);
+  static AppSettings _writeHudShowResolution(AppSettings s, bool v) =>
+      s.copyWith(hudShowResolution: v);
+  static AppSettings _writeHudShowConsole(AppSettings s, bool v) =>
+      s.copyWith(hudShowConsole: v);
+  static AppSettings _writeHudShowFrameTime(AppSettings s, bool v) =>
+      s.copyWith(hudShowFrameTime: v);
+
+  /// Especificação compartilhada dos 5 toggles do HUD (elimina cópias duplicadas).
+  static const List<HudOverlayToggleSpec> hudToggleSpecs = [
+    HudOverlayToggleSpec(
+      kind: HudOverlayToggleKind.masterBar,
+      title: 'Exibir Barra de Informações (HUD)',
+      subtitle: 'Ativa ou oculta todos os indicadores técnicos durante a partida',
+      isMaster: true,
+      readValue: _readShowFpsTelemetry,
+      applyValue: _writeShowFpsTelemetry,
+    ),
+    HudOverlayToggleSpec(
+      kind: HudOverlayToggleKind.fps,
+      title: 'Mostrar Contador de FPS',
+      subtitle: 'Exibe a taxa de quadros por segundo (ex.: 60 FPS)',
+      isMaster: false,
+      readValue: _readHudShowFps,
+      applyValue: _writeHudShowFps,
+    ),
+    HudOverlayToggleSpec(
+      kind: HudOverlayToggleKind.resolution,
+      title: 'Mostrar Multiplicador de Resolução',
+      subtitle: 'Exibe a resolução interna ativa (ex.: 2x, 3x, 4x)',
+      isMaster: false,
+      readValue: _readHudShowResolution,
+      applyValue: _writeHudShowResolution,
+    ),
+    HudOverlayToggleSpec(
+      kind: HudOverlayToggleKind.consoleName,
+      title: 'Mostrar Plataforma / Console',
+      subtitle: 'Exibe o console em execução (ex.: PSP, PS1, GBA)',
+      isMaster: false,
+      readValue: _readHudShowConsole,
+      applyValue: _writeHudShowConsole,
+    ),
+    HudOverlayToggleSpec(
+      kind: HudOverlayToggleKind.frameTime,
+      title: 'Mostrar Tempo de Quadro (ms)',
+      subtitle: 'Exibe a latência de renderização (ex.: 16.6 ms)',
+      isMaster: false,
+      readValue: _readHudShowFrameTime,
+      applyValue: _writeHudShowFrameTime,
+    ),
+  ];
 
   bool shouldUseSingleTriggers(String platformSlug) =>
       shoulderStyle == ShoulderTriggerStyle.singleLR ||
@@ -590,6 +702,7 @@ class AppSettings {
 
   Map<String, dynamic> toJson() {
     return {
+      'version': currentSchemaVersion,
       'fastForwardSpeed': fastForwardSpeed,
       'fastForwardHold': fastForwardHold,
       'showFastForwardButton': showFastForwardButton,
@@ -664,40 +777,64 @@ class AppSettings {
     };
   }
 
+  static bool _asBool(Map<String, dynamic> map, String key, bool fallback) {
+    final v = map[key];
+    return v is bool ? v : fallback;
+  }
+
+  static int _asInt(Map<String, dynamic> map, String key, int fallback) {
+    final v = map[key];
+    return v is num ? v.toInt() : fallback;
+  }
+
+  static double _asDouble(
+    Map<String, dynamic> map,
+    String key,
+    double fallback,
+  ) {
+    final v = map[key];
+    return v is num ? v.toDouble() : fallback;
+  }
+
+  static String _asString(
+    Map<String, dynamic> map,
+    String key,
+    String fallback,
+  ) {
+    final v = map[key];
+    return v is String ? v : fallback;
+  }
+
   factory AppSettings.fromJson(Map<String, dynamic> map) {
+    // Configs antigos sem campo 'version' são tratados como esquema v1 e migrados suavemente.
+    final legacyGpuRenderer = _asBool(map, 'gpuRenderer', true);
+    final legacyResolutionScale =
+        _asInt(map, 'internalResolutionScale', 1).clamp(1, 4);
+
     return AppSettings(
-      fastForwardSpeed:
-          ((map['fastForwardSpeed'] as num?)?.toInt() ?? 2).clamp(2, 4),
-      fastForwardHold: (map['fastForwardHold'] as bool?) ?? false,
-      showFastForwardButton: (map['showFastForwardButton'] as bool?) ?? true,
-      turboMask: ((map['turboMask'] as num?)?.toInt() ?? 0) & 0x3FFF,
+      fastForwardSpeed: _asInt(map, 'fastForwardSpeed', 2).clamp(2, 4),
+      fastForwardHold: _asBool(map, 'fastForwardHold', false),
+      showFastForwardButton: _asBool(map, 'showFastForwardButton', true),
+      turboMask: _asInt(map, 'turboMask', 0) & 0x3FFF,
       turboHalfPeriodFrames:
-          ((map['turboHalfPeriodFrames'] as num?)?.toInt() ?? 3).clamp(2, 8),
-      showTurboButton: (map['showTurboButton'] as bool?) ?? true,
+          _asInt(map, 'turboHalfPeriodFrames', 3).clamp(2, 8),
+      showTurboButton: _asBool(map, 'showTurboButton', true),
       touchOverlayMode: TouchOverlayMode.values.firstWhere(
         (e) => e.name == map['touchOverlayMode'],
         orElse: () => TouchOverlayMode.auto,
       ),
-      gpuRenderer: (map['gpuRenderer'] as bool?) ?? true,
-      internalResolutionScale:
-          ((map['internalResolutionScale'] as num?)?.toInt() ?? 1).clamp(1, 4),
+      gpuRenderer: legacyGpuRenderer,
+      internalResolutionScale: legacyResolutionScale,
       gpuBackend: GpuBackend.values.firstWhere(
         (e) => e.name == map['gpuBackend'],
         // legado: gpuRenderer == false forçava software; senão padrão é Vulkan
-        orElse: () => (map['gpuRenderer'] as bool?) == false
-            ? GpuBackend.software
-            : GpuBackend.vulkan,
+        orElse: () =>
+            !legacyGpuRenderer ? GpuBackend.software : GpuBackend.vulkan,
       ),
       renderResolution: RenderResolutionPreset.values.firstWhere(
         (e) => e.name == map['renderResolution'],
         // legado: internalResolutionScale 1..4 → presets x1..x4
-        orElse: () {
-          final legacy =
-              ((map['internalResolutionScale'] as num?)?.toInt() ?? 1)
-                  .clamp(1, 4);
-          return RenderResolutionPreset
-              .values[legacy - 1];
-        },
+        orElse: () => RenderResolutionPreset.values[legacyResolutionScale - 1],
       ),
       msaaLevel: MsaaLevel.values.firstWhere(
         (e) => e.name == map['msaaLevel'],
@@ -711,16 +848,15 @@ class AppSettings {
         (e) => e.name == map['textureFilter'],
         orElse: () => TextureFilterMode.nearest,
       ),
-      textureReplacement: (map['textureReplacement'] as bool?) ?? true,
-      lensFlare: (map['lensFlare'] as bool?) ?? false,
-      skipGpuReadbacks: (map['skipGpuReadbacks'] as bool?) ?? true,
-      lazyTextureCache: (map['lazyTextureCache'] as bool?) ?? true,
-      frameDuplication: (map['frameDuplication'] as bool?) ?? false,
-      hardwareTransform: (map['hardwareTransform'] as bool?) ?? true,
-      softwareSkinning: (map['softwareSkinning'] as bool?) ?? true,
-      anisotropicFiltering:
-          (map['anisotropicFiltering'] as bool?) ?? false,
-      textureDeposterize: (map['textureDeposterize'] as bool?) ?? false,
+      textureReplacement: _asBool(map, 'textureReplacement', true),
+      lensFlare: _asBool(map, 'lensFlare', false),
+      skipGpuReadbacks: _asBool(map, 'skipGpuReadbacks', true),
+      lazyTextureCache: _asBool(map, 'lazyTextureCache', true),
+      frameDuplication: _asBool(map, 'frameDuplication', false),
+      hardwareTransform: _asBool(map, 'hardwareTransform', true),
+      softwareSkinning: _asBool(map, 'softwareSkinning', true),
+      anisotropicFiltering: _asBool(map, 'anisotropicFiltering', false),
+      textureDeposterize: _asBool(map, 'textureDeposterize', false),
       videoFilter: VideoFilterPreset.values.firstWhere(
         (e) => e.name == map['videoFilter'],
         orElse: () => VideoFilterPreset.sharpPixels,
@@ -729,20 +865,19 @@ class AppSettings {
         (e) => e.name == map['aspectRatio'],
         orElse: () => AspectRatioPreset.consoleOriginal,
       ),
-      vsyncEnabled: (map['vsyncEnabled'] as bool?) ?? false,
-      frameSkip: ((map['frameSkip'] as num?)?.toInt() ?? 0).clamp(0, 2),
-      performanceBoost: (map['performanceBoost'] as bool?) ?? true,
-      showFpsTelemetry: (map['showFpsTelemetry'] as bool?) ?? true,
-      hudShowFps: (map['hudShowFps'] as bool?) ?? true,
-      hudShowResolution: (map['hudShowResolution'] as bool?) ?? true,
-      hudShowConsole: (map['hudShowConsole'] as bool?) ?? true,
-      hudShowFrameTime: (map['hudShowFrameTime'] as bool?) ?? false,
-      audioEnabled: (map['audioEnabled'] as bool?) ?? true,
-      masterVolume:
-          ((map['masterVolume'] as num?)?.toDouble() ?? 0.85).clamp(0.0, 1.0),
-      autoSaveOnExit: (map['autoSaveOnExit'] as bool?) ?? false,
-      autoLoadOnStart: (map['autoLoadOnStart'] as bool?) ?? false,
-      hapticVibration: (map['hapticVibration'] as bool?) ?? true,
+      vsyncEnabled: _asBool(map, 'vsyncEnabled', false),
+      frameSkip: _asInt(map, 'frameSkip', 0).clamp(0, 2),
+      performanceBoost: _asBool(map, 'performanceBoost', true),
+      showFpsTelemetry: _asBool(map, 'showFpsTelemetry', true),
+      hudShowFps: _asBool(map, 'hudShowFps', true),
+      hudShowResolution: _asBool(map, 'hudShowResolution', true),
+      hudShowConsole: _asBool(map, 'hudShowConsole', true),
+      hudShowFrameTime: _asBool(map, 'hudShowFrameTime', false),
+      audioEnabled: _asBool(map, 'audioEnabled', true),
+      masterVolume: _asDouble(map, 'masterVolume', 0.85).clamp(0.0, 1.0),
+      autoSaveOnExit: _asBool(map, 'autoSaveOnExit', false),
+      autoLoadOnStart: _asBool(map, 'autoLoadOnStart', false),
+      hapticVibration: _asBool(map, 'hapticVibration', true),
       buttonStyle: GamepadButtonStyle.values.firstWhere(
         (e) => e.name == map['buttonStyle'],
         orElse: () => GamepadButtonStyle.gamehubGlass,
@@ -751,60 +886,40 @@ class AppSettings {
         (e) => e.name == map['shoulderStyle'],
         orElse: () => ShoulderTriggerStyle.compactTogether,
       ),
-      gamepadScale:
-          ((map['gamepadScale'] as num?)?.toDouble() ?? 1.0).clamp(0.65, 1.45),
-      gamepadOpacity:
-          ((map['gamepadOpacity'] as num?)?.toDouble() ?? 0.82).clamp(0.20, 1.0),
-      dpadScale:
-          ((map['dpadScale'] as num?)?.toDouble() ?? 1.0).clamp(0.65, 1.45),
-      dpadOpacity:
-          ((map['dpadOpacity'] as num?)?.toDouble() ?? 0.85).clamp(0.20, 1.0),
-      dpadSpacing:
-          ((map['dpadSpacing'] as num?)?.toDouble() ?? 4.0).clamp(0.0, 24.0),
-      stickScale:
-          ((map['stickScale'] as num?)?.toDouble() ?? 1.0).clamp(0.65, 1.45),
-      stickOpacity:
-          ((map['stickOpacity'] as num?)?.toDouble() ?? 0.85).clamp(0.20, 1.0),
-      actionScale:
-          ((map['actionScale'] as num?)?.toDouble() ?? 1.0).clamp(0.65, 1.45),
-      actionOpacity:
-          ((map['actionOpacity'] as num?)?.toDouble() ?? 0.85).clamp(0.20, 1.0),
-      actionSpacing:
-          ((map['actionSpacing'] as num?)?.toDouble() ?? 6.0).clamp(0.0, 24.0),
-      shoulderScale:
-          ((map['shoulderScale'] as num?)?.toDouble() ?? 1.0).clamp(0.65, 1.45),
-      shoulderOpacity:
-          ((map['shoulderOpacity'] as num?)?.toDouble() ?? 0.88).clamp(0.20, 1.0),
-      shoulderSpacing:
-          ((map['shoulderSpacing'] as num?)?.toDouble() ?? 2.0).clamp(0.0, 24.0),
+      gamepadScale: _asDouble(map, 'gamepadScale', 1.0).clamp(0.65, 1.45),
+      gamepadOpacity: _asDouble(map, 'gamepadOpacity', 0.82).clamp(0.20, 1.0),
+      dpadScale: _asDouble(map, 'dpadScale', 1.0).clamp(0.65, 1.45),
+      dpadOpacity: _asDouble(map, 'dpadOpacity', 0.85).clamp(0.20, 1.0),
+      dpadSpacing: _asDouble(map, 'dpadSpacing', 4.0).clamp(0.0, 24.0),
+      stickScale: _asDouble(map, 'stickScale', 1.0).clamp(0.65, 1.45),
+      stickOpacity: _asDouble(map, 'stickOpacity', 0.85).clamp(0.20, 1.0),
+      actionScale: _asDouble(map, 'actionScale', 1.0).clamp(0.65, 1.45),
+      actionOpacity: _asDouble(map, 'actionOpacity', 0.85).clamp(0.20, 1.0),
+      actionSpacing: _asDouble(map, 'actionSpacing', 6.0).clamp(0.0, 24.0),
+      shoulderScale: _asDouble(map, 'shoulderScale', 1.0).clamp(0.65, 1.45),
+      shoulderOpacity: _asDouble(map, 'shoulderOpacity', 0.88).clamp(0.20, 1.0),
+      shoulderSpacing: _asDouble(map, 'shoulderSpacing', 2.0).clamp(0.0, 24.0),
       selectStartScale:
-          ((map['selectStartScale'] as num?)?.toDouble() ?? 0.95).clamp(0.65, 1.45),
+          _asDouble(map, 'selectStartScale', 0.95).clamp(0.65, 1.45),
       selectStartOpacity:
-          ((map['selectStartOpacity'] as num?)?.toDouble() ?? 0.78).clamp(0.20, 1.0),
+          _asDouble(map, 'selectStartOpacity', 0.78).clamp(0.20, 1.0),
       selectStartSpacing:
-          ((map['selectStartSpacing'] as num?)?.toDouble() ?? 12.0).clamp(4.0, 48.0),
-      dpadLeft: ((map['dpadLeft'] as num?)?.toDouble() ?? 24.0).clamp(8.0, 420.0),
-      dpadBottom:
-          ((map['dpadBottom'] as num?)?.toDouble() ?? 32.0).clamp(8.0, 280.0),
-      stickLeft:
-          ((map['stickLeft'] as num?)?.toDouble() ?? 186.0).clamp(8.0, 460.0),
-      stickBottom:
-          ((map['stickBottom'] as num?)?.toDouble() ?? 24.0).clamp(8.0, 280.0),
-      actionRight:
-          ((map['actionRight'] as num?)?.toDouble() ?? 24.0).clamp(8.0, 420.0),
-      actionBottom:
-          ((map['actionBottom'] as num?)?.toDouble() ?? 32.0).clamp(8.0, 280.0),
-      shoulderTop:
-          ((map['shoulderTop'] as num?)?.toDouble() ?? 18.0).clamp(10.0, 200.0),
+          _asDouble(map, 'selectStartSpacing', 12.0).clamp(4.0, 48.0),
+      dpadLeft: _asDouble(map, 'dpadLeft', 24.0).clamp(8.0, 420.0),
+      dpadBottom: _asDouble(map, 'dpadBottom', 32.0).clamp(8.0, 280.0),
+      stickLeft: _asDouble(map, 'stickLeft', 186.0).clamp(8.0, 460.0),
+      stickBottom: _asDouble(map, 'stickBottom', 24.0).clamp(8.0, 280.0),
+      actionRight: _asDouble(map, 'actionRight', 24.0).clamp(8.0, 420.0),
+      actionBottom: _asDouble(map, 'actionBottom', 32.0).clamp(8.0, 280.0),
+      shoulderTop: _asDouble(map, 'shoulderTop', 18.0).clamp(10.0, 200.0),
       selectStartBottom:
-          ((map['selectStartBottom'] as num?)?.toDouble() ?? 14.0).clamp(6.0, 200.0),
-      rommServerUrl: (map['rommServerUrl'] as String?) ?? '',
-      rommApiToken: (map['rommApiToken'] as String?) ?? '',
-      customVulkanDriverDir: (map['customVulkanDriverDir'] as String?) ?? '',
-      customVulkanDriverName: (map['customVulkanDriverName'] as String?) ?? '',
-      customVulkanDriverLabel:
-          (map['customVulkanDriverLabel'] as String?) ?? '',
-      adrenoTurboMode: (map['adrenoTurboMode'] as bool?) ?? false,
+          _asDouble(map, 'selectStartBottom', 14.0).clamp(6.0, 200.0),
+      rommServerUrl: _asString(map, 'rommServerUrl', ''),
+      rommApiToken: _asString(map, 'rommApiToken', ''),
+      customVulkanDriverDir: _asString(map, 'customVulkanDriverDir', ''),
+      customVulkanDriverName: _asString(map, 'customVulkanDriverName', ''),
+      customVulkanDriverLabel: _asString(map, 'customVulkanDriverLabel', ''),
+      adrenoTurboMode: _asBool(map, 'adrenoTurboMode', false),
       freedrenoPreset: TurnipFreedrenoPreset.values.firstWhere(
         (e) => e.name == map['freedrenoPreset'],
         orElse: () => TurnipFreedrenoPreset.standard,

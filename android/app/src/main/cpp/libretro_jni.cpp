@@ -14,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -45,7 +46,8 @@ bool on_negotiation_iface(const void* iface, ANativeWindow* window);
 bool get_render_interface(void** out);
 void context_reset();
 void context_destroy();
-void begin_frame();
+bool begin_frame();
+void consume_signal_semaphore();
 void present(unsigned w, unsigned h);
 void shutdown_public();
 } // namespace vkfe
@@ -222,6 +224,7 @@ struct LibretroCoreSymbols {
 LibretroCoreSymbols g_core;
 ANativeWindow* g_window = nullptr;
 std::mutex g_mutex;
+std::mutex g_state_mutex;
 
 // Ring buffer de áudio de baixa latência (evita realocações e memmove por frame)
 constexpr size_t kAudioRingCapacity = 32768;
@@ -234,6 +237,31 @@ std::mutex g_audio_mutex;
 retro_pixel_format g_pixel_format = RETRO_PIXEL_FORMAT_RGB565;
 std::string g_system_dir;
 std::string g_saves_dir;
+
+bool jni_check_clear(JNIEnv* env, const char* tag) {
+  if (env && env->ExceptionCheck()) {
+    __android_log_print(ANDROID_LOG_WARN, "loopgamer-core",
+                        "Exceção JNI detectada em %s", tag ? tag : "unknown");
+    env->ExceptionClear();
+    return true;
+  }
+  return false;
+}
+
+bool jstring_to_std(JNIEnv* env, jstring jstr, std::string& out,
+                    const char* tag) {
+  out.clear();
+  if (!env || !jstr) return false;
+  const char* utf = env->GetStringUTFChars(jstr, nullptr);
+  if (jni_check_clear(env, tag) || !utf) {
+    if (utf) env->ReleaseStringUTFChars(jstr, utf);
+    return false;
+  }
+  out.assign(utf);
+  env->ReleaseStringUTFChars(jstr, utf);
+  jni_check_clear(env, tag);
+  return true;
+}
 
 std::atomic<uint32_t> g_joypad_mask{0};
 std::atomic<uint32_t> g_turbo_mask{0};
@@ -259,6 +287,8 @@ int g_sample_rate = 44100;
 // ---------------------------------------------------------------------------
 bool g_forceSoftwareCore = false;  // core deve renderizar por CPU
 bool g_gpuFailed = false;          // EGL indisponível → fallback CPU
+int g_gpuConsecutiveFailures = 0;
+uint32_t g_gpuRetryAfterFrame = 0;
 bool g_hwActive = false;           // core negociou HW render com sucesso
 bool g_hwCbActive = false;         // callbacks HW válidos neste load
 bool g_glReady = false;
@@ -343,6 +373,8 @@ std::atomic<bool> g_frameDup{false};
 std::atomic<bool> g_vsyncEnabled{false};
 std::atomic<bool> g_presentedThisStep{false};
 std::unordered_map<std::string, std::string> g_coreVars;
+std::set<std::string> g_returnedVarStrings;
+std::atomic<bool> g_coreVarsDirty{false};
 
 retro_proc_address_t resolve_gl_proc(const char* sym) {
   if (!sym) return nullptr;
@@ -476,58 +508,70 @@ void gl_release_context() {
 }
 
 void gl_shutdown() {
-  if (!g_glReady && g_eglDisplay == EGL_NO_DISPLAY) return;
-  if (g_eglDisplay != EGL_NO_DISPLAY && g_eglSurface != EGL_NO_SURFACE &&
-      g_eglContext != EGL_NO_CONTEXT) {
-    if (eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext) ==
-        EGL_TRUE) {
-      if (g_swTex != 0) glDeleteTextures(1, &g_swTex);
-      if (g_hwColorTex != 0) glDeleteTextures(1, &g_hwColorTex);
-      if (g_hwDepthRb != 0) glDeleteRenderbuffers(1, &g_hwDepthRb);
-      if (g_hwStencilRb != 0) glDeleteRenderbuffers(1, &g_hwStencilRb);
-      if (g_hwFbo != 0) glDeleteFramebuffers(1, &g_hwFbo);
-      if (g_blitVao != 0 && g_glDeleteVertexArrays) {
-        g_glDeleteVertexArrays(1, &g_blitVao);
+  if (g_glReady || g_eglDisplay != EGL_NO_DISPLAY) {
+    if (g_eglDisplay != EGL_NO_DISPLAY && g_eglSurface != EGL_NO_SURFACE &&
+        g_eglContext != EGL_NO_CONTEXT) {
+      if (eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface,
+                         g_eglContext) == EGL_TRUE) {
+        if (g_swTex != 0) glDeleteTextures(1, &g_swTex);
+        if (g_hwColorTex != 0) glDeleteTextures(1, &g_hwColorTex);
+        if (g_hwDepthRb != 0) glDeleteRenderbuffers(1, &g_hwDepthRb);
+        if (g_hwStencilRb != 0) glDeleteRenderbuffers(1, &g_hwStencilRb);
+        if (g_hwFbo != 0) glDeleteFramebuffers(1, &g_hwFbo);
+        if (g_blitVao != 0 && g_glDeleteVertexArrays) {
+          g_glDeleteVertexArrays(1, &g_blitVao);
+        }
+        if (g_blitVbo != 0) glDeleteBuffers(1, &g_blitVbo);
+        if (g_blitProgram != 0) glDeleteProgram(g_blitProgram);
+        glFinish();
       }
-      if (g_blitVbo != 0) glDeleteBuffers(1, &g_blitVbo);
-      if (g_blitProgram != 0) glDeleteProgram(g_blitProgram);
-      glFinish();
+      gl_release_context();
     }
-    gl_release_context();
+    g_swTex = g_hwColorTex = g_hwDepthRb = g_hwStencilRb = g_hwFbo =
+        g_blitVao = g_blitVbo = g_blitProgram = 0;
+    g_blitUScaleLoc = -1;
+    g_glGenVertexArrays = nullptr;
+    g_glDeleteVertexArrays = nullptr;
+    g_glBindVertexArray = nullptr;
+    g_glBindSampler = nullptr;
+    g_swTexW = g_swTexH = 0;
+    g_swPresentCount = 0;
+    g_swConvertBuf.clear();
+    g_appliedWindowFps = 0.0;
+    g_hwFboW = g_hwFboH = 0;
+    g_hwEverPresented = false;
+    g_hwPresentCount = 0;
+    g_lastLoggedGlErr = GL_NO_ERROR;
+    if (g_eglDisplay != EGL_NO_DISPLAY) {
+      if (g_eglSurface != EGL_NO_SURFACE) {
+        eglDestroySurface(g_eglDisplay, g_eglSurface);
+        g_eglSurface = EGL_NO_SURFACE;
+      }
+      if (g_eglContext != EGL_NO_CONTEXT) {
+        eglDestroyContext(g_eglDisplay, g_eglContext);
+        g_eglContext = EGL_NO_CONTEXT;
+      }
+      eglTerminate(g_eglDisplay);
+      g_eglDisplay = EGL_NO_DISPLAY;
+    }
+    g_glReady = false;
+    g_glThreadId = std::thread::id();
   }
-  g_swTex = g_hwColorTex = g_hwDepthRb = g_hwStencilRb = g_hwFbo =
-      g_blitVao = g_blitVbo = g_blitProgram = 0;
-  g_blitUScaleLoc = -1;
-  g_glGenVertexArrays = nullptr;
-  g_glDeleteVertexArrays = nullptr;
-  g_glBindVertexArray = nullptr;
-  g_glBindSampler = nullptr;
-  g_swTexW = g_swTexH = 0;
-  g_swPresentCount = 0;
-  g_swConvertBuf.clear();
-  g_appliedWindowFps = 0.0;
-  g_hwFboW = g_hwFboH = 0;
-  g_hwEverPresented = false;
-  g_hwPresentCount = 0;
-  g_lastLoggedGlErr = GL_NO_ERROR;
-  if (g_eglDisplay != EGL_NO_DISPLAY) {
-    if (g_eglSurface != EGL_NO_SURFACE) {
-      eglDestroySurface(g_eglDisplay, g_eglSurface);
-      g_eglSurface = EGL_NO_SURFACE;
-    }
-    if (g_eglContext != EGL_NO_CONTEXT) {
-      eglDestroyContext(g_eglDisplay, g_eglContext);
-      g_eglContext = EGL_NO_CONTEXT;
-    }
-    eglTerminate(g_eglDisplay);
-    g_eglDisplay = EGL_NO_DISPLAY;
+  if (g_libGles3) {
+    dlclose(g_libGles3);
+    g_libGles3 = nullptr;
   }
-  g_glReady = false;
-  g_glThreadId = std::thread::id();
 }
 
 bool gl_ensure_current() {
-  if (g_gpuFailed || !g_window) return false;
+  if (!g_window) return false;
+  const uint32_t curFrame = g_emu_frame_count.load(std::memory_order_relaxed);
+  if (g_gpuFailed) {
+    if (g_gpuConsecutiveFailures >= 3 || curFrame < g_gpuRetryAfterFrame) {
+      return false;
+    }
+    g_gpuFailed = false;
+  }
   if (g_glReady) {
     if (g_glThreadId == std::this_thread::get_id()) return true;
     if (eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext) ==
@@ -535,17 +579,31 @@ bool gl_ensure_current() {
       g_glThreadId = std::this_thread::get_id();
       return true;
     }
+    const EGLint err = eglGetError();
+    __android_log_print(ANDROID_LOG_WARN, "loopgamer-core",
+                        "eglMakeCurrent falhou (err=0x%x)", err);
+    if (err == EGL_CONTEXT_LOST || err == EGL_BAD_SURFACE ||
+        err == EGL_BAD_NATIVE_WINDOW || err == EGL_BAD_DISPLAY) {
+      gl_shutdown();
+      ++g_gpuConsecutiveFailures;
+      g_gpuRetryAfterFrame = curFrame + 60;
+      g_gpuFailed = true;
+    }
     return false;
   }
 
   g_eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
   if (g_eglDisplay == EGL_NO_DISPLAY) {
+    ++g_gpuConsecutiveFailures;
+    g_gpuRetryAfterFrame = curFrame + 60;
     g_gpuFailed = true;
     return false;
   }
   EGLint maj = 0, min = 0;
   if (!eglInitialize(g_eglDisplay, &maj, &min)) {
     g_eglDisplay = EGL_NO_DISPLAY;
+    ++g_gpuConsecutiveFailures;
+    g_gpuRetryAfterFrame = curFrame + 60;
     g_gpuFailed = true;
     return false;
   }
@@ -613,6 +671,8 @@ bool gl_ensure_current() {
   if (g_eglContext == EGL_NO_CONTEXT || g_eglSurface == EGL_NO_SURFACE) {
     eglTerminate(g_eglDisplay);
     g_eglDisplay = EGL_NO_DISPLAY;
+    ++g_gpuConsecutiveFailures;
+    g_gpuRetryAfterFrame = curFrame + 60;
     g_gpuFailed = true;
     return false;
   }
@@ -624,9 +684,12 @@ bool gl_ensure_current() {
 
   if (!init_blit_program()) {
     gl_shutdown();
+    ++g_gpuConsecutiveFailures;
+    g_gpuRetryAfterFrame = curFrame + 60;
     g_gpuFailed = true;
     return false;
   }
+  g_gpuConsecutiveFailures = 0;
   return true;
 }
 
@@ -703,19 +766,43 @@ void gl_draw_bound(GLuint tex, float uScale, float vScale, float vOffset,
 }
 
 void gl_finish_frame() {
-  eglSwapBuffers(g_eglDisplay, g_eglSurface);
+  if (!eglSwapBuffers(g_eglDisplay, g_eglSurface)) {
+    const EGLint err = eglGetError();
+    __android_log_print(ANDROID_LOG_WARN, "loopgamer-core",
+                        "eglSwapBuffers falhou (err=0x%x)", err);
+    if (err == EGL_CONTEXT_LOST || err == EGL_BAD_SURFACE ||
+        err == EGL_BAD_NATIVE_WINDOW) {
+      gl_shutdown();
+      ++g_gpuConsecutiveFailures;
+      g_gpuRetryAfterFrame =
+          g_emu_frame_count.load(std::memory_order_relaxed) + 30;
+      g_gpuFailed = true;
+    }
+    return;
+  }
+  g_gpuConsecutiveFailures = 0;
   g_presentedThisStep.store(true, std::memory_order_relaxed);
+  double fps = 60.0;
+  {
+    std::lock_guard<std::mutex> state_lock(g_state_mutex);
+    fps = g_target_fps;
+  }
   // Duplicação de frames: jogos a ~30fps passam a entregar 60 frames/s
-  if (g_frameDup.load(std::memory_order_relaxed) &&
-      g_target_fps <= 30.5) {
+  if (g_frameDup.load(std::memory_order_relaxed) && fps <= 30.5) {
     eglSwapBuffers(g_eglDisplay, g_eglSurface);
   }
 }
 
 bool hw_ensure_fbo() {
   if (!gl_ensure_current()) return false;
-  unsigned w = g_hwMaxW > 0 ? g_hwMaxW : (g_last_width > 0 ? g_last_width : 512);
-  unsigned h = g_hwMaxH > 0 ? g_hwMaxH : (g_last_height > 0 ? g_last_height : 512);
+  unsigned lastW = 512, lastH = 512;
+  {
+    std::lock_guard<std::mutex> state_lock(g_state_mutex);
+    lastW = g_last_width > 0 ? g_last_width : 512;
+    lastH = g_last_height > 0 ? g_last_height : 512;
+  }
+  unsigned w = g_hwMaxW > 0 ? g_hwMaxW : lastW;
+  unsigned h = g_hwMaxH > 0 ? g_hwMaxH : lastH;
   if (g_hwFbo != 0 && w == g_hwFboW && h == g_hwFboH) return true;
 
   if (g_hwFbo != 0) {
@@ -835,9 +922,19 @@ void present_hw_frame(unsigned width, unsigned height) {
   gl_finish_frame();
 }
 
-void present_sw_frame_gl(const void* data, unsigned w, unsigned h,
-                         size_t pitch) {
-  if (!gl_ensure_current()) return;
+bool present_sw_frame_gl(const void* data, unsigned w, unsigned h, size_t pitch,
+                         retro_pixel_format pixel_format) {
+  if (!data || w == 0 || h == 0) return false;
+  const bool isRgb565 = (pixel_format == RETRO_PIXEL_FORMAT_RGB565);
+  const bool isXrgb8888 = (pixel_format == RETRO_PIXEL_FORMAT_XRGB8888);
+  const bool is0Rgb1555 = (pixel_format == RETRO_PIXEL_FORMAT_0RGB1555);
+  if (!isRgb565 && !isXrgb8888 && !is0Rgb1555) return false;
+
+  const size_t srcBytesPerPx = isXrgb8888 ? sizeof(uint32_t) : sizeof(uint16_t);
+  if (static_cast<size_t>(w) > SIZE_MAX / srcBytesPerPx) return false;
+  if (pitch < static_cast<size_t>(w) * srcBytesPerPx) return false;
+
+  if (!gl_ensure_current()) return false;
 
   if (g_eglGlesVersion >= 3) {
     glBindBuffer(0x88EC /*GL_PIXEL_UNPACK_BUFFER*/, 0);
@@ -846,7 +943,7 @@ void present_sw_frame_gl(const void* data, unsigned w, unsigned h,
 
   // (Re)aloca a textura quando a resolução ou o pixel format do core mudam
   if (g_swTex == 0 || w != g_swTexW || h != g_swTexH ||
-      g_pixel_format != g_swTexFormat) {
+      pixel_format != g_swTexFormat) {
     if (g_swTex != 0) glDeleteTextures(1, &g_swTex);
     glGenTextures(1, &g_swTex);
     glBindTexture(GL_TEXTURE_2D, g_swTex);
@@ -854,44 +951,37 @@ void present_sw_frame_gl(const void* data, unsigned w, unsigned h,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    if (g_pixel_format == RETRO_PIXEL_FORMAT_RGB565) {
+    if (isRgb565) {
       // Adreno/GLES2+ exige GL_RGB (não GL_RGB565) em format/internalformat
       // combinado com GL_UNSIGNED_SHORT_5_6_5 para não retornar GL_INVALID_ENUM.
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, static_cast<GLsizei>(w),
                    static_cast<GLsizei>(h), 0, GL_RGB,
                    GL_UNSIGNED_SHORT_5_6_5, nullptr);
-    } else if (g_pixel_format == RETRO_PIXEL_FORMAT_XRGB8888 ||
-               g_pixel_format == RETRO_PIXEL_FORMAT_0RGB1555) {
+    } else {
       // Upload universal via GL_RGBA/GL_RGBA (XRGB8888 usa swizzle no shader;
       // 0RGB1555 é convertido em buffer compacto já em ordem RGBA).
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(w),
                    static_cast<GLsizei>(h), 0, GL_RGBA, GL_UNSIGNED_BYTE,
                    nullptr);
-    } else {
-      glDeleteTextures(1, &g_swTex);
-      g_swTex = 0;
-      return; // formato não suportado no upload GL → caller usa fallback CPU
     }
     g_swTexW = w;
     g_swTexH = h;
-    g_swTexFormat = g_pixel_format;
+    g_swTexFormat = pixel_format;
   }
 
   glBindTexture(GL_TEXTURE_2D, g_swTex);
-  const bool isRgb565 = (g_pixel_format == RETRO_PIXEL_FORMAT_RGB565);
-  const bool isXrgb8888 = (g_pixel_format == RETRO_PIXEL_FORMAT_XRGB8888);
   const uint8_t* uploadBytes = static_cast<const uint8_t*>(data);
   size_t uploadPitch = pitch;
 
-  if (g_pixel_format == RETRO_PIXEL_FORMAT_0RGB1555) {
+  if (is0Rgb1555) {
     const size_t totalPx = static_cast<size_t>(w) * static_cast<size_t>(h);
     if (g_swConvertBuf.size() < totalPx) {
       g_swConvertBuf.resize(totalPx);
     }
     const auto* srcBytes = static_cast<const uint8_t*>(data);
     for (unsigned y = 0; y < h; ++y) {
-      const auto* srcRow =
-          reinterpret_cast<const uint16_t*>(srcBytes + y * pitch);
+      const auto* srcRow = reinterpret_cast<const uint16_t*>(
+          srcBytes + static_cast<size_t>(y) * pitch);
       uint32_t* dstRow = g_swConvertBuf.data() + static_cast<size_t>(y) * w;
       for (unsigned x = 0; x < w; ++x) {
         const uint16_t px = srcRow[x];
@@ -929,7 +1019,7 @@ void present_sw_frame_gl(const void* data, unsigned w, unsigned h,
     for (unsigned y = 0; y < h; ++y) {
       glTexSubImage2D(GL_TEXTURE_2D, 0, 0, static_cast<GLsizei>(y),
                       static_cast<GLsizei>(w), 1, uploadFmt, uploadType,
-                      uploadBytes + y * uploadPitch);
+                      uploadBytes + static_cast<size_t>(y) * uploadPitch);
     }
   }
   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -945,78 +1035,133 @@ void present_sw_frame_gl(const void* data, unsigned w, unsigned h,
         "loopgamer-core",
         "SW GL present #%llu: frame=%ux%u pitch=%zu fmt=%d gles=%d err=0x%x",
         static_cast<unsigned long long>(g_swPresentCount),
-        w, h, pitch, static_cast<int>(g_pixel_format), g_eglGlesVersion, err);
+        w, h, pitch, static_cast<int>(pixel_format), g_eglGlesVersion, err);
   }
   gl_finish_frame();
+  return true;
 }
 
 // Fallback: caminho original via ANativeWindow_lock (lento, usado só se EGL falhar)
 void present_sw_frame_cpu(const void* data, unsigned width, unsigned height,
-                          size_t pitch) {
-  if (!g_window) return;
+                          size_t pitch, retro_pixel_format pixel_format) {
+  if (!g_window || !data || width == 0 || height == 0) return;
+  if (pixel_format != RETRO_PIXEL_FORMAT_RGB565 &&
+      pixel_format != RETRO_PIXEL_FORMAT_XRGB8888 &&
+      pixel_format != RETRO_PIXEL_FORMAT_0RGB1555) {
+    return;
+  }
+  const size_t src_bytes_per_px =
+      (pixel_format == RETRO_PIXEL_FORMAT_XRGB8888) ? sizeof(uint32_t)
+                                                    : sizeof(uint16_t);
+  if (static_cast<size_t>(width) > SIZE_MAX / src_bytes_per_px) return;
+  if (pitch < static_cast<size_t>(width) * src_bytes_per_px) return;
+
   const int32_t desired_format =
-      (g_pixel_format == RETRO_PIXEL_FORMAT_RGB565)
+      (pixel_format == RETRO_PIXEL_FORMAT_RGB565)
           ? WINDOW_FORMAT_RGB_565
           : WINDOW_FORMAT_RGBA_8888;
   if (width != g_configured_width || height != g_configured_height ||
       desired_format != g_configured_win_format) {
-    ANativeWindow_setBuffersGeometry(g_window, width, height, desired_format);
+    ANativeWindow_setBuffersGeometry(g_window, static_cast<int32_t>(width),
+                                     static_cast<int32_t>(height),
+                                     desired_format);
     g_configured_width = width;
     g_configured_height = height;
     g_configured_win_format = desired_format;
   }
-  ANativeWindow_Buffer buffer;
+  ANativeWindow_Buffer buffer{};
   if (ANativeWindow_lock(g_window, &buffer, nullptr) != 0) return;
+  if (!buffer.bits || buffer.width <= 0 || buffer.height <= 0 ||
+      buffer.stride < buffer.width) {
+    ANativeWindow_unlockAndPost(g_window);
+    return;
+  }
+  const unsigned copy_w =
+      std::min(width, static_cast<unsigned>(buffer.width));
+  const unsigned copy_h =
+      std::min(height, static_cast<unsigned>(buffer.height));
+  if (copy_w == 0 || copy_h == 0) {
+    ANativeWindow_unlockAndPost(g_window);
+    return;
+  }
+  const size_t dst_stride = static_cast<size_t>(buffer.stride);
   const auto* __restrict__ src_bytes = static_cast<const uint8_t*>(data);
-  if (desired_format == WINDOW_FORMAT_RGB_565) {
+
+  if (buffer.format == WINDOW_FORMAT_RGB_565 &&
+      pixel_format == RETRO_PIXEL_FORMAT_RGB565) {
     auto* __restrict__ dst_base = static_cast<uint16_t*>(buffer.bits);
-    if (buffer.stride == static_cast<int32_t>(width) &&
-        pitch == width * sizeof(uint16_t)) {
-      std::memcpy(dst_base, src_bytes, width * height * sizeof(uint16_t));
+    if (dst_stride == copy_w && copy_w == width &&
+        pitch == static_cast<size_t>(copy_w) * sizeof(uint16_t)) {
+      std::memcpy(dst_base, src_bytes,
+                  static_cast<size_t>(copy_w) * copy_h * sizeof(uint16_t));
     } else {
-      const size_t row_bytes = width * sizeof(uint16_t);
-      for (unsigned y = 0; y < height; ++y) {
-        std::memcpy(dst_base + y * buffer.stride,
-                    src_bytes + y * pitch, row_bytes);
+      const size_t row_bytes = static_cast<size_t>(copy_w) * sizeof(uint16_t);
+      for (unsigned y = 0; y < copy_h; ++y) {
+        std::memcpy(dst_base + static_cast<size_t>(y) * dst_stride,
+                    src_bytes + static_cast<size_t>(y) * pitch, row_bytes);
       }
     }
-  } else if (g_pixel_format == RETRO_PIXEL_FORMAT_XRGB8888) {
+  } else if (buffer.format == WINDOW_FORMAT_RGBA_8888 ||
+             buffer.format == WINDOW_FORMAT_RGBX_8888) {
     auto* __restrict__ dst_base = static_cast<uint32_t*>(buffer.bits);
-    for (unsigned y = 0; y < height; ++y) {
-      uint32_t* __restrict__ dst_row = dst_base + y * buffer.stride;
-      const auto* __restrict__ src_row =
-          reinterpret_cast<const uint32_t*>(src_bytes + y * pitch);
-      unsigned x = 0;
+    if (pixel_format == RETRO_PIXEL_FORMAT_XRGB8888) {
+      for (unsigned y = 0; y < copy_h; ++y) {
+        uint32_t* __restrict__ dst_row =
+            dst_base + static_cast<size_t>(y) * dst_stride;
+        const auto* __restrict__ src_row = reinterpret_cast<const uint32_t*>(
+            src_bytes + static_cast<size_t>(y) * pitch);
+        unsigned x = 0;
 #if defined(__aarch64__) || defined(__ARM_NEON)
-      for (; x + 15 < width; x += 16) {
-        uint8x16x4_t src =
-            vld4q_u8(reinterpret_cast<const uint8_t*>(src_row + x));
-        uint8x16x4_t dst;
-        dst.val[0] = src.val[2];
-        dst.val[1] = src.val[1];
-        dst.val[2] = src.val[0];
-        dst.val[3] = vdupq_n_u8(0xFF);
-        vst4q_u8(reinterpret_cast<uint8_t*>(dst_row + x), dst);
-      }
+        for (; x + 15 < copy_w; x += 16) {
+          uint8x16x4_t src =
+              vld4q_u8(reinterpret_cast<const uint8_t*>(src_row + x));
+          uint8x16x4_t dst;
+          dst.val[0] = src.val[2];
+          dst.val[1] = src.val[1];
+          dst.val[2] = src.val[0];
+          dst.val[3] = vdupq_n_u8(0xFF);
+          vst4q_u8(reinterpret_cast<uint8_t*>(dst_row + x), dst);
+        }
 #endif
-      for (; x < width; ++x) {
-        const uint32_t px = src_row[x];
-        dst_row[x] = 0xFF000000u | ((px & 0x000000FFu) << 16) |
-                     (px & 0x0000FF00u) | ((px & 0x00FF0000u) >> 16);
+        for (; x < copy_w; ++x) {
+          const uint32_t px = src_row[x];
+          dst_row[x] = 0xFF000000u | ((px & 0x000000FFu) << 16) |
+                       (px & 0x0000FF00u) | ((px & 0x00FF0000u) >> 16);
+        }
       }
-    }
-  } else {
-    auto* __restrict__ dst_base = static_cast<uint32_t*>(buffer.bits);
-    for (unsigned y = 0; y < height; ++y) {
-      uint32_t* __restrict__ dst_row = dst_base + y * buffer.stride;
-      const auto* __restrict__ src_row =
-          reinterpret_cast<const uint16_t*>(src_bytes + y * pitch);
-      for (unsigned x = 0; x < width; ++x) {
-        const uint16_t px = src_row[x];
-        const uint32_t r = ((px >> 10) & 0x1Fu) << 3;
-        const uint32_t g = ((px >> 5) & 0x1Fu) << 3;
-        const uint32_t b = (px & 0x1Fu) << 3;
-        dst_row[x] = 0xFF000000u | (b << 16) | (g << 8) | r;
+    } else if (pixel_format == RETRO_PIXEL_FORMAT_RGB565) {
+      for (unsigned y = 0; y < copy_h; ++y) {
+        uint32_t* __restrict__ dst_row =
+            dst_base + static_cast<size_t>(y) * dst_stride;
+        const auto* __restrict__ src_row = reinterpret_cast<const uint16_t*>(
+            src_bytes + static_cast<size_t>(y) * pitch);
+        for (unsigned x = 0; x < copy_w; ++x) {
+          const uint16_t px = src_row[x];
+          const uint32_t r5 = (px >> 11) & 0x1Fu;
+          const uint32_t g6 = (px >> 5) & 0x3Fu;
+          const uint32_t b5 = px & 0x1Fu;
+          const uint32_t r = (r5 << 3) | (r5 >> 2);
+          const uint32_t g = (g6 << 2) | (g6 >> 4);
+          const uint32_t b = (b5 << 3) | (b5 >> 2);
+          dst_row[x] = 0xFF000000u | (b << 16) | (g << 8) | r;
+        }
+      }
+    } else {
+      for (unsigned y = 0; y < copy_h; ++y) {
+        uint32_t* __restrict__ dst_row =
+            dst_base + static_cast<size_t>(y) * dst_stride;
+        const auto* __restrict__ src_row = reinterpret_cast<const uint16_t*>(
+            src_bytes + static_cast<size_t>(y) * pitch);
+        for (unsigned x = 0; x < copy_w; ++x) {
+          const uint16_t px = src_row[x];
+          const uint32_t r5 = (px >> 10) & 0x1Fu;
+          const uint32_t g5 = (px >> 5) & 0x1Fu;
+          const uint32_t b5 = px & 0x1Fu;
+          const uint32_t r = (r5 << 3) | (r5 >> 2);
+          const uint32_t g = (g5 << 3) | (g5 >> 2);
+          const uint32_t b = (b5 << 3) | (b5 >> 2);
+          dst_row[x] = 0xFF000000u | (b << 16) | (g << 8) | r;
+        }
       }
     }
   }
@@ -1044,9 +1189,16 @@ bool should_skip_present() {
   return skip > 0 && (++g_frame_counter % (skip + 1)) != 0;
 }
 
+const char* intern_var_string_locked(const std::string& val) {
+  auto res = g_returnedVarStrings.insert(val);
+  return res.first->c_str();
+}
+
 const char* get_core_variable(const char* key) {
   if (!key) return nullptr;
   const std::string_view k(key);
+
+  std::lock_guard<std::mutex> state_lock(g_state_mutex);
 
   // Garante fallback automático Vulkan → OpenGL ES (ou software se forçado)
   // quando o dispositivo não passa no probe Vulkan.
@@ -1055,7 +1207,7 @@ const char* get_core_variable(const char* key) {
     const auto it = g_coreVars.find(key);
     if (it != g_coreVars.end()) {
       if (it->second == "vulkan" && !vkfe::vulkan_requested()) return "opengl";
-      return it->second.c_str();
+      return intern_var_string_locked(it->second);
     }
     return vkfe::vulkan_requested() ? "vulkan" : "opengl";
   }
@@ -1065,7 +1217,7 @@ const char* get_core_variable(const char* key) {
 
   // Overrides vindos das configurações do usuário (k=v;k=v via JNI)
   const auto it = g_coreVars.find(key);
-  if (it != g_coreVars.end()) return it->second.c_str();
+  if (it != g_coreVars.end()) return intern_var_string_locked(it->second);
 
   // PPSSPP: Configurações de Máximo Desempenho (60 FPS) compatíveis com
   // libretro_core_options.h do PPSSPP upstream
@@ -1141,6 +1293,7 @@ bool environment_callback(unsigned cmd, void* data) {
     case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: {
       const auto* fmt = static_cast<const retro_pixel_format*>(data);
       if (fmt) {
+        std::lock_guard<std::mutex> state_lock(g_state_mutex);
         g_pixel_format = *fmt;
         return true;
       }
@@ -1160,7 +1313,12 @@ bool environment_callback(unsigned cmd, void* data) {
     }
     case RETRO_ENVIRONMENT_SET_HW_RENDER: {
       auto* cb = static_cast<retro_hw_render_callback*>(data);
-      if (!cb || g_forceSoftwareCore) return false;
+      bool forceSoftware = false;
+      {
+        std::lock_guard<std::mutex> state_lock(g_state_mutex);
+        forceSoftware = g_forceSoftwareCore;
+      }
+      if (!cb || forceSoftware) return false;
       const auto t = cb->context_type;
 
       // Vulkan: o core cria o VkDevice via negotiation interface; nós
@@ -1240,20 +1398,25 @@ bool environment_callback(unsigned cmd, void* data) {
     case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO: {
       const auto* av = static_cast<const retro_system_av_info*>(data);
       if (!av) return false;
-      if (av->geometry.base_width > 0 && av->geometry.base_height > 0) {
-        g_last_width = av->geometry.base_width;
-        g_last_height = av->geometry.base_height;
+      {
+        std::lock_guard<std::mutex> state_lock(g_state_mutex);
+        if (av->geometry.base_width > 0 && av->geometry.base_height > 0) {
+          g_last_width = av->geometry.base_width;
+          g_last_height = av->geometry.base_height;
+        }
+        if (av->timing.fps > 10.0) {
+          g_target_fps = av->timing.fps;
+        }
+        if (av->timing.sample_rate > 8000.0) {
+          g_sample_rate = static_cast<int>(av->timing.sample_rate);
+        }
       }
       if (av->geometry.max_width > 0 && av->geometry.max_height > 0) {
         g_hwMaxW = av->geometry.max_width;
         g_hwMaxH = av->geometry.max_height;
       }
       if (av->timing.fps > 10.0) {
-        g_target_fps = av->timing.fps;
-        apply_window_frame_rate(g_window, g_target_fps);
-      }
-      if (av->timing.sample_rate > 8000.0) {
-        g_sample_rate = static_cast<int>(av->timing.sample_rate);
+        apply_window_frame_rate(g_window, av->timing.fps);
       }
       return true;
     }
@@ -1261,6 +1424,7 @@ bool environment_callback(unsigned cmd, void* data) {
       const auto* geom = static_cast<const retro_game_geometry*>(data);
       if (!geom) return false;
       if (geom->base_width > 0 && geom->base_height > 0) {
+        std::lock_guard<std::mutex> state_lock(g_state_mutex);
         g_last_width = geom->base_width;
         g_last_height = geom->base_height;
       }
@@ -1281,6 +1445,7 @@ bool environment_callback(unsigned cmd, void* data) {
     case RETRO_ENVIRONMENT_SET_VARIABLE: {
       const auto* var = static_cast<const retro_variable*>(data);
       if (var && var->key && var->value) {
+        std::lock_guard<std::mutex> state_lock(g_state_mutex);
         g_coreVars[var->key] = var->value;
         return true;
       }
@@ -1298,7 +1463,10 @@ bool environment_callback(unsigned cmd, void* data) {
       return true;
     }
     case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE: {
-      if (data) *static_cast<bool*>(data) = false;
+      if (data) {
+        *static_cast<bool*>(data) =
+            g_coreVarsDirty.exchange(false, std::memory_order_acq_rel);
+      }
       return true;
     }
     case RETRO_ENVIRONMENT_SET_PERFORMANCE_LEVEL: {
@@ -1347,7 +1515,12 @@ bool environment_callback(unsigned cmd, void* data) {
       return true;
     }
     case RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER: {
-      if (!data || g_forceSoftwareCore) return false;
+      bool forceSoftware = false;
+      {
+        std::lock_guard<std::mutex> state_lock(g_state_mutex);
+        forceSoftware = g_forceSoftwareCore;
+      }
+      if (!data || forceSoftware) return false;
       auto* t = static_cast<int*>(data);
       if (vkfe::vulkan_requested()) {
         g_hwPreferredEs3 = false;
@@ -1394,17 +1567,24 @@ bool environment_callback(unsigned cmd, void* data) {
 
 void video_refresh_callback(const void* data, unsigned width, unsigned height, size_t pitch) {
   g_videoCbThisStep = true;
-  if (width == 0 || height == 0) return;
+  if (width == 0 || height == 0) {
+    if (vkfe::is_active()) vkfe::consume_signal_semaphore();
+    return;
+  }
 
-  g_last_width = width;
-  g_last_height = height;
+  {
+    std::lock_guard<std::mutex> state_lock(g_state_mutex);
+    g_last_width = width;
+    g_last_height = height;
+  }
 
   const bool is_hw_frame =
       data != nullptr &&
       reinterpret_cast<uintptr_t>(data) == ~static_cast<uintptr_t>(0);
   if (data == nullptr) {
     // Frame duplicado/pulo intencional pelo core (ex.: 30fps / AutoFrameSkip):
-    // SurfaceTexture mantém o frame anterior visível sem swap vazio.
+    // em Vulkan, sinaliza signalSem pendente conforme libretro_vulkan.h.
+    if (vkfe::is_active()) vkfe::consume_signal_semaphore();
     return;
   }
 
@@ -1423,18 +1603,23 @@ void video_refresh_callback(const void* data, unsigned width, unsigned height, s
     return;
   }
 
+  retro_pixel_format pixel_format;
+  {
+    std::lock_guard<std::mutex> state_lock(g_state_mutex);
+    pixel_format = g_pixel_format;
+  }
+
   // Caminho GPU: upload para textura + blit (RGB565 nativo, XRGB8888 via swizzle,
   // ou 0RGB1555 convertido em RGBA8888 compacto). Verifica formato ANTES de bind EGL
   // para não bloquear ANativeWindow_lock caso caia no fallback CPU.
   const bool format_ok =
-      g_pixel_format == RETRO_PIXEL_FORMAT_RGB565 ||
-      g_pixel_format == RETRO_PIXEL_FORMAT_XRGB8888 ||
-      g_pixel_format == RETRO_PIXEL_FORMAT_0RGB1555;
+      pixel_format == RETRO_PIXEL_FORMAT_RGB565 ||
+      pixel_format == RETRO_PIXEL_FORMAT_XRGB8888 ||
+      pixel_format == RETRO_PIXEL_FORMAT_0RGB1555;
   if (format_ok && gl_ensure_current() && g_blitProgram != 0) {
-    present_sw_frame_gl(data, width, height, pitch);
-    return;
+    if (present_sw_frame_gl(data, width, height, pitch, pixel_format)) return;
   }
-  present_sw_frame_cpu(data, width, height, pitch);
+  present_sw_frame_cpu(data, width, height, pitch, pixel_format);
 }
 
 inline void push_audio_sample_unlocked(int16_t s) {
@@ -1495,6 +1680,55 @@ int16_t input_state_callback(unsigned port, unsigned device, unsigned index, uns
   return 0;
 }
 
+void unload_core_locked() {
+  if (g_hwActive && g_hwCb.context_destroy) {
+    if (!g_hwIsVulkan && g_glReady) gl_ensure_current();
+    g_hwCb.context_destroy();
+  }
+  if (g_core.handle) {
+    if (g_core.retro_unload_game) g_core.retro_unload_game();
+    if (g_core.retro_deinit) g_core.retro_deinit();
+  }
+  // Vulkan: espera GPU idle, chama destroy_device (com o .so ainda carregado)
+  // e destrói swapchain/device/surface/instance.
+  vkfe::shutdown_public();
+  if (g_core.handle) {
+    dlclose(g_core.handle);
+    g_core = LibretroCoreSymbols{};
+  }
+  // Destrói objetos GL antes de liberar a janela
+  gl_shutdown();
+  g_gpuFailed = false;
+  g_gpuConsecutiveFailures = 0;
+  g_gpuRetryAfterFrame = 0;
+  g_hwCbActive = false;
+  g_hwActive = false;
+  g_hwIsVulkan = false;
+  g_hwCoreReset = nullptr;
+  g_hwCb = retro_hw_render_callback{};
+  g_configured_width = 0;
+  g_configured_height = 0;
+  g_configured_win_format = 0;
+  g_videoCbThisStep = false;
+  g_hwCbCalledThisStep = false;
+  g_hwEverPresented = false;
+  g_hwPresentCount = 0;
+  g_presentedThisStep.store(false, std::memory_order_relaxed);
+  if (g_window) {
+    ANativeWindow_release(g_window);
+    g_window = nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> state_lock(g_state_mutex);
+    g_returnedVarStrings.clear();
+    g_coreVarsDirty.store(false, std::memory_order_relaxed);
+  }
+  std::lock_guard<std::mutex> audio_lock(g_audio_mutex);
+  g_audio_read_idx = 0;
+  g_audio_write_idx = 0;
+  g_audio_count = 0;
+}
+
 }  // namespace
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -1508,32 +1742,56 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
     jobject surface_j) {
   std::lock_guard<std::mutex> lock(g_mutex);
 
-  const char* core_c = env->GetStringUTFChars(core_path_j, nullptr);
-  const char* rom_c = env->GetStringUTFChars(rom_path_j, nullptr);
-  const char* sys_c = env->GetStringUTFChars(system_dir_j, nullptr);
-  const char* sav_c = env->GetStringUTFChars(saves_dir_j, nullptr);
+  // Garante limpeza completa de sessão anterior antes de sobrescrever handles
+  unload_core_locked();
 
-  g_system_dir = sys_c;
-  g_saves_dir = sav_c;
-  std::string core_path(core_c);
-  std::string rom_path(rom_c);
+  if (!env || !surface_j) {
+    __android_log_print(ANDROID_LOG_ERROR, "loopgamer-core",
+                        "nativeLoadCoreAndRom: JNIEnv ou Surface nulo");
+    return JNI_FALSE;
+  }
 
-  env->ReleaseStringUTFChars(core_path_j, core_c);
-  env->ReleaseStringUTFChars(rom_path_j, rom_c);
-  env->ReleaseStringUTFChars(system_dir_j, sys_c);
-  env->ReleaseStringUTFChars(saves_dir_j, sav_c);
+  std::string core_path;
+  std::string rom_path;
+  std::string sys_dir;
+  std::string sav_dir;
+  if (!jstring_to_std(env, core_path_j, core_path, "nativeLoadCoreAndRom(core)") ||
+      !jstring_to_std(env, rom_path_j, rom_path, "nativeLoadCoreAndRom(rom)") ||
+      !jstring_to_std(env, system_dir_j, sys_dir, "nativeLoadCoreAndRom(sys)") ||
+      !jstring_to_std(env, saves_dir_j, sav_dir, "nativeLoadCoreAndRom(saves)") ||
+      core_path.empty() || rom_path.empty()) {
+    __android_log_print(ANDROID_LOG_ERROR, "loopgamer-core",
+                        "nativeLoadCoreAndRom: caminhos inválidos");
+    return JNI_FALSE;
+  }
+
+  g_window = ANativeWindow_fromSurface(env, surface_j);
+  if (jni_check_clear(env, "ANativeWindow_fromSurface") || !g_window) {
+    __android_log_print(ANDROID_LOG_ERROR, "loopgamer-core",
+                        "ANativeWindow_fromSurface retornou nullptr");
+    unload_core_locked();
+    return JNI_FALSE;
+  }
+
+  g_system_dir = std::move(sys_dir);
+  g_saves_dir = std::move(sav_dir);
 
   g_core.handle = dlopen(core_path.c_str(), RTLD_LAZY);
   if (!g_core.handle) {
     __android_log_print(ANDROID_LOG_ERROR, "loopgamer-core",
                         "dlopen failed for %s: %s", core_path.c_str(),
                         dlerror());
+    unload_core_locked();
     return JNI_FALSE;
   }
 
   #define LOAD_SYM(name) \
     g_core.name = reinterpret_cast<decltype(g_core.name)>(dlsym(g_core.handle, #name)); \
-    if (!g_core.name) { dlclose(g_core.handle); g_core.handle = nullptr; return JNI_FALSE; }
+    if (!g_core.name) { \
+      __android_log_print(ANDROID_LOG_ERROR, "loopgamer-core", "Missing symbol: %s", #name); \
+      unload_core_locked(); \
+      return JNI_FALSE; \
+    }
 
   LOAD_SYM(retro_init)
   LOAD_SYM(retro_deinit)
@@ -1554,12 +1812,13 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
   LOAD_SYM(retro_unserialize)
   #undef LOAD_SYM
 
-  g_window = ANativeWindow_fromSurface(env, surface_j);
   g_configured_width = 0;
   g_configured_height = 0;
   g_configured_win_format = 0;
   g_frame_counter = 0;
   g_gpuFailed = false;
+  g_gpuConsecutiveFailures = 0;
+  g_gpuRetryAfterFrame = 0;
   g_glReady = false;
   g_eglDisplay = EGL_NO_DISPLAY;
   g_eglSurface = EGL_NO_SURFACE;
@@ -1567,7 +1826,11 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
   // Tenta GLES3 primeiro (es3Candidates faz fallback automático para ES2),
   // habilitando GL_UNPACK_ROW_LENGTH (mGBA/SNES) e VAOs nos cores de software.
   g_eglGlesVersion = 3;
-  g_pixel_format = RETRO_PIXEL_FORMAT_0RGB1555;
+  {
+    std::lock_guard<std::mutex> state_lock(g_state_mutex);
+    g_pixel_format = RETRO_PIXEL_FORMAT_0RGB1555;
+    g_coreVarsDirty.store(false, std::memory_order_relaxed);
+  }
   g_swTexFormat = RETRO_PIXEL_FORMAT_RGB565;
   g_swPresentCount = 0;
   g_appliedWindowFps = 0.0;
@@ -1649,32 +1912,33 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
 
   if (!g_core.retro_load_game(&info)) {
     rom_buffer.clear();
-    if (g_core.retro_deinit) g_core.retro_deinit();
-    vkfe::shutdown_public();
-    gl_shutdown();
-    dlclose(g_core.handle);
-    g_core = LibretroCoreSymbols{};
-    if (g_window) {
-      ANativeWindow_release(g_window);
-      g_window = nullptr;
-    }
+    unload_core_locked();
     return JNI_FALSE;
   }
   rom_buffer.clear();
 
   retro_system_av_info av{};
   g_core.retro_get_system_av_info(&av);
-  if (av.geometry.base_width > 0 && av.geometry.base_height > 0) {
-    g_last_width = av.geometry.base_width;
-    g_last_height = av.geometry.base_height;
+  unsigned baseW = 480;
+  unsigned baseH = 272;
+  double targetFps = 60.0;
+  {
+    std::lock_guard<std::mutex> state_lock(g_state_mutex);
+    if (av.geometry.base_width > 0 && av.geometry.base_height > 0) {
+      g_last_width = av.geometry.base_width;
+      g_last_height = av.geometry.base_height;
+    }
+    baseW = g_last_width;
+    baseH = g_last_height;
+    if (av.timing.fps > 10.0) {
+      g_target_fps = av.timing.fps;
+    }
+    targetFps = g_target_fps;
+    if (av.timing.sample_rate > 8000.0) {
+      g_sample_rate = static_cast<int>(av.timing.sample_rate);
+    }
   }
-  if (av.timing.fps > 10.0) {
-    g_target_fps = av.timing.fps;
-  }
-  apply_window_frame_rate(g_window, g_target_fps);
-  if (av.timing.sample_rate > 8000.0) {
-    g_sample_rate = static_cast<int>(av.timing.sample_rate);
-  }
+  apply_window_frame_rate(g_window, targetFps);
   g_hwMaxW = av.geometry.max_width;
   g_hwMaxH = av.geometry.max_height;
 
@@ -1688,7 +1952,7 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
         __android_log_print(
             ANDROID_LOG_INFO, "loopgamer-core",
             "HW context_reset OK: Vulkan active (max=%ux%u base=%ux%u)",
-            g_hwMaxW, g_hwMaxH, g_last_width, g_last_height);
+            g_hwMaxW, g_hwMaxH, baseW, baseH);
       } else {
         __android_log_print(ANDROID_LOG_WARN, "loopgamer-core",
                             "HW context_reset skipped: Vulkan not active");
@@ -1702,7 +1966,7 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
       __android_log_print(
           ANDROID_LOG_INFO, "loopgamer-core",
           "HW context_reset OK: GLES%d active (max=%ux%u base=%ux%u)",
-          g_eglGlesVersion, g_hwMaxW, g_hwMaxH, g_last_width, g_last_height);
+          g_eglGlesVersion, g_hwMaxW, g_hwMaxH, baseW, baseH);
     } else {
       __android_log_print(ANDROID_LOG_WARN, "loopgamer-core",
                           "HW context_reset failed: gl_ensure_current false");
@@ -1711,7 +1975,7 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadCoreAndRom(
     }
   }
 
-  // O contexto EGL pode ter sido criado na thread principal durante
+  // O contexto EGL pode ter sido criado na thread principal/IO durante
   // retro_load_game / context_reset. Libera para a thread de emulação
   // poder fazer eglMakeCurrent.
   if (g_glReady) {
@@ -1725,18 +1989,19 @@ extern "C" JNIEXPORT void JNICALL
 Java_org_loopgamer_emulator_MainActivity_nativeStepFrame(JNIEnv*, jobject) {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (g_core.handle && g_core.retro_run) {
-    g_emu_frame_count.fetch_add(1, std::memory_order_relaxed);
-    g_videoCbThisStep = false;
-    g_hwCbCalledThisStep = false;
-    g_presentedThisStep.store(false, std::memory_order_relaxed);
     // Vulkan: adquire a próxima imagem do swapchain antes do retro_run
-    // (get_sync_index do core precisa retornar um índice válido durante o run)
+    // (get_sync_index do core precisa retornar um índice válido durante o run).
+    // Se acquire falhar, não avança retro_run() dessincronizado do swapchain.
     if (vkfe::is_active()) {
-      vkfe::begin_frame();
+      if (!vkfe::begin_frame()) return;
     } else if (g_hwCbActive) {
       // Se o core usa HW render GL, o contexto EGL precisa estar current
       gl_ensure_current();
     }
+    g_emu_frame_count.fetch_add(1, std::memory_order_relaxed);
+    g_videoCbThisStep = false;
+    g_hwCbCalledThisStep = false;
+    g_presentedThisStep.store(false, std::memory_order_relaxed);
     g_core.retro_run();
     // Fallback apenas se o core desenhou no FBO HW mas não chamou video_refresh
     // (nunca força swap em frames anulados via video_refresh(nullptr)).
@@ -1746,8 +2011,24 @@ Java_org_loopgamer_emulator_MainActivity_nativeStepFrame(JNIEnv*, jobject) {
         g_hwEverPresented &&
         !g_presentedThisStep.load(std::memory_order_relaxed) &&
         g_hwColorTex != 0) {
-      present_hw_frame(g_last_width, g_last_height);
+      unsigned lastW = 480, lastH = 272;
+      {
+        std::lock_guard<std::mutex> state_lock(g_state_mutex);
+        lastW = g_last_width;
+        lastH = g_last_height;
+      }
+      present_hw_frame(lastW, lastH);
     }
+  }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_loopgamer_emulator_MainActivity_nativeReleaseRenderThreadContext(
+    JNIEnv*, jobject) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (g_eglDisplay != EGL_NO_DISPLAY &&
+      g_glThreadId == std::this_thread::get_id()) {
+    gl_release_context();
   }
 }
 
@@ -1767,28 +2048,35 @@ Java_org_loopgamer_emulator_MainActivity_nativeSetFrameSkip(
 extern "C" JNIEXPORT jint JNICALL
 Java_org_loopgamer_emulator_MainActivity_nativeDrainAudioBuffer(
     JNIEnv* env, jobject, jshortArray out_pcm) {
+  if (!env || !out_pcm) return 0;
   std::lock_guard<std::mutex> lock(g_audio_mutex);
   if (g_audio_count == 0) return 0;
   const jsize cap = env->GetArrayLength(out_pcm);
+  if (jni_check_clear(env, "nativeDrainAudioBuffer(GetArrayLength)") || cap <= 0) {
+    return 0;
+  }
   const size_t count = std::min(static_cast<size_t>(cap), g_audio_count);
 
   int16_t temp[4096];
   const size_t batch = std::min(count, static_cast<size_t>(4096));
   for (size_t i = 0; i < batch; ++i) {
-    temp[i] = g_audio_ring[g_audio_read_idx];
-    g_audio_read_idx = (g_audio_read_idx + 1) & (kAudioRingCapacity - 1);
+    temp[i] = g_audio_ring[(g_audio_read_idx + i) & (kAudioRingCapacity - 1)];
   }
-  g_audio_count -= batch;
   env->SetShortArrayRegion(out_pcm, 0, static_cast<jsize>(batch), temp);
+  if (jni_check_clear(env, "nativeDrainAudioBuffer(SetShortArrayRegion)")) {
+    return 0;
+  }
+  g_audio_read_idx = (g_audio_read_idx + batch) & (kAudioRingCapacity - 1);
+  g_audio_count -= batch;
   return static_cast<jint>(batch);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_loopgamer_emulator_MainActivity_nativeSetCoreOptions(
     JNIEnv* env, jobject, jstring options_j) {
-  if (!options_j) return;
-  const char* opts = env->GetStringUTFChars(options_j, nullptr);
-  if (!opts) return;
+  if (!env || !options_j) return;
+  std::string opts;
+  if (!jstring_to_std(env, options_j, opts, "nativeSetCoreOptions")) return;
   std::unordered_map<std::string, std::string> parsed;
   std::string_view sv(opts);
   size_t pos = 0;
@@ -1805,14 +2093,18 @@ Java_org_loopgamer_emulator_MainActivity_nativeSetCoreOptions(
     if (semi == std::string_view::npos) break;
     pos = semi + 1;
   }
-  env->ReleaseStringUTFChars(options_j, opts);
+  std::lock_guard<std::mutex> state_lock(g_state_mutex);
   g_coreVars = std::move(parsed);
+  g_coreVarsDirty.store(true, std::memory_order_release);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_loopgamer_emulator_MainActivity_nativeSetRendererMode(
     JNIEnv*, jobject, jboolean software) {
-  g_forceSoftwareCore = software == JNI_TRUE;
+  {
+    std::lock_guard<std::mutex> state_lock(g_state_mutex);
+    g_forceSoftwareCore = (software == JNI_TRUE);
+  }
   vkfe::set_backend(software == JNI_TRUE ? 1 : 0);
 }
 
@@ -1825,17 +2117,15 @@ Java_org_loopgamer_emulator_MainActivity_nativeSetCustomVulkanDriver(
     jstring drv_dir_j,
     jstring drv_name_j,
     jboolean turbo) {
-  auto to_std = [env](jstring s) -> std::string {
-    if (!s) return {};
-    const char* c = env->GetStringUTFChars(s, nullptr);
-    std::string out = c ? c : "";
-    if (c) env->ReleaseStringUTFChars(s, c);
+  auto to_std = [env](jstring s, const char* tag) -> std::string {
+    std::string out;
+    if (s) jstring_to_std(env, s, out, tag);
     return out;
   };
-  const std::string hookDir = to_std(hook_dir_j);
-  const std::string tmpDir = to_std(tmp_dir_j);
-  const std::string drvDir = to_std(drv_dir_j);
-  const std::string drvName = to_std(drv_name_j);
+  const std::string hookDir = to_std(hook_dir_j, "customDriver(hook)");
+  const std::string tmpDir = to_std(tmp_dir_j, "customDriver(tmp)");
+  const std::string drvDir = to_std(drv_dir_j, "customDriver(dir)");
+  const std::string drvName = to_std(drv_name_j, "customDriver(name)");
   vkfe::set_custom_driver(hookDir.c_str(), tmpDir.c_str(), drvDir.c_str(),
                           drvName.c_str(), turbo == JNI_TRUE);
 }
@@ -1843,13 +2133,11 @@ Java_org_loopgamer_emulator_MainActivity_nativeSetCustomVulkanDriver(
 extern "C" JNIEXPORT void JNICALL
 Java_org_loopgamer_emulator_MainActivity_nativeSetFreedrenoPreset(
     JNIEnv* env, jobject, jstring preset_j) {
-  if (!preset_j) {
-    vkfe::set_freedreno_preset("");
-    return;
+  std::string preset;
+  if (env && preset_j) {
+    jstring_to_std(env, preset_j, preset, "nativeSetFreedrenoPreset");
   }
-  const char* c = env->GetStringUTFChars(preset_j, nullptr);
-  vkfe::set_freedreno_preset(c ? c : "");
-  if (c) env->ReleaseStringUTFChars(preset_j, c);
+  vkfe::set_freedreno_preset(preset.c_str());
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1857,6 +2145,7 @@ Java_org_loopgamer_emulator_MainActivity_nativeSetGpuBackend(
     JNIEnv*, jobject, jint mode) {
   // 0 = OpenGL ES, 1 = software CPU, 2 = Vulkan
   vkfe::set_backend(mode);
+  std::lock_guard<std::mutex> state_lock(g_state_mutex);
   g_forceSoftwareCore = (mode == 1);
 }
 
@@ -1879,11 +2168,13 @@ Java_org_loopgamer_emulator_MainActivity_nativeSetVsync(
 
 extern "C" JNIEXPORT jint JNICALL
 Java_org_loopgamer_emulator_MainActivity_nativeGetSampleRate(JNIEnv*, jobject) {
+  std::lock_guard<std::mutex> state_lock(g_state_mutex);
   return static_cast<jint>(g_sample_rate);
 }
 
 extern "C" JNIEXPORT jdouble JNICALL
 Java_org_loopgamer_emulator_MainActivity_nativeGetTargetFps(JNIEnv*, jobject) {
+  std::lock_guard<std::mutex> state_lock(g_state_mutex);
   return static_cast<jdouble>(g_target_fps);
 }
 
@@ -1899,17 +2190,34 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_org_loopgamer_emulator_MainActivity_nativeSaveState(
     JNIEnv* env, jobject, jstring path_j) {
   std::lock_guard<std::mutex> lock(g_mutex);
-  if (!g_core.handle || !g_core.retro_serialize_size) return JNI_FALSE;
-  size_t sz = g_core.retro_serialize_size();
+  if (!g_core.handle || !g_core.retro_serialize_size || !g_core.retro_serialize) {
+    return JNI_FALSE;
+  }
+  std::string path;
+  if (!jstring_to_std(env, path_j, path, "nativeSaveState") || path.empty()) {
+    return JNI_FALSE;
+  }
+  const size_t sz = g_core.retro_serialize_size();
   if (sz == 0) return JNI_FALSE;
   std::vector<uint8_t> buf(sz);
   if (!g_core.retro_serialize(buf.data(), sz)) return JNI_FALSE;
 
-  const char* path_c = env->GetStringUTFChars(path_j, nullptr);
-  std::ofstream ofs(path_c, std::ios::binary);
-  env->ReleaseStringUTFChars(path_j, path_c);
+  const std::string tmp_path = path + ".tmp";
+  std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
   if (!ofs) return JNI_FALSE;
-  ofs.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(sz));
+  ofs.write(reinterpret_cast<const char*>(buf.data()),
+            static_cast<std::streamsize>(sz));
+  ofs.flush();
+  const bool write_ok = static_cast<bool>(ofs) && !ofs.fail();
+  ofs.close();
+  if (!write_ok) {
+    std::remove(tmp_path.c_str());
+    return JNI_FALSE;
+  }
+  if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+    std::remove(tmp_path.c_str());
+    return JNI_FALSE;
+  }
   return JNI_TRUE;
 }
 
@@ -1918,59 +2226,38 @@ Java_org_loopgamer_emulator_MainActivity_nativeLoadState(
     JNIEnv* env, jobject, jstring path_j) {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (!g_core.handle || !g_core.retro_unserialize) return JNI_FALSE;
+  std::string path;
+  if (!jstring_to_std(env, path_j, path, "nativeLoadState") || path.empty()) {
+    return JNI_FALSE;
+  }
 
-  const char* path_c = env->GetStringUTFChars(path_j, nullptr);
-  std::ifstream ifs(path_c, std::ios::binary | std::ios::ate);
-  env->ReleaseStringUTFChars(path_j, path_c);
+  std::ifstream ifs(path, std::ios::binary | std::ios::ate);
   if (!ifs) return JNI_FALSE;
-  auto sz = ifs.tellg();
+  const std::streamoff sz = ifs.tellg();
+  constexpr std::streamoff kMaxStateBytes = 256LL * 1024LL * 1024LL;
+  if (sz <= 0 || sz > kMaxStateBytes) return JNI_FALSE;
   ifs.seekg(0, std::ios::beg);
   std::vector<uint8_t> buf(static_cast<size_t>(sz));
-  ifs.read(reinterpret_cast<char*>(buf.data()), sz);
+  if (!ifs.read(reinterpret_cast<char*>(buf.data()), sz) || ifs.gcount() != sz) {
+    return JNI_FALSE;
+  }
   return g_core.retro_unserialize(buf.data(), buf.size()) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jint JNICALL
 Java_org_loopgamer_emulator_MainActivity_nativeGetFrameWidth(JNIEnv*, jobject) {
+  std::lock_guard<std::mutex> state_lock(g_state_mutex);
   return static_cast<jint>(g_last_width);
 }
 
 extern "C" JNIEXPORT jint JNICALL
 Java_org_loopgamer_emulator_MainActivity_nativeGetFrameHeight(JNIEnv*, jobject) {
+  std::lock_guard<std::mutex> state_lock(g_state_mutex);
   return static_cast<jint>(g_last_height);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_loopgamer_emulator_MainActivity_nativeUnloadCore(JNIEnv*, jobject) {
   std::lock_guard<std::mutex> lock(g_mutex);
-  if (g_hwActive && g_hwCb.context_destroy) {
-    if (!g_hwIsVulkan && g_glReady) gl_ensure_current();
-    g_hwCb.context_destroy();
-  }
-  if (g_core.handle) {
-    if (g_core.retro_unload_game) g_core.retro_unload_game();
-    if (g_core.retro_deinit) g_core.retro_deinit();
-  }
-  // Vulkan: espera GPU idle, chama destroy_device (com o .so ainda carregado)
-  // e destrói swapchain/device/surface/instance.
-  vkfe::shutdown_public();
-  if (g_core.handle) {
-    dlclose(g_core.handle);
-    g_core = LibretroCoreSymbols{};
-  }
-  // Destrói objetos GL antes de liberar a janela
-  gl_shutdown();
-  g_hwCbActive = false;
-  g_hwActive = false;
-  g_hwIsVulkan = false;
-  g_hwCoreReset = nullptr;
-  g_hwCb = retro_hw_render_callback{};
-  if (g_window) {
-    ANativeWindow_release(g_window);
-    g_window = nullptr;
-  }
-  std::lock_guard<std::mutex> audio_lock(g_audio_mutex);
-  g_audio_read_idx = 0;
-  g_audio_write_idx = 0;
-  g_audio_count = 0;
+  unload_core_locked();
 }

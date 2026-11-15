@@ -24,9 +24,12 @@ class PlaytimeRecord {
       };
 
   factory PlaytimeRecord.fromJson(Map<String, dynamic> m) => PlaytimeRecord(
-        totalSeconds: (m['totalSeconds'] as num?)?.toInt() ?? 0,
-        lastPlayed: DateTime.tryParse((m['lastPlayed'] as String?) ?? ''),
-        sessions: (m['sessions'] as num?)?.toInt() ?? 0,
+        totalSeconds:
+            m['totalSeconds'] is num ? (m['totalSeconds'] as num).toInt() : 0,
+        lastPlayed: DateTime.tryParse(
+          m['lastPlayed'] is String ? m['lastPlayed'] as String : '',
+        ),
+        sessions: m['sessions'] is num ? (m['sessions'] as num).toInt() : 0,
       );
 }
 
@@ -53,6 +56,8 @@ String formatLastPlayed(DateTime? when, {DateTime? now}) {
 }
 
 class UserLibraryMeta {
+  static const int currentSchemaVersion = 1;
+
   const UserLibraryMeta({
     this.favorites = const {},
     this.collections = const {},
@@ -166,6 +171,7 @@ class UserLibraryMeta {
   }
 
   Map<String, dynamic> toJson() => {
+        'version': currentSchemaVersion,
         'favorites': favorites.toList(),
         'collections': collections,
         'playtime': {
@@ -174,10 +180,10 @@ class UserLibraryMeta {
       };
 
   factory UserLibraryMeta.fromJson(Map<String, dynamic> m) {
-    final favs = ((m['favorites'] as List?) ?? const [])
-        .whereType<num>()
-        .map((e) => e.toInt())
-        .toSet();
+    final rawFavs = m['favorites'];
+    final favs = rawFavs is List
+        ? rawFavs.whereType<num>().map((e) => e.toInt()).toSet()
+        : <int>{};
     final cols = <String, List<int>>{};
     final rawCols = m['collections'];
     if (rawCols is Map) {
@@ -192,8 +198,11 @@ class UserLibraryMeta {
     if (rawPt is Map) {
       rawPt.forEach((k, v) {
         final id = int.tryParse('$k');
-        if (id != null && v is Map<String, dynamic>) {
-          pt[id] = PlaytimeRecord.fromJson(v);
+        if (id != null && v is Map) {
+          final normalized = <String, dynamic>{
+            for (final entry in v.entries) '${entry.key}': entry.value,
+          };
+          pt[id] = PlaytimeRecord.fromJson(normalized);
         }
       });
     }

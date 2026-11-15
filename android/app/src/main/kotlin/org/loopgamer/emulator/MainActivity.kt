@@ -7,6 +7,7 @@ import android.media.AudioTrack
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
+import android.util.Log
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -18,13 +19,18 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.LockSupport
 
 class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
     companion object {
+        private const val TAG = "LoopGamerMain"
         private const val METHOD_CHANNEL = "org.loopgamer.libretro/methods"
         private const val EVENT_CHANNEL = "org.loopgamer.libretro/events"
 
@@ -65,13 +71,24 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         }
     }
 
-    private var surfaceEntry: TextureRegistry.SurfaceTextureEntry? = null
-    private var surfaceTexture: SurfaceTexture? = null
-    private var renderSurface: Surface? = null
-    private var audioTrack: AudioTrack? = null
-    private var emuThread: Thread? = null
+    @Volatile private var surfaceEntry: TextureRegistry.SurfaceTextureEntry? = null
+    @Volatile private var surfaceTexture: SurfaceTexture? = null
+    @Volatile private var renderSurface: Surface? = null
+    @Volatile private var audioTrack: AudioTrack? = null
+    private val audioLock = Any()
+
+    @Volatile private var emuThread: Thread? = null
     private val isRunning = AtomicBoolean(false)
     private val isPaused = AtomicBoolean(false)
+    private val userPaused = AtomicBoolean(false)
+    private val lifecyclePaused = AtomicBoolean(false)
+    private val isActivityResumed = AtomicBoolean(false)
+    private val sessionToken = AtomicLong(0)
+
+    private val nativeExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "LibretroNativeIO")
+    }
+
     private val vsyncEnabledFlag = AtomicBoolean(false)
     private val audioEnabledFlag = AtomicBoolean(true)
     @Volatile private var masterVolumeLevel: Float = 0.85f
@@ -82,31 +99,36 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     @Volatile private var singleTriggerPlatform: Boolean = false
     private val leftStickX = AtomicInteger(0)
     private val leftStickY = AtomicInteger(0)
-    private var currentSavesDir: String = ""
-    private var currentRomBaseName: String = "slot"
-    private var eventSink: EventChannel.EventSink? = null
+    @Volatile private var currentSavesDir: String = ""
+    @Volatile private var currentRomBaseName: String = "slot"
+    @Volatile private var currentSessionTitle: String = "LoopGamer"
+    @Volatile private var eventSink: EventChannel.EventSink? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var methodChannel: MethodChannel? = null
+    private var eventChannel: EventChannel? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        MethodChannel(
+        methodChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             METHOD_CHANNEL
-        ).setMethodCallHandler(this)
+        ).also { it.setMethodCallHandler(this) }
 
-        EventChannel(
+        eventChannel = EventChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             EVENT_CHANNEL
-        ).setStreamHandler(object : EventChannel.StreamHandler {
-            override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-                eventSink = events
-            }
+        ).also {
+            it.setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    eventSink = events
+                }
 
-            override fun onCancel(arguments: Any?) {
-                eventSink = null
-            }
-        })
+                override fun onCancel(arguments: Any?) {
+                    eventSink = null
+                }
+            })
+        }
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -116,7 +138,6 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 val romPath = call.argument<String>("romPath")
                 val systemDir = call.argument<String>("systemDir") ?: filesDir.absolutePath
                 val savesDir = call.argument<String>("savesDir") ?: filesDir.absolutePath
-                val scale = (call.argument<Int>("resolutionScale") ?: 2).coerceIn(1, 10)
                 val frameSkip = (call.argument<Int>("frameSkip") ?: 0).coerceIn(0, 3)
                 val vsync = call.argument<Boolean>("vsyncEnabled") ?: false
                 val audEnabled = call.argument<Boolean>("audioEnabled") ?: true
@@ -131,53 +152,33 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 }
                 val screenScale = (call.argument<Int>("screenScale") ?: 1).coerceIn(1, 4)
                 val frameDup = call.argument<Boolean>("frameDup") ?: false
-                val coreOptions = call.argument<String>("coreOptions")
+                val coreOptions = call.argument<String>("coreOptions") ?: ""
                 val customDriverDir = call.argument<String>("customDriverDir") ?: ""
                 val customDriverName = call.argument<String>("customDriverName") ?: ""
                 val adrenoTurbo = call.argument<Boolean>("adrenoTurbo") ?: false
                 val freedrenoPreset = call.argument<String>("freedrenoPreset") ?: ""
+                val platform = call.argument<String>("platform")?.lowercase() ?: ""
 
                 if (corePath.isNullOrEmpty() || romPath.isNullOrEmpty()) {
                     result.error("INVALID_ARGS", "corePath e romPath são obrigatórios.", null)
                     return
                 }
 
-                val hookLibDir = applicationInfo.nativeLibraryDir + "/"
-                val tmpDir = File(cacheDir, "adrenotools_tmp").apply { mkdirs() }.absolutePath + "/"
-                nativeSetCustomVulkanDriver(
-                    hookLibDir,
-                    tmpDir,
-                    customDriverDir,
-                    customDriverName,
-                    adrenoTurbo
-                )
-                nativeSetFreedrenoPreset(freedrenoPreset)
+                val engine = flutterEngine
+                if (engine == null) {
+                    result.error("ENGINE_UNAVAILABLE", "FlutterEngine indisponível.", null)
+                    return
+                }
 
-                vsyncEnabledFlag.set(vsync)
-                audioEnabledFlag.set(audEnabled)
-                masterVolumeLevel = audVolume
-                nativeSetFrameSkip(frameSkip)
-                nativeSetGpuBackend(backendMode)
-                nativeSetFrameDup(frameDup)
-                nativeSetVsync(vsync)
-                nativeSetCoreOptions(coreOptions ?: "")
-
-                stopLibretroLoop()
-
-                val entry = flutterEngine!!.renderer.createSurfaceTexture()
+                val entry = engine.renderer.createSurfaceTexture()
                 val st = entry.surfaceTexture()
-                surfaceTexture = st
-                val platform = call.argument<String>("platform")?.lowercase() ?: ""
                 val romLower = romPath.lowercase()
                 val isPs1 = platform == "ps1" || platform == "psx"
                 val isPsp = platform == "psp" ||
                     romLower.endsWith(".iso") ||
                     romLower.endsWith(".cso") ||
                     (!isPs1 && (romLower.endsWith(".pbp") || romLower.endsWith(".chd")))
-                singleTriggerPlatform = platform in SINGLE_TRIGGER_PLATFORMS || isPsp
-                touchJoypadMask.set(0)
-                hardwareJoypadMask.set(0)
-                hardwareAxisMask.set(0)
+
                 val initW = when {
                     isPsp -> (480 * screenScale).coerceIn(64, 4096)
                     isPs1 -> maxOf(320 * screenScale, 640).coerceIn(64, 4096)
@@ -191,43 +192,112 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 st.setDefaultBufferSize(initW, initH)
                 val surface = Surface(st)
 
-                surfaceEntry = entry
-                renderSurface = surface
-                currentSavesDir = savesDir
-                currentRomBaseName = File(romPath).nameWithoutExtension
+                val hookLibDir = applicationInfo.nativeLibraryDir + "/"
+                val tmpDir = File(cacheDir, "adrenotools_tmp").apply { mkdirs() }.absolutePath + "/"
 
-                val loaded = nativeLoadCoreAndRom(
-                    corePath,
-                    romPath,
-                    systemDir,
-                    savesDir,
-                    surface
-                )
-                if (!loaded) {
-                    surface.release()
-                    entry.release()
-                    surfaceEntry = null
-                    renderSurface = null
-                    surfaceTexture = null
-                    result.error("CORE_LOAD_FAILED", "Falha ao carregar motor ou ROM.", null)
-                    return
+                val myToken = sessionToken.incrementAndGet()
+                // Sinaliza interrupção imediata para qualquer loop em execução
+                isRunning.set(false)
+
+                nativeExecutor.execute {
+                    stopLibretroLoopInternal()
+
+                    if (sessionToken.get() != myToken || isFinishing || isDestroyed) {
+                        surface.release()
+                        releaseSurfaceEntryOnMain(entry)
+                        mainHandler.post {
+                            result.error("SESSION_CANCELLED", "Sessão cancelada antes de iniciar.", null)
+                        }
+                        return@execute
+                    }
+
+                    // Opções nativas aplicadas APÓS parar a sessão anterior
+                    nativeSetCustomVulkanDriver(
+                        hookLibDir,
+                        tmpDir,
+                        customDriverDir,
+                        customDriverName,
+                        adrenoTurbo
+                    )
+                    nativeSetFreedrenoPreset(freedrenoPreset)
+
+                    vsyncEnabledFlag.set(vsync)
+                    audioEnabledFlag.set(audEnabled)
+                    masterVolumeLevel = audVolume
+                    nativeSetFrameSkip(frameSkip)
+                    nativeSetGpuBackend(backendMode)
+                    nativeSetFrameDup(frameDup)
+                    nativeSetVsync(vsync)
+                    nativeSetCoreOptions(coreOptions)
+
+                    singleTriggerPlatform = platform in SINGLE_TRIGGER_PLATFORMS || isPsp
+                    touchJoypadMask.set(0)
+                    hardwareJoypadMask.set(0)
+                    hardwareAxisMask.set(0)
+                    leftStickX.set(0)
+                    leftStickY.set(0)
+                    userPaused.set(false)
+                    lifecyclePaused.set(!isActivityResumed.get())
+                    isPaused.set(lifecyclePaused.get())
+
+                    surfaceEntry = entry
+                    surfaceTexture = st
+                    renderSurface = surface
+                    currentSavesDir = savesDir
+                    val romBase = File(romPath).nameWithoutExtension
+                    currentRomBaseName = romBase
+                    currentSessionTitle = romBase.ifBlank { File(corePath).name }
+
+                    val loaded = try {
+                        nativeLoadCoreAndRom(
+                            corePath,
+                            romPath,
+                            systemDir,
+                            savesDir,
+                            surface
+                        )
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "Erro em nativeLoadCoreAndRom", t)
+                        false
+                    }
+
+                    if (!loaded) {
+                        stopLibretroLoopInternal()
+                        mainHandler.post {
+                            result.error("CORE_LOAD_FAILED", "Falha ao carregar motor ou ROM.", null)
+                        }
+                        return@execute
+                    }
+
+                    if (sessionToken.get() != myToken || isFinishing || isDestroyed) {
+                        stopLibretroLoopInternal()
+                        mainHandler.post {
+                            result.error("SESSION_CANCELLED", "Sessão cancelada durante carregamento.", null)
+                        }
+                        return@execute
+                    }
+
+                    // Define o tamanho real do buffer do SurfaceTexture conforme a
+                    // resolução base do jogo × escala de tela escolhida (PS1 garante
+                    // mínimo de 640x480 para telas entrelaçadas de boot/menu).
+                    val baseW = nativeGetFrameWidth().coerceAtLeast(64)
+                    val baseH = nativeGetFrameHeight().coerceAtLeast(64)
+                    val targetW = maxOf(baseW * screenScale, if (isPs1) 640 else 64).coerceAtMost(4096)
+                    val targetH = maxOf(baseH * screenScale, if (isPs1) 480 else 64).coerceAtMost(4096)
+                    if (targetW != initW || targetH != initH) {
+                        st.setDefaultBufferSize(targetW, targetH)
+                    }
+
+                    isPaused.set(userPaused.get() || lifecyclePaused.get() || !isActivityResumed.get())
+                    initAudioTrack(nativeGetSampleRate())
+                    applyAudioVolume()
+                    startLibretroLoop(File(corePath).name)
+
+                    mainHandler.post {
+                        syncPauseAndServiceState()
+                        result.success(entry.id())
+                    }
                 }
-
-                // Define o tamanho real do buffer do SurfaceTexture conforme a
-                // resolução base do jogo × escala de tela escolhida (PS1 garante
-                // mínimo de 640x480 para telas entrelaçadas de boot/menu).
-                val baseW = nativeGetFrameWidth().coerceAtLeast(64)
-                val baseH = nativeGetFrameHeight().coerceAtLeast(64)
-                val targetW = maxOf(baseW * screenScale, if (isPs1) 640 else 64).coerceAtMost(4096)
-                val targetH = maxOf(baseH * screenScale, if (isPs1) 480 else 64).coerceAtMost(4096)
-                if (targetW != initW || targetH != initH) {
-                    st.setDefaultBufferSize(targetW, targetH)
-                }
-
-                initAudioTrack(nativeGetSampleRate())
-                applyAudioVolume()
-                startLibretroLoop(File(corePath).name)
-                result.success(entry.id())
             }
 
             "setAudioConfig" -> {
@@ -276,63 +346,257 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
             "saveState" -> {
                 val slot = call.argument<Int>("slot") ?: 0
-                val statePath = "$currentSavesDir/${currentRomBaseName}_slot$slot.state"
-                val ok = nativeSaveState(statePath)
-                result.success(ok)
+                val savesDir = currentSavesDir
+                val romBase = currentRomBaseName
+                if (savesDir.isEmpty()) {
+                    result.success(false)
+                    return
+                }
+                val statePath = "$savesDir/${romBase}_slot$slot.state"
+                nativeExecutor.execute {
+                    val ok = try {
+                        nativeSaveState(statePath)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "Erro em nativeSaveState", t)
+                        false
+                    }
+                    mainHandler.post { result.success(ok) }
+                }
             }
 
             "loadState" -> {
                 val slot = call.argument<Int>("slot") ?: 0
-                val statePath = "$currentSavesDir/${currentRomBaseName}_slot$slot.state"
-                val ok = nativeLoadState(statePath)
-                result.success(ok)
+                val savesDir = currentSavesDir
+                val romBase = currentRomBaseName
+                if (savesDir.isEmpty()) {
+                    result.success(false)
+                    return
+                }
+                val statePath = "$savesDir/${romBase}_slot$slot.state"
+                nativeExecutor.execute {
+                    val ok = try {
+                        nativeLoadState(statePath)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "Erro em nativeLoadState", t)
+                        false
+                    }
+                    mainHandler.post { result.success(ok) }
+                }
             }
 
             "setPaused" -> {
                 val paused = call.argument<Boolean>("paused") ?: false
-                isPaused.set(paused)
+                userPaused.set(paused)
+                syncPauseAndServiceState()
                 result.success(null)
             }
 
             "stopLibretroSession" -> {
-                stopLibretroLoop()
-                result.success(null)
+                sessionToken.incrementAndGet()
+                isRunning.set(false)
+                userPaused.set(false)
+                lifecyclePaused.set(false)
+                isPaused.set(false)
+                EmulationForegroundService.stop(this)
+                nativeExecutor.execute {
+                    stopLibretroLoopInternal()
+                    mainHandler.post { result.success(null) }
+                }
             }
 
             else -> result.notImplemented()
         }
     }
 
+    private fun syncPauseAndServiceState() {
+        val running = isRunning.get()
+        val effectivePaused = userPaused.get() || lifecyclePaused.get() || !isActivityResumed.get()
+        isPaused.set(effectivePaused)
+
+        synchronized(audioLock) {
+            val track = audioTrack
+            if (track != null && track.state == AudioTrack.STATE_INITIALIZED) {
+                try {
+                    if (!running || effectivePaused) {
+                        if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                            track.pause()
+                            track.flush()
+                        }
+                    } else {
+                        if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                            track.play()
+                        }
+                    }
+                } catch (e: IllegalStateException) {
+                    Log.w(TAG, "AudioTrack state transition ignorado: ${e.message}")
+                }
+            }
+        }
+
+        if (running) {
+            if (isActivityResumed.get() && !EmulationForegroundService.isActive) {
+                EmulationForegroundService.start(this, currentSessionTitle, effectivePaused)
+            } else if (EmulationForegroundService.isActive) {
+                EmulationForegroundService.update(this, currentSessionTitle, effectivePaused)
+            }
+        } else {
+            EmulationForegroundService.stop(this)
+        }
+    }
+
     private fun applyAudioVolume() {
         val effectiveVol = if (audioEnabledFlag.get()) masterVolumeLevel else 0f
-        audioTrack?.setVolume(effectiveVol)
+        synchronized(audioLock) {
+            val track = audioTrack
+            if (track != null && track.state == AudioTrack.STATE_INITIALIZED) {
+                try {
+                    track.setVolume(effectiveVol)
+                } catch (_: IllegalStateException) {
+                }
+            }
+        }
+    }
+
+    private fun releaseAudioTrack() {
+        synchronized(audioLock) {
+            val track = audioTrack
+            audioTrack = null
+            if (track != null) {
+                try {
+                    if (track.state == AudioTrack.STATE_INITIALIZED) {
+                        val underruns = track.underrunCount
+                        if (underruns > 0) {
+                            Log.i(TAG, "AudioTrack underruns na sessão: $underruns")
+                        }
+                        if (track.playState == AudioTrack.PLAYSTATE_PLAYING ||
+                            track.playState == AudioTrack.PLAYSTATE_PAUSED
+                        ) {
+                            track.stop()
+                        }
+                    }
+                } catch (_: Throwable) {
+                } finally {
+                    try {
+                        track.release()
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }
     }
 
     private fun initAudioTrack(sampleRateHz: Int) {
+        releaseAudioTrack()
         val validRate = if (sampleRateHz in 8000..96000) sampleRateHz else 44100
-        val minBuf = AudioTrack.getMinBufferSize(
+        val rawMinBuf = AudioTrack.getMinBufferSize(
             validRate,
             AudioFormat.CHANNEL_OUT_STEREO,
             AudioFormat.ENCODING_PCM_16BIT
         )
-        audioTrack = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_GAME)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build()
+        if (rawMinBuf <= 0) {
+            Log.w(
+                TAG,
+                "AudioTrack.getMinBufferSize retornou erro ($rawMinBuf) para ${validRate}Hz; usando fallback"
             )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(validRate)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                    .build()
-            )
-            .setBufferSizeInBytes((minBuf * 2).coerceAtLeast(8192))
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
-            .apply { play() }
+        }
+        val safeMinBuf = if (rawMinBuf > 0) {
+            rawMinBuf
+        } else {
+            ((validRate / 10) * 4).coerceAtLeast(8192)
+        }
+        // Margem de 4x o buffer mínimo (mínimo 16 KB, alinhado a 4 bytes/frame stereo PCM16)
+        val targetBufferBytes = (((safeMinBuf * 4).coerceAtLeast(16384)) + 3) and 3.inv()
+
+        val built = try {
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_GAME)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(validRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                        .build()
+                )
+                .setBufferSizeInBytes(targetBufferBytes)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+        } catch (t: Throwable) {
+            Log.e(TAG, "Falha ao construir AudioTrack", t)
+            null
+        }
+
+        if (built == null || built.state != AudioTrack.STATE_INITIALIZED) {
+            Log.e(TAG, "AudioTrack não inicializado (state=${built?.state})")
+            try {
+                built?.release()
+            } catch (_: Throwable) {
+            }
+            return
+        }
+
+        synchronized(audioLock) {
+            audioTrack = built
+            if (!isPaused.get()) {
+                try {
+                    built.play()
+                } catch (e: IllegalStateException) {
+                    Log.w(TAG, "Falha ao iniciar AudioTrack.play(): ${e.message}")
+                }
+            }
+        }
+    }
+
+    private fun writeAudioNonBlocking(pcmBuffer: ShortArray, sampleCount: Int) {
+        synchronized(audioLock) {
+            val track = audioTrack ?: return
+            if (track.state != AudioTrack.STATE_INITIALIZED ||
+                track.playState != AudioTrack.PLAYSTATE_PLAYING
+            ) {
+                return
+            }
+
+            var offset = 0
+            var remaining = sampleCount
+            var zeroWriteRetries = 0
+            while (remaining > 0 && isRunning.get() && !isPaused.get()) {
+                val written = try {
+                    track.write(pcmBuffer, offset, remaining, AudioTrack.WRITE_NON_BLOCKING)
+                } catch (_: IllegalStateException) {
+                    AudioTrack.ERROR_INVALID_OPERATION
+                }
+
+                if (written < 0) {
+                    if (written == AudioTrack.ERROR_DEAD_OBJECT) {
+                        Log.w(TAG, "AudioTrack ERROR_DEAD_OBJECT ($written); liberando track")
+                        audioTrack = null
+                        try {
+                            track.release()
+                        } catch (_: Throwable) {
+                        }
+                    } else {
+                        Log.w(TAG, "AudioTrack.write falhou com código $written")
+                    }
+                    break
+                }
+
+                if (written == 0) {
+                    if (fastForwardMultiplier > 1.15 || zeroWriteRetries >= 1) {
+                        break
+                    }
+                    zeroWriteRetries++
+                    LockSupport.parkNanos(350_000L)
+                    continue
+                }
+
+                offset += written
+                remaining -= written
+            }
+        }
     }
 
     private fun pushCombinedInputToNative() {
@@ -357,7 +621,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         if (bit != 0 && isRunning.get()) {
             hardwareJoypadMask.set(hardwareJoypadMask.get() or bit)
             pushCombinedInputToNative()
-            mainHandler.post { eventSink?.success(mapOf("event" to "hardwareGamepadActive")) }
+            mainHandler.post {
+                try {
+                    eventSink?.success(mapOf("event" to "hardwareGamepadActive"))
+                } catch (_: Throwable) {
+                }
+            }
             return true
         }
         return super.onKeyDown(keyCode, event)
@@ -404,7 +673,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             hardwareAxisMask.set(axisBits)
             pushCombinedInputToNative()
             if (kotlin.math.abs(lx) > 3000 || kotlin.math.abs(ly) > 3000 || axisBits != 0) {
-                mainHandler.post { eventSink?.success(mapOf("event" to "hardwareGamepadActive")) }
+                mainHandler.post {
+                    try {
+                        eventSink?.success(mapOf("event" to "hardwareGamepadActive"))
+                    } catch (_: Throwable) {
+                    }
+                }
             }
             return true
         }
@@ -433,68 +707,77 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
     private fun startLibretroLoop(coreFileName: String) {
         isRunning.set(true)
-        isPaused.set(false)
 
         emuThread = Thread({
             try {
-                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
-            } catch (_: Throwable) {}
+                try {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
+                } catch (_: Throwable) {
+                }
 
-            val baseTargetFps = nativeGetTargetFps().takeIf { it > 10.0 } ?: 60.0
-            val pcmBuffer = ShortArray(4096)
-            var frames = 0
-            var lastFpsTimestamp = System.nanoTime()
-            var nextFrameDeadline = System.nanoTime()
+                val baseTargetFps = nativeGetTargetFps().takeIf { it > 10.0 } ?: 60.0
+                val pcmBuffer = ShortArray(4096)
+                var frames = 0
+                var lastFpsTimestamp = System.nanoTime()
+                var nextFrameDeadline = System.nanoTime()
 
-            while (isRunning.get()) {
-                val frameStart = System.nanoTime()
-                val currentFf = fastForwardMultiplier
-                val effectiveTargetFps = (baseTargetFps * currentFf).coerceIn(10.0, 480.0)
-                val targetFrameNs = (1_000_000_000.0 / effectiveTargetFps).toLong().coerceAtLeast(300_000L)
+                while (isRunning.get()) {
+                    val currentFf = fastForwardMultiplier
+                    val effectiveTargetFps = (baseTargetFps * currentFf).coerceIn(10.0, 480.0)
+                    val targetFrameNs = (1_000_000_000.0 / effectiveTargetFps).toLong().coerceAtLeast(300_000L)
 
-                if (!isPaused.get()) {
-                    nativeStepFrame()
-                    while (true) {
-                        val samplesRead = nativeDrainAudioBuffer(pcmBuffer)
-                        if (samplesRead <= 0) break
-                        if (audioEnabledFlag.get()) {
-                            audioTrack?.write(pcmBuffer, 0, samplesRead, AudioTrack.WRITE_NON_BLOCKING)
+                    if (!isPaused.get()) {
+                        nativeStepFrame()
+                        while (isRunning.get() && !isPaused.get()) {
+                            val samplesRead = nativeDrainAudioBuffer(pcmBuffer)
+                            if (samplesRead <= 0) break
+                            if (audioEnabledFlag.get()) {
+                                writeAudioNonBlocking(pcmBuffer, samplesRead)
+                            }
+                        }
+                        frames++
+                    } else {
+                        LockSupport.parkNanos(16_000_000L)
+                        nextFrameDeadline = System.nanoTime()
+                    }
+
+                    val now = System.nanoTime()
+                    if (now - lastFpsTimestamp >= 750_000_000L) {
+                        val fps = (frames * 1_000_000_000.0 / (now - lastFpsTimestamp)).coerceAtMost(effectiveTargetFps)
+                        val frameTimeMs = if (fps > 0.5) 1000.0 / fps else 16.6
+                        val w = nativeGetFrameWidth()
+                        val h = nativeGetFrameHeight()
+                        frames = 0
+                        lastFpsTimestamp = now
+
+                        mainHandler.post {
+                            try {
+                                eventSink?.success(
+                                    mapOf(
+                                        "fps" to fps,
+                                        "frameTimeMs" to frameTimeMs,
+                                        "width" to w,
+                                        "height" to h,
+                                        "coreName" to coreFileName
+                                    )
+                                )
+                            } catch (_: Throwable) {
+                            }
                         }
                     }
-                    frames++
-                } else {
-                    LockSupport.parkNanos(16_000_000L)
-                    nextFrameDeadline = System.nanoTime()
-                }
 
-                val now = System.nanoTime()
-                if (now - lastFpsTimestamp >= 750_000_000L) {
-                    val fps = (frames * 1_000_000_000.0 / (now - lastFpsTimestamp)).coerceAtMost(effectiveTargetFps)
-                    val frameTimeMs = if (fps > 0.5) 1000.0 / fps else 16.6
-                    val w = nativeGetFrameWidth()
-                    val h = nativeGetFrameHeight()
-                    frames = 0
-                    lastFpsTimestamp = now
-
-                    mainHandler.post {
-                        eventSink?.success(
-                            mapOf(
-                                "fps" to fps,
-                                "frameTimeMs" to frameTimeMs,
-                                "width" to w,
-                                "height" to h,
-                                "coreName" to coreFileName
-                            )
-                        )
+                    nextFrameDeadline += targetFrameNs
+                    val remainingNs = nextFrameDeadline - System.nanoTime()
+                    if (remainingNs > 800_000L) {
+                        LockSupport.parkNanos(remainingNs - 300_000L)
+                    } else if (remainingNs <= 0L) {
+                        nextFrameDeadline = System.nanoTime()
                     }
                 }
-
-                nextFrameDeadline += targetFrameNs
-                val remainingNs = nextFrameDeadline - System.nanoTime()
-                if (remainingNs > 800_000L) {
-                    LockSupport.parkNanos(remainingNs - 300_000L)
-                } else if (remainingNs <= 0L) {
-                    nextFrameDeadline = System.nanoTime()
+            } finally {
+                try {
+                    nativeReleaseRenderThreadContext()
+                } catch (_: Throwable) {
                 }
             }
         }, "LibretroTurboThread").apply {
@@ -503,24 +786,126 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         }
     }
 
-    private fun stopLibretroLoop() {
-        if (isRunning.getAndSet(false)) {
-            emuThread?.join(1500)
-            emuThread = null
-            nativeUnloadCore()
+    private fun releaseSurfaceEntryOnMain(entry: TextureRegistry.SurfaceTextureEntry?) {
+        if (entry == null) return
+        val releaseAction = Runnable {
+            try {
+                if (!isDestroyed) {
+                    entry.release()
+                }
+            } catch (_: Throwable) {
+            }
         }
-        audioTrack?.stop()
-        audioTrack?.release()
-        audioTrack = null
-        renderSurface?.release()
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            releaseAction.run()
+        } else {
+            mainHandler.post(releaseAction)
+        }
+    }
+
+    private fun releaseRenderSurfaces() {
+        val surf = renderSurface
         renderSurface = null
         surfaceTexture = null
-        surfaceEntry?.release()
+        val entry = surfaceEntry
         surfaceEntry = null
+
+        if (surf != null) {
+            try {
+                surf.release()
+            } catch (_: Throwable) {
+            }
+        }
+        releaseSurfaceEntryOnMain(entry)
+    }
+
+    private fun stopLibretroLoopInternal() {
+        isRunning.set(false)
+        val thread = emuThread
+        emuThread = null
+        if (thread != null) {
+            try {
+                thread.join(2000)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            if (thread.isAlive) {
+                Log.w(TAG, "LibretroTurboThread não encerrou em 2000ms; interrompendo")
+                thread.interrupt()
+                try {
+                    thread.join(500)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+        }
+
+        // Sempre descarrega o core e libera áudio/superfícies fora de `if (isRunning)`
+        // para evitar vazamentos caso uma exceção ocorra antes do start do loop.
+        try {
+            nativeUnloadCore()
+        } catch (t: Throwable) {
+            Log.e(TAG, "Falha em nativeUnloadCore", t)
+        }
+        releaseAudioTrack()
+        releaseRenderSurfaces()
+        EmulationForegroundService.stop(this)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        isActivityResumed.set(true)
+        lifecyclePaused.set(false)
+        syncPauseAndServiceState()
+    }
+
+    override fun onPause() {
+        isActivityResumed.set(false)
+        lifecyclePaused.set(true)
+        if (isRunning.get()) {
+            touchJoypadMask.set(0)
+            hardwareJoypadMask.set(0)
+            hardwareAxisMask.set(0)
+            pushCombinedInputToNative()
+            syncPauseAndServiceState()
+        }
+        super.onPause()
+    }
+
+    override fun onStop() {
+        lifecyclePaused.set(true)
+        if (isRunning.get()) {
+            syncPauseAndServiceState()
+        }
+        super.onStop()
     }
 
     override fun onDestroy() {
-        stopLibretroLoop()
+        isActivityResumed.set(false)
+        sessionToken.incrementAndGet()
+        isRunning.set(false)
+        EmulationForegroundService.stop(this)
+
+        methodChannel?.setMethodCallHandler(null)
+        methodChannel = null
+        eventChannel?.setStreamHandler(null)
+        eventChannel = null
+        eventSink = null
+
+        val latch = CountDownLatch(1)
+        try {
+            nativeExecutor.execute {
+                try {
+                    stopLibretroLoopInternal()
+                } finally {
+                    latch.countDown()
+                }
+            }
+            latch.await(2500, TimeUnit.MILLISECONDS)
+        } catch (_: Throwable) {
+            stopLibretroLoopInternal()
+        }
+        nativeExecutor.shutdown()
         super.onDestroy()
     }
 
@@ -533,6 +918,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     ): Boolean
 
     private external fun nativeStepFrame()
+    private external fun nativeReleaseRenderThreadContext()
     private external fun nativeSetFrameSkip(skip: Int)
     private external fun nativeSetCoreOptions(options: String)
     private external fun nativeSetCustomVulkanDriver(

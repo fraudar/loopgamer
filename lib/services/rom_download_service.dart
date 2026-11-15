@@ -4,8 +4,10 @@ import 'dart:isolate';
 import 'package:archive/archive_io.dart';
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import '../models/emulation_game.dart';
+import 'library_storage_service.dart';
 
 enum RomActionState {
   notDownloaded,
@@ -23,6 +25,8 @@ class RomDownloadStatus {
     this.speedLabel,
     this.downloadedBytes = 0,
     this.totalBytes = 0,
+    this.warningMessage,
+    this.crcVerified,
   });
 
   final RomActionState state;
@@ -32,6 +36,8 @@ class RomDownloadStatus {
   final String? speedLabel;
   final int downloadedBytes;
   final int totalBytes;
+  final String? warningMessage;
+  final bool? crcVerified;
 
   String get buttonLabel {
     switch (state) {
@@ -61,15 +67,24 @@ class RomDownloadEvent {
   final RomDownloadStatus status;
 }
 
+class _NonRetryableDownloadException implements Exception {
+  const _NonRetryableDownloadException(this.message);
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
 class RomDownloadService {
   RomDownloadService({Dio? dio})
-      : _dio = dio ??
+      : _ownsDio = dio == null,
+        _dio = dio ??
             Dio(
               BaseOptions(
                 followRedirects: true,
                 maxRedirects: 8,
                 connectTimeout: const Duration(seconds: 25),
-                receiveTimeout: null,
+                receiveTimeout: defaultReceiveTimeout,
                 headers: const {
                   'User-Agent':
                       'Mozilla/5.0 (Linux; Android 14; LoopGamer) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Mobile Safari/537.36',
@@ -79,13 +94,19 @@ class RomDownloadService {
               ),
             );
 
+  static const Duration defaultReceiveTimeout = Duration(seconds: 45);
+  static const int maxRetryAttempts = 3;
+
+  final bool _ownsDio;
   final Dio _dio;
   final Map<int, CancelToken> _cancelTokens = {};
+  final Map<int, int> _operationSeq = {};
   final Map<int, EmulationGame> _activeGames = {};
   final Map<int, RomDownloadStatus> _activeStatuses = {};
   final Map<int, bool> _pauseRequested = {};
   final StreamController<RomDownloadEvent> _eventsController =
       StreamController<RomDownloadEvent>.broadcast();
+  bool _isDisposed = false;
 
   /// Stream global de eventos de download em segundo plano
   Stream<RomDownloadEvent> get downloadEvents => _eventsController.stream;
@@ -439,8 +460,10 @@ class RomDownloadService {
     return romDir;
   }
 
-  /// Verifica se a ROM já foi baixada/extraída no armazenamento local.
+  /// Verifica se a ROM já existe no armazenamento local sem apagar `.zip` válidos importados.
+  /// Apenas ignora `.part` e limpa stubs inválidos (< 1 KB).
   Future<String?> resolveExistingRomPath(int igdbId) async {
+    const int minStubBytes = 1024;
     try {
       final dir = await _romsDirectory();
       final gameDir = Directory('${dir.path}/game_$igdbId');
@@ -458,47 +481,63 @@ class RomDownloadService {
           final pickedLen = await pickedFile.length();
           final lower = picked.toLowerCase();
           final isCueOrM3u = lower.endsWith('.cue') || lower.endsWith('.m3u');
-          if (pickedLen >= 32 * 1024 || isCueOrM3u) {
+          if (pickedLen >= minStubBytes || isCueOrM3u) {
             return picked;
           }
         }
       }
+
       final arcadeDir = Directory('${dir.path}/arcade_$igdbId');
       if (await arcadeDir.exists()) {
         final arcadeFiles = await arcadeDir.list().toList();
         for (final entity in arcadeFiles) {
-          if (entity is File &&
-              !entity.path.endsWith('.part') &&
-              !entity.path.toLowerCase().endsWith('/neogeo.zip')) {
+          if (entity is File && !entity.path.endsWith('.part')) {
+            final baseName = entity.path
+                .split(Platform.pathSeparator)
+                .last
+                .toLowerCase();
+            if (baseName == 'neogeo.zip') continue;
             final len = await entity.length();
-            if (len >= 32 * 1024) {
+            if (len >= minStubBytes) {
               return entity.path;
-            } else {
-              try {
-                await entity.delete();
-              } catch (_) {}
+            }
+            try {
+              await entity.delete();
+            } catch (e) {
+              debugPrint(
+                '[RomDownloadService] Falha ao remover stub arcade: $e',
+              );
             }
           }
         }
       }
+
       final files = await dir.list().toList();
       for (final entity in files) {
         if (entity is File &&
             entity.path.contains('rom_${igdbId}_') &&
             !entity.path.endsWith('.part')) {
           final lower = entity.path.toLowerCase();
+          if (lower.endsWith('_jp2.zip')) {
+            continue;
+          }
           final len = await entity.length();
-          // Resíduos antigos (< 32KB) ou zips manuais não extraíveis são descartados
-          if (len < 32 * 1024 || lower.endsWith('_jp2.zip') || lower.endsWith('.zip')) {
+          if (len < minStubBytes) {
             try {
               await entity.delete();
-            } catch (_) {}
+            } catch (e) {
+              debugPrint('[RomDownloadService] Falha ao remover stub ROM: $e');
+            }
             continue;
           }
           return entity.path;
         }
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint(
+        '[RomDownloadService] Erro ao resolver ROM existente ($igdbId): $e',
+      );
+    }
     return null;
   }
 
@@ -556,7 +595,9 @@ class RomDownloadService {
       if (await f.exists()) {
         try {
           await f.delete();
-        } catch (_) {}
+        } catch (e) {
+          debugPrint('[RomDownloadService] Falha ao remover $localPath: $e');
+        }
       }
     }
 
@@ -576,10 +617,15 @@ class RomDownloadService {
           await entity.delete();
         }
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint(
+        '[RomDownloadService] Falha ao remover arquivos da ROM ($igdbId): $e',
+      );
+    }
   }
 
   void _emit(EmulationGame game, RomDownloadStatus status) {
+    if (_isDisposed) return;
     _activeGames[game.igdbId] = game;
     _activeStatuses[game.igdbId] = status;
     if (!_eventsController.isClosed) {
@@ -592,8 +638,13 @@ class RomDownloadService {
     required EmulationGame game,
     void Function(RomDownloadStatus status)? onStatus,
   }) async {
+    if (_isDisposed) return null;
+
+    final existingToken = _cancelTokens[game.igdbId];
     final curStatus = _activeStatuses[game.igdbId];
-    if (curStatus?.state == RomActionState.downloading) {
+    if (curStatus?.state == RomActionState.downloading &&
+        existingToken != null &&
+        !existingToken.isCancelled) {
       return null;
     }
 
@@ -608,9 +659,16 @@ class RomDownloadService {
       return null;
     }
 
+    final cancelToken = CancelToken();
+    _cancelTokens[game.igdbId] = cancelToken;
+    _operationSeq[game.igdbId] = (_operationSeq[game.igdbId] ?? 0) + 1;
     _pauseRequested[game.igdbId] = false;
 
+    bool isCurrentOperation() =>
+        !_isDisposed && identical(_cancelTokens[game.igdbId], cancelToken);
+
     void notify(RomDownloadStatus st) {
+      if (!isCurrentOperation()) return;
       _emit(game, st);
       onStatus?.call(st);
     }
@@ -626,24 +684,36 @@ class RomDownloadService {
     );
 
     try {
-      final savedPath = await _executeResilientDownload(
+      final result = await _executeResilientDownload(
         game: game,
+        cancelToken: cancelToken,
+        isCurrentOperation: isCurrentOperation,
         notify: notify,
       );
 
-      if (savedPath != null) {
+      if (result != null && isCurrentOperation()) {
         final ready = RomDownloadStatus(
           state: RomActionState.readyToPlay,
           progress: 1.0,
-          localPath: savedPath,
+          localPath: result.path,
+          crcVerified: result.crcVerified,
+          warningMessage: result.warningMessage,
         );
         notify(ready);
-        return savedPath;
+        return result.path;
       }
       return null;
     } catch (e) {
-      if (_pauseRequested[game.igdbId] == true) {
+      if (!isCurrentOperation()) {
+        return null;
+      }
+
+      if (_pauseRequested[game.igdbId] == true ||
+          (e is DioException &&
+              e.type == DioExceptionType.cancel &&
+              cancelToken.cancelError?.error == 'PAUSED_BY_USER')) {
         final partFile = await _resolvePartFile(game.igdbId);
+        if (!isCurrentOperation()) return null;
         final downloaded =
             (partFile != null && await partFile.exists()) ? await partFile.length() : 0;
         final total = game.estimatedSizeBytes > 0
@@ -662,23 +732,31 @@ class RomDownloadService {
         return null;
       }
 
+      if (e is DioException && e.type == DioExceptionType.cancel) {
+        return null;
+      }
+
       notify(
         RomDownloadStatus(
           state: RomActionState.notDownloaded,
-          errorMessage: e is StateError
-              ? e.message
-              : 'Falha no download: Servidor offline ou ROM protegida.',
+          errorMessage: _friendlyErrorMessage(e),
         ),
       );
       return null;
+    } finally {
+      if (identical(_cancelTokens[game.igdbId], cancelToken)) {
+        _cancelTokens.remove(game.igdbId);
+      }
     }
   }
 
-  /// Pausa um download ativo preservando o arquivo .part para continuação posterior
+  /// Pausa um download ativo preservando o arquivo `.part` para continuação posterior.
   void pauseDownload(int igdbId) {
     _pauseRequested[igdbId] = true;
-    _cancelTokens[igdbId]?.cancel('PAUSED_BY_USER');
-    _cancelTokens.remove(igdbId);
+    final token = _cancelTokens[igdbId];
+    if (token != null && !token.isCancelled) {
+      token.cancel('PAUSED_BY_USER');
+    }
     final game = _activeGames[igdbId];
     final cur = _activeStatuses[igdbId];
     if (game != null && cur != null) {
@@ -698,8 +776,12 @@ class RomDownloadService {
   /// Cancela e exclui arquivos parciais
   void cancelDownload(int igdbId) {
     _pauseRequested.remove(igdbId);
-    _cancelTokens[igdbId]?.cancel('CANCELLED_BY_USER');
-    _cancelTokens.remove(igdbId);
+    final cancelSeq = (_operationSeq[igdbId] ?? 0) + 1;
+    _operationSeq[igdbId] = cancelSeq;
+    final token = _cancelTokens.remove(igdbId);
+    if (token != null && !token.isCancelled) {
+      token.cancel('CANCELLED_BY_USER');
+    }
     final game = _activeGames[igdbId];
     if (game != null) {
       _emit(
@@ -710,16 +792,21 @@ class RomDownloadService {
         ),
       );
     }
-    _cleanPartFiles(igdbId);
+    unawaited(_cleanPartFiles(igdbId, expectedSeq: cancelSeq));
   }
 
-  Future<void> _cleanPartFiles(int igdbId) async {
+  Future<void> _cleanPartFiles(int igdbId, {int? expectedSeq}) async {
     try {
       final dir = await _romsDirectory();
+      if (expectedSeq != null && _operationSeq[igdbId] != expectedSeq) return;
+
       final arcadeDir = Directory('${dir.path}/arcade_$igdbId');
       if (await arcadeDir.exists()) {
         final arcadeFiles = await arcadeDir.list().toList();
         for (final f in arcadeFiles) {
+          if (expectedSeq != null && _operationSeq[igdbId] != expectedSeq) {
+            return;
+          }
           if (f is File && f.path.endsWith('.part')) {
             await f.delete();
           }
@@ -727,25 +814,100 @@ class RomDownloadService {
       }
       final files = await dir.list().toList();
       for (final f in files) {
+        if (expectedSeq != null && _operationSeq[igdbId] != expectedSeq) return;
         if (f is File &&
             f.path.contains('rom_${igdbId}_') &&
             f.path.endsWith('.part')) {
           await f.delete();
         }
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('[RomDownloadService] Falha ao limpar .part ($igdbId): $e');
+    }
   }
 
-  /// Executa o download real com HTTP Range e medição de bytes/segundo
-  Future<String?> _executeResilientDownload({
+  String _friendlyErrorMessage(Object error) {
+    if (error is _NonRetryableDownloadException) return error.message;
+    if (error is StateError) return error.message;
+    if (error is DioException) return _friendlyDioMessage(error);
+    return 'Falha no download: erro inesperado ao acessar o servidor.';
+  }
+
+  String _friendlyDioMessage(DioException e) {
+    final code = e.response?.statusCode;
+    switch (code) {
+      case 401:
+        return 'Autenticação necessária (HTTP 401). Verifique o token RomM.';
+      case 403:
+        return 'Acesso negado pelo servidor (HTTP 403). Este mirror restringiu o download.';
+      case 404:
+        return 'ROM não encontrada no servidor (HTTP 404). Tente outro mirror ou arquivo local.';
+      case 416:
+        return 'Faixa de bytes inválida no servidor (HTTP 416). Reinicie o download.';
+      case 429:
+        return 'Muitas requisições ao servidor (HTTP 429). Aguarde instantes e tente novamente.';
+      default:
+        if (code != null && code >= 500) {
+          return 'Servidor temporariamente indisponível (HTTP $code). Tente novamente em instantes.';
+        }
+        if (code != null) {
+          return 'Falha no servidor (HTTP $code) ao baixar a ROM.';
+        }
+    }
+
+    switch (e.type) {
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.sendTimeout:
+      case DioExceptionType.receiveTimeout:
+      case DioExceptionType.transformTimeout:
+        return 'Tempo esgotado na conexão com o servidor. Verifique sua internet e tente novamente.';
+      case DioExceptionType.connectionError:
+        return 'Não foi possível conectar ao servidor. Verifique sua rede ou endereço RomM.';
+      case DioExceptionType.badCertificate:
+        return 'Certificado SSL/TLS inválido no servidor.';
+      case DioExceptionType.cancel:
+        return 'Download interrompido.';
+      case DioExceptionType.badResponse:
+      case DioExceptionType.unknown:
+        return 'Falha de rede durante a transferência da ROM. Tente novamente.';
+    }
+  }
+
+  Future<void> _delayWithCancel(
+    Duration duration,
+    CancelToken cancelToken,
+  ) async {
+    if (cancelToken.isCancelled) {
+      throw DioException.requestCancelled(
+        requestOptions: RequestOptions(path: ''),
+        reason: cancelToken.cancelError?.error,
+      );
+    }
+    await Future.any<void>([
+      Future<void>.delayed(duration),
+      cancelToken.whenCancel.then((_) {}),
+    ]);
+    if (cancelToken.isCancelled) {
+      throw DioException.requestCancelled(
+        requestOptions: RequestOptions(path: ''),
+        reason: cancelToken.cancelError?.error,
+      );
+    }
+  }
+
+  bool _isValidCrc32Hex(String raw) {
+    final clean = raw.trim().toUpperCase();
+    return RegExp(r'^[0-9A-F]{8}$').hasMatch(clean) && clean != '00000000';
+  }
+
+  /// Executa o download real com HTTP Range, retry exponencial e verificação de CRC32.
+  Future<({String path, bool? crcVerified, String? warningMessage})?>
+      _executeResilientDownload({
     required EmulationGame game,
+    required CancelToken cancelToken,
+    required bool Function() isCurrentOperation,
     required void Function(RomDownloadStatus status) notify,
   }) async {
-    final cancelToken = CancelToken();
-    _cancelTokens[game.igdbId] = cancelToken;
-
-    // 1. Resolução prioritária de URL funcional:
-    //    Primeiro checa directUrls verificadas, depois directRomUrl http, depois Archive.org
     String? verifiedUrl = _verifiedDirectUrls[game.igdbId];
     String targetUrl = verifiedUrl ?? game.directRomUrl.trim();
     if (verifiedUrl == null &&
@@ -769,7 +931,8 @@ class RomDownloadService {
     final isArcade = _isArcadePlatform(game.platformSlug);
     final minExpectedBytes = minBytesForPlatform(game.platformSlug);
 
-    Future<String> downloadUrlToPath(String url) async {
+    Future<({String path, bool? crcVerified, String? warningMessage})>
+        downloadUrlToPath(String url) async {
       String realExt = '';
       final urlPath = Uri.parse(url).path.toLowerCase();
       for (final ext in _romInnerExtensions) {
@@ -800,110 +963,203 @@ class RomDownloadService {
         finalDestinationPath =
             '${dir.path}/rom_${game.igdbId}_$safeFileName$realExt';
       }
+
       final partFilePath = '$finalDestinationPath.part';
       final partFile = File(partFilePath);
 
-      int existingBytes = 0;
-      if (await partFile.exists()) {
-        existingBytes = await partFile.length();
-      }
+      int attempt = 1;
+      bool rangeResetDone = false;
 
-      final rollingWindow = <_SpeedSample>[];
-      int currentBytes = existingBytes;
-      int expectedTotalBytes = game.estimatedSizeBytes > existingBytes
-          ? game.estimatedSizeBytes
-          : existingBytes;
-
-      final headers = <String, String>{};
-      if (existingBytes > 0) {
-        headers['Range'] = 'bytes=$existingBytes-';
-      }
-
-      final response = await _dio.get<ResponseBody>(
-        url,
-        cancelToken: cancelToken,
-        options: Options(
-          responseType: ResponseType.stream,
-          headers: headers,
-          validateStatus: (s) => (s != null && (s >= 200 && s < 300)),
-        ),
-      );
-
-      final contentType =
-          (response.headers.value('content-type') ?? '').toLowerCase();
-      if (contentType.contains('text/html')) {
-        throw StateError('Mirror retornou página HTML em vez de ROM.');
-      }
-
-      final statusCode = response.statusCode ?? 200;
-      final isRangeAccepted = statusCode == 206;
-
-      final contentLengthHeader = response.headers.value('content-length');
-      if (contentLengthHeader != null) {
-        final cl = int.tryParse(contentLengthHeader) ?? 0;
-        if (cl > 0) {
-          expectedTotalBytes = isRangeAccepted ? existingBytes + cl : cl;
-          if (!isRangeAccepted && cl < minExpectedBytes) {
-            throw StateError(
-              'Arquivo no servidor é pequeno demais (${(cl / 1024).toStringAsFixed(0)} KB) para ${game.platformName}. Provável manual/patch.',
-            );
-          }
-        }
-      }
-
-      final sink = partFile.openWrite(
-        mode: isRangeAccepted ? FileMode.append : FileMode.write,
-      );
-
-      final stream = response.data?.stream;
-      if (stream == null) {
-        await sink.close();
-        throw StateError('Resposta de stream vazia.');
-      }
-
-      DateTime lastUiUpdate = DateTime.now();
-
-      await for (final chunk in stream) {
-        sink.add(chunk);
-        currentBytes += chunk.length;
-
-        final now = DateTime.now();
-        rollingWindow.add(_SpeedSample(now, chunk.length));
-        rollingWindow.removeWhere(
-            (s) => now.difference(s.time).inMilliseconds > 1500);
-
-        if (now.difference(lastUiUpdate).inMilliseconds >= 250) {
-          lastUiUpdate = now;
-          final totalWindowBytes =
-              rollingWindow.fold<int>(0, (acc, s) => acc + s.bytes);
-          final windowDurationMs = rollingWindow.isEmpty
-              ? 1000
-              : now
-                  .difference(rollingWindow.first.time)
-                  .inMilliseconds
-                  .clamp(100, 2000);
-          final bytesPerSec =
-              (totalWindowBytes * 1000.0) / windowDurationMs;
-
-          final speedLabel = _formatSpeed(bytesPerSec);
-          final progress = expectedTotalBytes > 0
-              ? (currentBytes / expectedTotalBytes).clamp(0.01, 0.99)
-              : 0.5;
-
-          notify(
-            RomDownloadStatus(
-              state: RomActionState.downloading,
-              progress: progress,
-              downloadedBytes: currentBytes,
-              totalBytes: expectedTotalBytes,
-              speedLabel: speedLabel,
-            ),
+      while (true) {
+        if (cancelToken.isCancelled || !isCurrentOperation()) {
+          throw DioException.requestCancelled(
+            requestOptions: RequestOptions(path: url),
+            reason: cancelToken.cancelError?.error,
           );
         }
-      }
 
-      await sink.flush();
-      await sink.close();
+        int existingBytes = 0;
+        if (await partFile.exists()) {
+          existingBytes = await partFile.length();
+        }
+
+        final rollingWindow = <_SpeedSample>[];
+        int currentBytes = existingBytes;
+        int expectedTotalBytes = game.estimatedSizeBytes > existingBytes
+            ? game.estimatedSizeBytes
+            : existingBytes;
+
+        final headers = <String, String>{};
+        if (existingBytes > 0) {
+          headers['Range'] = 'bytes=$existingBytes-';
+        }
+
+        try {
+          final response = await _dio.get<ResponseBody>(
+            url,
+            cancelToken: cancelToken,
+            options: Options(
+              responseType: ResponseType.stream,
+              receiveTimeout: defaultReceiveTimeout,
+              headers: headers,
+              validateStatus: (s) => s != null && s >= 200 && s < 300,
+            ),
+          );
+
+          final contentType =
+              (response.headers.value('content-type') ?? '').toLowerCase();
+          if (contentType.contains('text/html')) {
+            throw const _NonRetryableDownloadException(
+              'Mirror retornou página HTML em vez de ROM.',
+            );
+          }
+
+          final statusCode = response.statusCode ?? 200;
+          final isRangeAccepted = statusCode == 206;
+          if (!isRangeAccepted) {
+            currentBytes = 0;
+          }
+
+          final contentLengthHeader = response.headers.value('content-length');
+          if (contentLengthHeader != null) {
+            final cl = int.tryParse(contentLengthHeader) ?? 0;
+            if (cl > 0) {
+              expectedTotalBytes = isRangeAccepted ? existingBytes + cl : cl;
+              if (!isRangeAccepted && cl < minExpectedBytes) {
+                throw _NonRetryableDownloadException(
+                  'Arquivo no servidor é pequeno demais (${(cl / 1024).toStringAsFixed(0)} KB) para ${game.platformName}. Provável manual/patch.',
+                );
+              }
+            }
+          }
+
+          final stream = response.data?.stream;
+          if (stream == null) {
+            throw DioException(
+              requestOptions: response.requestOptions,
+              type: DioExceptionType.unknown,
+              message: 'Resposta de stream vazia.',
+            );
+          }
+
+          final sink = partFile.openWrite(
+            mode: isRangeAccepted ? FileMode.append : FileMode.write,
+          );
+          DateTime lastUiUpdate = DateTime.now();
+
+          try {
+            await for (final chunk in stream) {
+              if (cancelToken.isCancelled || !isCurrentOperation()) {
+                throw DioException.requestCancelled(
+                  requestOptions: response.requestOptions,
+                  reason: cancelToken.cancelError?.error,
+                );
+              }
+              sink.add(chunk);
+              currentBytes += chunk.length;
+
+              final now = DateTime.now();
+              rollingWindow.add(_SpeedSample(now, chunk.length));
+              rollingWindow.removeWhere(
+                (s) => now.difference(s.time).inMilliseconds > 1500,
+              );
+
+              if (now.difference(lastUiUpdate).inMilliseconds >= 250) {
+                lastUiUpdate = now;
+                final totalWindowBytes =
+                    rollingWindow.fold<int>(0, (acc, s) => acc + s.bytes);
+                final windowDurationMs = rollingWindow.isEmpty
+                    ? 1000
+                    : now
+                        .difference(rollingWindow.first.time)
+                        .inMilliseconds
+                        .clamp(100, 2000);
+                final bytesPerSec =
+                    (totalWindowBytes * 1000.0) / windowDurationMs;
+
+                final speedLabel = _formatSpeed(bytesPerSec);
+                final progress = expectedTotalBytes > 0
+                    ? (currentBytes / expectedTotalBytes).clamp(0.01, 0.99)
+                    : 0.5;
+
+                notify(
+                  RomDownloadStatus(
+                    state: RomActionState.downloading,
+                    progress: progress,
+                    downloadedBytes: currentBytes,
+                    totalBytes: expectedTotalBytes,
+                    speedLabel: speedLabel,
+                  ),
+                );
+              }
+            }
+            await sink.flush();
+          } finally {
+            try {
+              await sink.close();
+            } catch (e) {
+              debugPrint('[RomDownloadService] Falha ao fechar sink: $e');
+            }
+          }
+
+          break;
+        } on DioException catch (e) {
+          if (e.type == DioExceptionType.cancel || cancelToken.isCancelled) {
+            rethrow;
+          }
+
+          final code = e.response?.statusCode;
+          if (code == 416) {
+            if (!rangeResetDone && await partFile.exists()) {
+              rangeResetDone = true;
+              debugPrint(
+                '[RomDownloadService] HTTP 416 Range inválido para ${game.name}; resetando .part e tentando do zero.',
+              );
+              try {
+                await partFile.delete();
+              } catch (delErr) {
+                debugPrint(
+                  '[RomDownloadService] Falha ao limpar .part após HTTP 416: $delErr',
+                );
+              }
+              continue;
+            }
+            throw _NonRetryableDownloadException(_friendlyDioMessage(e));
+          }
+
+          if (code == 401 || code == 403 || code == 404) {
+            throw _NonRetryableDownloadException(_friendlyDioMessage(e));
+          }
+
+          final isRetryable = code == null ||
+              code == 408 ||
+              code == 429 ||
+              (code >= 500 && code < 600);
+
+          if (isRetryable && attempt < maxRetryAttempts) {
+            final delay = Duration(seconds: 1 << (attempt - 1));
+            debugPrint(
+              '[RomDownloadService] Tentativa $attempt/$maxRetryAttempts falhou (${code ?? e.type}); nova tentativa em ${delay.inSeconds}s.',
+            );
+            notify(
+              RomDownloadStatus(
+                state: RomActionState.downloading,
+                progress: expectedTotalBytes > 0
+                    ? (currentBytes / expectedTotalBytes).clamp(0.01, 0.99)
+                    : 0.05,
+                downloadedBytes: currentBytes,
+                totalBytes: expectedTotalBytes,
+                speedLabel: 'Reconectando (${attempt + 1}/$maxRetryAttempts)...',
+              ),
+            );
+            await _delayWithCancel(delay, cancelToken);
+            attempt++;
+            continue;
+          }
+
+          throw StateError(_friendlyDioMessage(e));
+        }
+      }
 
       if (!await partFile.exists()) {
         throw StateError('Arquivo baixado corrompido ou incompleto.');
@@ -917,6 +1173,23 @@ class RomDownloadService {
       }
 
       final finalFile = await partFile.rename(finalDestinationPath);
+
+      final expectedCrc = game.crc32.trim().toUpperCase();
+      final checkCrc = _isValidCrc32Hex(expectedCrc);
+      bool? crcVerified;
+      String? warningMessage;
+      String? zipCrc;
+
+      if (checkCrc &&
+          !isArcade &&
+          finalDestinationPath.toLowerCase().endsWith('.zip')) {
+        zipCrc = await LibraryStorageService.computeFileCrc32Hex(finalFile.path);
+        if (zipCrc == expectedCrc) {
+          crcVerified = true;
+        }
+      }
+
+      String resolvedPath = finalFile.path;
       if (!isArcade && finalDestinationPath.toLowerCase().endsWith('.zip')) {
         notify(
           RomDownloadStatus(
@@ -933,35 +1206,55 @@ class RomDownloadService {
           romsDir: dir,
           platformSlug: game.platformSlug,
         );
-        if (extracted != null) return extracted;
-        if (await finalFile.exists()) {
-          await finalFile.delete();
+        if (extracted == null) {
+          if (await finalFile.exists()) {
+            await finalFile.delete();
+          }
+          throw StateError(
+            'O arquivo .zip baixado não continha uma ROM jogável para ${game.platformName}.',
+          );
         }
-        throw StateError(
-          'O arquivo .zip baixado não continha uma ROM jogável para ${game.platformName}.',
-        );
+        resolvedPath = extracted;
       }
-      return finalFile.path;
+
+      if (checkCrc && crcVerified != true) {
+        final actualCrc =
+            await LibraryStorageService.computeFileCrc32Hex(resolvedPath);
+        if (actualCrc == expectedCrc) {
+          crcVerified = true;
+        } else {
+          crcVerified = false;
+          warningMessage =
+              'CRC32 divergente do catálogo (esperado $expectedCrc, obtido $actualCrc).';
+          debugPrint(
+            '[RomDownloadService] Aviso CRC32 mismatch para "${game.name}": esperado=$expectedCrc, obtido=$actualCrc${zipCrc != null ? " (zip=$zipCrc)" : ""}.',
+          );
+        }
+      }
+
+      return (
+        path: resolvedPath,
+        crcVerified: crcVerified,
+        warningMessage: warningMessage,
+      );
     }
 
     try {
-      try {
-        return await downloadUrlToPath(targetUrl);
-      } catch (e) {
-        // Se uma URL verificada expirou/retornou 404, busca outro mirror público antes de falhar.
-        if (verifiedUrl != null && !cancelToken.isCancelled) {
-          final fallbackMirror = await _findUnlockedArchiveMirror(
-            game: game,
-            cancelToken: cancelToken,
-          );
-          if (fallbackMirror != null && fallbackMirror != targetUrl) {
-            return await downloadUrlToPath(fallbackMirror);
-          }
+      return await downloadUrlToPath(targetUrl);
+    } catch (e) {
+      if (e is DioException && e.type == DioExceptionType.cancel) rethrow;
+      if (verifiedUrl != null &&
+          !cancelToken.isCancelled &&
+          isCurrentOperation()) {
+        final fallbackMirror = await _findUnlockedArchiveMirror(
+          game: game,
+          cancelToken: cancelToken,
+        );
+        if (fallbackMirror != null && fallbackMirror != targetUrl) {
+          return await downloadUrlToPath(fallbackMirror);
         }
-        rethrow;
       }
-    } finally {
-      _cancelTokens.remove(game.igdbId);
+      rethrow;
     }
   }
 
@@ -1083,7 +1376,6 @@ class RomDownloadService {
       if (sizeVal == 0) {
         score -= 30;
       } else {
-        // Desempate discreto para preferir o arquivo principal maior (ex: ISO/Track 1 vs faixa extra pequena)
         score += (sizeVal / (100 * 1024 * 1024)).clamp(0, 20).round();
       }
 
@@ -1165,12 +1457,17 @@ class RomDownloadService {
 
       await extractDir.delete(recursive: true);
       return null;
-    } catch (_) {
+    } catch (e) {
+      debugPrint('[RomDownloadService] Falha ao extrair ZIP $zipPath: $e');
       try {
         if (await extractDir.exists()) {
           await extractDir.delete(recursive: true);
         }
-      } catch (_) {}
+      } catch (cleanupErr) {
+        debugPrint(
+          '[RomDownloadService] Falha ao remover pasta de extração $extractDir: $cleanupErr',
+        );
+      }
       return null;
     }
   }
@@ -1193,11 +1490,18 @@ class RomDownloadService {
     final collections = _collectionsForPlatform(game.platformSlug);
     String? fallbackCollectionUrl;
     for (final collection in collections) {
+      if (cancelToken.isCancelled) {
+        throw DioException.requestCancelled(
+          requestOptions: RequestOptions(path: 'https://archive.org/metadata/$collection'),
+          reason: cancelToken.cancelError?.error,
+        );
+      }
       try {
         final metaRes = await _dio
             .get<Map<String, dynamic>>(
               'https://archive.org/metadata/$collection',
               cancelToken: cancelToken,
+              options: Options(receiveTimeout: defaultReceiveTimeout),
             )
             .timeout(const Duration(seconds: 10));
 
@@ -1242,7 +1546,16 @@ class RomDownloadService {
           }
           fallbackCollectionUrl ??= url;
         }
-      } catch (_) {}
+      } on DioException catch (e) {
+        if (e.type == DioExceptionType.cancel) rethrow;
+        debugPrint(
+          '[RomDownloadService] Archive collection HTTP error ($collection): ${e.response?.statusCode}',
+        );
+      } catch (e) {
+        debugPrint(
+          '[RomDownloadService] Archive collection lookup error ($collection): $e',
+        );
+      }
     }
     if (fallbackCollectionUrl != null) {
       return fallbackCollectionUrl;
@@ -1262,6 +1575,12 @@ class RomDownloadService {
       ];
 
       for (final query in searchQueries) {
+        if (cancelToken.isCancelled) {
+          throw DioException.requestCancelled(
+            requestOptions: RequestOptions(path: 'https://archive.org/advancedsearch.php'),
+            reason: cancelToken.cancelError?.error,
+          );
+        }
         final clean = query
             .replaceAll(RegExp(r'\([^)]*\)'), '')
             .replaceAll(RegExp(r'[^a-zA-Z0-9 ]'), ' ')
@@ -1272,6 +1591,7 @@ class RomDownloadService {
             .get<Map<String, dynamic>>(
               'https://archive.org/advancedsearch.php',
               cancelToken: cancelToken,
+              options: Options(receiveTimeout: defaultReceiveTimeout),
               queryParameters: {
                 'q':
                     'title:("$clean") AND mediatype:(software) AND NOT access-restricted-item:true',
@@ -1289,6 +1609,12 @@ class RomDownloadService {
         final docsTyped = docs.whereType<Map<String, dynamic>>().toList();
 
         for (final doc in docsTyped) {
+          if (cancelToken.isCancelled) {
+            throw DioException.requestCancelled(
+              requestOptions: RequestOptions(path: 'https://archive.org/metadata'),
+              reason: cancelToken.cancelError?.error,
+            );
+          }
           final identifier = doc['identifier'] as String?;
           final docTitle = (doc['title'] as String?) ?? '';
           if (identifier == null || identifier.isEmpty) continue;
@@ -1301,6 +1627,7 @@ class RomDownloadService {
                 .get<Map<String, dynamic>>(
                   'https://archive.org/metadata/$identifier',
                   cancelToken: cancelToken,
+                  options: Options(receiveTimeout: defaultReceiveTimeout),
                 )
                 .timeout(const Duration(seconds: 7));
 
@@ -1324,10 +1651,26 @@ class RomDownloadService {
             if (best != null) {
               return 'https://archive.org/download/$identifier/${_encodeArchivePath(best)}';
             }
-          } catch (_) {}
+          } on DioException catch (e) {
+            if (e.type == DioExceptionType.cancel) rethrow;
+            debugPrint(
+              '[RomDownloadService] Archive mirror metadata error ($identifier): ${e.response?.statusCode}',
+            );
+          } catch (e) {
+            debugPrint(
+              '[RomDownloadService] Archive mirror parse error ($identifier): $e',
+            );
+          }
         }
       }
-    } catch (_) {}
+    } on DioException catch (e) {
+      if (e.type == DioExceptionType.cancel) rethrow;
+      debugPrint(
+        '[RomDownloadService] Archive mirror search HTTP error: ${e.response?.statusCode}',
+      );
+    } catch (e) {
+      debugPrint('[RomDownloadService] Archive mirror search error: $e');
+    }
     return null;
   }
 
@@ -1520,6 +1863,24 @@ class RomDownloadService {
     final targetPath = '${dir.path}/rom_${igdbId}_$safeName';
     await sourceFile.copy(targetPath);
     return targetPath;
+  }
+
+  /// Libera o stream controller de eventos e o cliente HTTP quando próprio.
+  void dispose() {
+    if (_isDisposed) return;
+    _isDisposed = true;
+    for (final token in _cancelTokens.values) {
+      if (!token.isCancelled) {
+        token.cancel('SERVICE_DISPOSED');
+      }
+    }
+    _cancelTokens.clear();
+    if (!_eventsController.isClosed) {
+      unawaited(_eventsController.close());
+    }
+    if (_ownsDio) {
+      _dio.close(force: true);
+    }
   }
 }
 

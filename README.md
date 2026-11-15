@@ -1,35 +1,44 @@
 # LoopGamer
 
 Emulador de consoles retro para Android construído em Flutter, com frontend
-nativo C++/JNI rodando cores **libretro** (.so) — PPSSPP (PSP), PCSX-ReARMed
-(PS1), Snes9x, Genesis Plus GX, Mupen64Plus etc.
+nativo Kotlin/C++/JNI rodando cores **libretro** (`.so`) — PPSSPP (PSP),
+PCSX-ReARMed (PS1), mGBA (GBA), Snes9x, Genesis Plus GX, Mupen64Plus, FBNeo,
+Dolphin etc.
 
-Destaques:
+## Destaques
 
-- **Backend Vulkan** (padrão, experimental) com **OpenGL ES** e **software CPU**
-  como fallback — frontend Vulkan próprio baseado na interface oficial
-  `retro_hw_render_interface_vulkan` v5 do libretro.
-- Renderer EGL/GLES próprio (substitui `ANativeWindow_lock`), HW render com
-  FBO + depth/stencil para cores que usam GPU.
-- Configurações de gráficos estilo PPSSPP: resolução de render 1x–10x/1080p/4K,
-  MSAA, resolução de tela, filtros, textura replacement, toggles de performance.
-- Save states, turbo/fast-forward, gamepad Bluetooth/USB, telemetria de FPS.
+- **Backend Vulkan** (`v5` + negotiation `v2` próprio em `libretro_vulkan.cpp`,
+  padrão/experimental em device) com suporte a drivers **Adreno Turnip** via
+  **AdrenoTools** (`arm64-v8a`), além de **OpenGL ES** e **software CPU** como
+  fallback.
+- **Renderer EGL/GLES** próprio + HW render com FBO e depth/stencil, além de
+  ciclo de vida integrado ao `EmulationForegroundService` (`mediaPlayback`).
+- **Configurações estilo PPSSPP**: resolução de render 1x–10x/1080p/4K, MSAA,
+  escala de tela, filtros, substituição de texturas, presets Freedreno e
+  layout touch customizável isolado em `ValueNotifier` + `RepaintBoundary`.
+- **Catálogo, downloads e biblioteca**: integração REST com servidor **RomM**,
+  downloads com retomada e validação CRC32, cache de capas SteamGridDB em disco
+  e persistência atômica (`.tmp` + `rename` com backup `.corrupt.bak`).
+- **Jogabilidade e segurança**: save states atômicos por slot com preview,
+  turbo/fast-forward, gamepad Bluetooth/USB, telemetria de FPS/frame-time e
+  `networkSecurityConfig` com HTTPS padrão.
 
 ## Documentação
 
-- [`docs/BACKEND.md`](docs/BACKEND.md) — Kotlin + JNI + C++ (libretro, EGL/GLES,
-  Vulkan, áudio, save states, build nativo).
-- [`docs/FRONTEND.md`](docs/FRONTEND.md) — Flutter/Dart (telas, services,
-  `AppSettings`, canais nativos).
-- [`AGENTS.md`](AGENTS.md) — contexto rápido e comandos de build para agentes
-  de IA continuarem o trabalho.
+- [`docs/BACKEND.md`](docs/BACKEND.md) — Kotlin + JNI + C++ (libretro,
+  EGL/GLES, Vulkan/AdrenoTools, áudio, save states, FGS e build nativo).
+- [`docs/FRONTEND.md`](docs/FRONTEND.md) — Flutter/Dart (telas, widgets
+  compartilhados, serviços, `AppSettings`, persistência e canais nativos).
+- [`docs/AGENTS.md`](docs/AGENTS.md) — contexto rápido, regras de arquitetura e
+  comandos de build/teste para agentes de IA continuarem o trabalho.
 
-## Build
+## Build e verificação
 
 ```bash
-./build-apk.sh    # gera loopgamer-release.apk
-flutter analyze   # lint
+./build-apk.sh    # gera loopgamer-release.apk (arm64-v8a + R8 minify/shrink)
+flutter analyze   # lint estrito (analysis_options.yaml)
+flutter test      # suíte de testes unitários e de widgets (32 testes)
 ```
 
 Toolchain portátil em `~/.local/share/loopgamer-toolchain`
-(Flutter + JDK 17 + Android SDK); NDK 27 do sistema em `/opt/android-ndk`.
+(Flutter + JDK 17 + Android SDK); NDK 27 em `/opt/android-ndk` (e no SDK portátil).

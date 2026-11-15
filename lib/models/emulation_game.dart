@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 
 enum RommPlatformCategory {
@@ -646,6 +648,22 @@ class EmulationGame {
     );
     if (match.isNotEmpty) return match.first.accentColor;
     return const Color(0xFF00F5A0);
+  }
+
+  /// Gera um ID inteiro positivo determinístico (FNV-1a 32-bit, faixa > 100000)
+  /// a partir de [key], evitando colisão com o catálogo estático (< 100000)
+  /// e substituindo `.hashCode` de String (instável entre execuções em Dart).
+  static int stableIdFromKey(String key) {
+    const int fnvOffsetBasis = 0x811c9dc5;
+    const int fnvPrime = 0x01000193;
+    var hash = fnvOffsetBasis;
+    for (final byte in utf8.encode(key)) {
+      hash ^= byte;
+      final lo = (hash & 0xFFFF) * fnvPrime;
+      final hi = (((hash >>> 16) * fnvPrime) & 0xFFFF) << 16;
+      hash = (lo + hi) & 0xFFFFFFFF;
+    }
+    return 100001 + (hash % 0x7FFE0000);
   }
 
   static const Map<String, String> _diacriticReplacements = {
