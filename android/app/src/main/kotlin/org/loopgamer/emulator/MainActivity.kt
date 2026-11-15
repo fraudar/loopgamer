@@ -1,20 +1,33 @@
 package org.loopgamer.emulator
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.Color
 import android.graphics.SurfaceTexture
+import android.hardware.input.InputManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import android.view.InputDevice
+import android.view.InputEvent
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
+import android.view.WindowManager
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -52,6 +65,13 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         private const val RETRO_R = 1 shl 11
         private const val RETRO_L2 = 1 shl 12
         private const val RETRO_R2 = 1 shl 13
+        private const val RETRO_L3 = 1 shl 14
+        private const val RETRO_R3 = 1 shl 15
+
+        private const val REQ_POST_NOTIFICATIONS = 4105
+        private const val GAMEPAD_ACTIVE_THROTTLE_MS = 400L
+        private const val UI_MOTION_REPEAT_MS = 180L
+        private const val SELECT_HOLD_FAST_FORWARD_MS = 320L
 
         // Plataformas que só possuem 1 gatilho de cada lado (L e R, sem L2/R2),
         // como PSP (God of War), GBA, SNES e Nintendo DS.
@@ -95,13 +115,21 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private val vsyncEnabledFlag = AtomicBoolean(false)
     private val audioEnabledFlag = AtomicBoolean(true)
     @Volatile private var masterVolumeLevel: Float = 0.85f
+    @Volatile private var baseFastForwardMultiplier: Double = 1.0
+    @Volatile private var hardwareSelectFastForwardActive: Boolean = false
     @Volatile private var fastForwardMultiplier: Double = 1.0
     private val touchJoypadMask = AtomicInteger(0)
     private val hardwareJoypadMask = AtomicInteger(0)
     private val hardwareAxisMask = AtomicInteger(0)
     @Volatile private var singleTriggerPlatform: Boolean = false
-    private val leftStickX = AtomicInteger(0)
-    private val leftStickY = AtomicInteger(0)
+    private val touchLeftStickX = AtomicInteger(0)
+    private val touchLeftStickY = AtomicInteger(0)
+    private val touchRightStickX = AtomicInteger(0)
+    private val touchRightStickY = AtomicInteger(0)
+    private val hardwareLeftStickX = AtomicInteger(0)
+    private val hardwareLeftStickY = AtomicInteger(0)
+    private val hardwareRightStickX = AtomicInteger(0)
+    private val hardwareRightStickY = AtomicInteger(0)
     @Volatile private var currentSavesDir: String = ""
     @Volatile private var currentRomBaseName: String = "slot"
     @Volatile private var currentSessionTitle: String = "LoopGamer"
@@ -109,6 +137,100 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var methodChannel: MethodChannel? = null
     private var eventChannel: EventChannel? = null
+    private var inputManager: InputManager? = null
+    private val lastGamepadActiveEmitMs = AtomicLong(-GAMEPAD_ACTIVE_THROTTLE_MS)
+    @Volatile private var lastReportedGamepadConnected: Boolean? = null
+    private var notificationPermissionRequestedThisSession: Boolean = false
+
+    private var currentUiDirection: String? = null
+    private var uiLeftTriggerPressed: Boolean = false
+    private var uiRightTriggerPressed: Boolean = false
+
+    private val uiDirectionRepeatRunnable = object : Runnable {
+        override fun run() {
+            val dir = currentUiDirection ?: return
+            if (isRunning.get() && !isPaused.get()) {
+                currentUiDirection = null
+                return
+            }
+            emitGamepadUiAction(dir)
+            notifyHardwareGamepadActive()
+            mainHandler.postDelayed(this, UI_MOTION_REPEAT_MS)
+        }
+    }
+
+    private val selectHoldFastForwardRunnable = Runnable {
+        if (isRunning.get() &&
+            !isPaused.get() &&
+            (hardwareJoypadMask.get() and RETRO_SELECT) != 0 &&
+            baseFastForwardMultiplier < 2.0
+        ) {
+            hardwareSelectFastForwardActive = true
+            updateEffectiveFastForward()
+        }
+    }
+
+    private val inputDeviceListener = object : InputManager.InputDeviceListener {
+        override fun onInputDeviceAdded(deviceId: Int) {
+            val dev = InputDevice.getDevice(deviceId)
+            val connected = hasConnectedPhysicalGamepad()
+            if (isPhysicalGamepadDevice(dev) || connected != lastReportedGamepadConnected) {
+                emitHardwareGamepadState(connected = connected, forceEmit = true)
+            }
+        }
+
+        override fun onInputDeviceRemoved(deviceId: Int) {
+            val connected = hasConnectedPhysicalGamepad()
+            if (connected != lastReportedGamepadConnected) {
+                emitHardwareGamepadState(connected = connected, forceEmit = true)
+            }
+        }
+
+        override fun onInputDeviceChanged(deviceId: Int) {
+            val dev = InputDevice.getDevice(deviceId)
+            val connected = hasConnectedPhysicalGamepad()
+            if (isPhysicalGamepadDevice(dev) || connected != lastReportedGamepadConnected) {
+                emitHardwareGamepadState(connected = connected, forceEmit = true)
+            }
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        applyEdgeToEdgeAndCutout(touchDecorView = false)
+        super.onCreate(savedInstanceState)
+        applyEdgeToEdgeAndCutout()
+        inputManager = getSystemService(Context.INPUT_SERVICE) as? InputManager
+        inputManager?.registerInputDeviceListener(inputDeviceListener, mainHandler)
+    }
+
+    private fun applyEdgeToEdgeAndCutout(touchDecorView: Boolean = true) {
+        val win = window ?: return
+        WindowCompat.setDecorFitsSystemWindows(win, false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            win.attributes = win.attributes.apply {
+                layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                } else {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
+            }
+        }
+        @Suppress("DEPRECATION")
+        win.statusBarColor = Color.TRANSPARENT
+        @Suppress("DEPRECATION")
+        win.navigationBarColor = Color.TRANSPARENT
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            @Suppress("DEPRECATION")
+            win.isStatusBarContrastEnforced = false
+            win.isNavigationBarContrastEnforced = false
+        }
+        if (touchDecorView) {
+            WindowInsetsControllerCompat(win, win.decorView).apply {
+                isAppearanceLightStatusBars = false
+                isAppearanceLightNavigationBars = false
+            }
+        }
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -125,6 +247,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             it.setStreamHandler(object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
                     eventSink = events
+                    emitHardwareGamepadState(
+                        connected = hasConnectedPhysicalGamepad(),
+                        forceEmit = true
+                    )
                 }
 
                 override fun onCancel(arguments: Any?) {
@@ -160,7 +286,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 val customDriverName = call.argument<String>("customDriverName") ?: ""
                 val adrenoTurbo = call.argument<Boolean>("adrenoTurbo") ?: false
                 val freedrenoPreset = call.argument<String>("freedrenoPreset") ?: ""
-                val platform = call.argument<String>("platform")?.lowercase() ?: ""
+                val platform = call.argument<String>("platform")?.trim()?.lowercase() ?: ""
+                val explicitSingleTrigger = call.argument<Boolean>("singleTrigger")
 
                 if (corePath.isNullOrEmpty() || romPath.isNullOrEmpty()) {
                     result.error("INVALID_ARGS", "corePath e romPath são obrigatórios.", null)
@@ -176,11 +303,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 val entry = engine.renderer.createSurfaceTexture()
                 val st = entry.surfaceTexture()
                 val romLower = romPath.lowercase()
-                val isPs1 = platform == "ps1" || platform == "psx"
+                val isPs1 = platform in setOf("ps", "ps1", "psx", "playstation")
                 val isPsp = platform == "psp" ||
-                    romLower.endsWith(".iso") ||
-                    romLower.endsWith(".cso") ||
-                    (!isPs1 && (romLower.endsWith(".pbp") || romLower.endsWith(".chd")))
+                    (platform.isEmpty() && (romLower.endsWith(".cso") || romLower.endsWith(".pbp")))
 
                 val initW = when {
                     isPsp -> (480 * screenScale).coerceIn(64, 4096)
@@ -233,12 +358,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     nativeSetVsync(vsync)
                     nativeSetCoreOptions(coreOptions)
 
-                    singleTriggerPlatform = platform in SINGLE_TRIGGER_PLATFORMS || isPsp
-                    touchJoypadMask.set(0)
-                    hardwareJoypadMask.set(0)
-                    hardwareAxisMask.set(0)
-                    leftStickX.set(0)
-                    leftStickY.set(0)
+                    singleTriggerPlatform = explicitSingleTrigger ?: (platform in SINGLE_TRIGGER_PLATFORMS || isPsp)
+                    resetAllInputAtomics()
+                    resetFastForwardState()
+                    mainHandler.post { resetUiGamepadMotionState() }
                     userPaused.set(false)
                     lifecyclePaused.set(!isActivityResumed.get())
                     isPaused.set(lifecyclePaused.get())
@@ -325,7 +448,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
             "setFastForward" -> {
                 val speed = (call.argument<Double>("speed") ?: 1.0).coerceIn(1.0, 8.0)
-                fastForwardMultiplier = speed
+                baseFastForwardMultiplier = speed
+                updateEffectiveFastForward()
                 result.success(null)
             }
 
@@ -337,12 +461,20 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             }
 
             "updateInput" -> {
-                val mask = call.argument<Int>("joypadMask") ?: 0
-                val lx = call.argument<Int>("leftX") ?: 0
-                val ly = call.argument<Int>("leftY") ?: 0
+                val mask = (call.argument<Any>("joypadMask") as? Number)?.toInt() ?: 0
+                val lx = (call.argument<Any>("leftX") as? Number)?.toInt() ?: 0
+                val ly = (call.argument<Any>("leftY") as? Number)?.toInt() ?: 0
                 touchJoypadMask.set(mask)
-                leftStickX.set(lx)
-                leftStickY.set(ly)
+                touchLeftStickX.set(lx)
+                touchLeftStickY.set(ly)
+                val rx = (call.argument<Any>("rightX") as? Number)?.toInt()
+                val ry = (call.argument<Any>("rightY") as? Number)?.toInt()
+                if (rx != null) {
+                    touchRightStickX.set(rx)
+                }
+                if (ry != null) {
+                    touchRightStickY.set(ry)
+                }
                 pushCombinedInputToNative()
                 result.success(null)
             }
@@ -400,11 +532,103 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 userPaused.set(false)
                 lifecyclePaused.set(false)
                 isPaused.set(false)
+                resetUiGamepadMotionState()
+                resetFastForwardState()
+                resetAllInputAtomics()
+                pushCombinedInputToNative()
                 EmulationForegroundService.stop(this)
                 nativeExecutor.execute {
                     stopLibretroLoopInternal()
                     mainHandler.post { result.success(null) }
                 }
+            }
+
+            "syncDownloadNotification" -> {
+                val activeCount = (call.argument<Any>("activeCount") as? Number)?.toInt() ?: 0
+                val queuedCount = (call.argument<Any>("queuedCount") as? Number)?.toInt() ?: 0
+                val completedCount = (call.argument<Any>("completedCount") as? Number)?.toInt() ?: 0
+                val failedCount = (call.argument<Any>("failedCount") as? Number)?.toInt() ?: 0
+                val progressPercent = (call.argument<Any>("progressPercent") as? Number)?.toInt() ?: 0
+                val indeterminate = call.argument<Boolean>("indeterminate") ?: false
+                val title = call.argument<String>("title") ?: ""
+                val detail = call.argument<String>("detail") ?: ""
+
+                if (activeCount > 0 || queuedCount > 0) {
+                    val intent = DownloadForegroundService.buildSyncIntent(
+                        context = this,
+                        activeCount = activeCount,
+                        queuedCount = queuedCount,
+                        completedCount = completedCount,
+                        failedCount = failedCount,
+                        progressPercent = progressPercent,
+                        indeterminate = indeterminate,
+                        title = title,
+                        detail = detail,
+                        startedAsForeground = true
+                    )
+                    DownloadForegroundService.hasPendingOrActiveStart = true
+                    try {
+                        ContextCompat.startForegroundService(this, intent)
+                    } catch (t: Throwable) {
+                        DownloadForegroundService.hasPendingOrActiveStart = DownloadForegroundService.isActive
+                        Log.w(TAG, "Falha ao iniciar/atualizar DownloadForegroundService: ${t.message}")
+                    }
+                } else {
+                    val stopIntent = DownloadForegroundService.buildStopIntent(
+                        context = this,
+                        completedCount = completedCount,
+                        failedCount = failedCount,
+                        title = title,
+                        detail = detail
+                    )
+                    if (DownloadForegroundService.isActive || DownloadForegroundService.hasPendingOrActiveStart) {
+                        try {
+                            startService(stopIntent)
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "Falha ao parar DownloadForegroundService via intent: ${t.message}")
+                            DownloadForegroundService.stopNowAndNotifyCompletion(
+                                context = this,
+                                completedCount = completedCount,
+                                failedCount = failedCount,
+                                title = title,
+                                detail = detail
+                            )
+                        }
+                    } else {
+                        DownloadForegroundService.stopNowAndNotifyCompletion(
+                            context = this,
+                            completedCount = completedCount,
+                            failedCount = failedCount,
+                            title = title,
+                            detail = detail
+                        )
+                    }
+                }
+                result.success(null)
+            }
+
+            "requestNotificationPermission" -> {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                    result.success(true)
+                    return
+                }
+                val granted = ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) == PackageManager.PERMISSION_GRANTED
+                if (!granted && !notificationPermissionRequestedThisSession) {
+                    notificationPermissionRequestedThisSession = true
+                    try {
+                        ActivityCompat.requestPermissions(
+                            this,
+                            arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                            REQ_POST_NOTIFICATIONS
+                        )
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "Falha ao solicitar permissão POST_NOTIFICATIONS: ${t.message}")
+                    }
+                }
+                result.success(granted)
             }
 
             "getNetworkStatus" -> {
@@ -433,6 +657,15 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         val running = isRunning.get()
         val effectivePaused = userPaused.get() || lifecyclePaused.get() || !isActivityResumed.get()
         isPaused.set(effectivePaused)
+
+        if (running && effectivePaused) {
+            cancelHardwareSelectFastForward()
+            resetUiGamepadMotionState()
+            resetAllInputAtomics()
+            pushCombinedInputToNative()
+        } else if (running) {
+            resetUiGamepadMotionState()
+        }
 
         synchronized(audioLock) {
             val track = audioTrack
@@ -620,6 +853,59 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         }
     }
 
+    private fun updateEffectiveFastForward() {
+        fastForwardMultiplier = if (hardwareSelectFastForwardActive) {
+            maxOf(baseFastForwardMultiplier, 2.0)
+        } else {
+            baseFastForwardMultiplier
+        }
+    }
+
+    private fun cancelHardwareSelectFastForward() {
+        mainHandler.removeCallbacks(selectHoldFastForwardRunnable)
+        if (hardwareSelectFastForwardActive) {
+            hardwareSelectFastForwardActive = false
+            updateEffectiveFastForward()
+        }
+    }
+
+    private fun resetFastForwardState() {
+        mainHandler.removeCallbacks(selectHoldFastForwardRunnable)
+        hardwareSelectFastForwardActive = false
+        baseFastForwardMultiplier = 1.0
+        updateEffectiveFastForward()
+    }
+
+    private fun resetAllInputAtomics() {
+        touchJoypadMask.set(0)
+        hardwareJoypadMask.set(0)
+        hardwareAxisMask.set(0)
+        touchLeftStickX.set(0)
+        touchLeftStickY.set(0)
+        touchRightStickX.set(0)
+        touchRightStickY.set(0)
+        hardwareLeftStickX.set(0)
+        hardwareLeftStickY.set(0)
+        hardwareRightStickX.set(0)
+        hardwareRightStickY.set(0)
+    }
+
+    private fun resetUiGamepadMotionState() {
+        mainHandler.removeCallbacks(uiDirectionRepeatRunnable)
+        currentUiDirection = null
+        uiLeftTriggerPressed = false
+        uiRightTriggerPressed = false
+    }
+
+    private fun pickCombinedAxis(touchValue: Int, hardwareValue: Int): Short {
+        val chosen = if (kotlin.math.abs(hardwareValue) > kotlin.math.abs(touchValue)) {
+            hardwareValue
+        } else {
+            touchValue
+        }
+        return chosen.coerceIn(-32767, 32767).toShort()
+    }
+
     private fun pushCombinedInputToNative() {
         var mergedMask = touchJoypadMask.get() or hardwareJoypadMask.get() or hardwareAxisMask.get()
         if (singleTriggerPlatform) {
@@ -630,98 +916,416 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 mergedMask = (mergedMask and RETRO_R2.inv()) or RETRO_R
             }
         }
-        nativeUpdateInput(
-            mergedMask,
-            leftStickX.get().toShort(),
-            leftStickY.get().toShort()
+        val lx = pickCombinedAxis(touchLeftStickX.get(), hardwareLeftStickX.get())
+        val ly = pickCombinedAxis(touchLeftStickY.get(), hardwareLeftStickY.get())
+        val rx = pickCombinedAxis(touchRightStickX.get(), hardwareRightStickX.get())
+        val ry = pickCombinedAxis(touchRightStickY.get(), hardwareRightStickY.get())
+        nativeUpdateInput(mergedMask, lx, ly, rx, ry)
+    }
+
+    private fun emitEventOnMain(payload: Map<String, Any>) {
+        val send = Runnable {
+            try {
+                eventSink?.success(payload)
+            } catch (_: Throwable) {
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            send.run()
+        } else {
+            mainHandler.post(send)
+        }
+    }
+
+    private fun emitHardwareGamepadState(connected: Boolean, forceEmit: Boolean) {
+        if (!forceEmit && connected == lastReportedGamepadConnected) return
+        lastReportedGamepadConnected = connected
+        emitEventOnMain(
+            mapOf(
+                "event" to "hardwareGamepadState",
+                "connected" to connected
+            )
+        )
+        if (connected) {
+            notifyHardwareGamepadActive(force = true)
+        }
+    }
+
+    private fun notifyHardwareGamepadActive(force: Boolean = false) {
+        val now = SystemClock.elapsedRealtime()
+        if (!force) {
+            val prev = lastGamepadActiveEmitMs.get()
+            if (now - prev < GAMEPAD_ACTIVE_THROTTLE_MS) return
+            if (!lastGamepadActiveEmitMs.compareAndSet(prev, now)) return
+        } else {
+            lastGamepadActiveEmitMs.set(now)
+        }
+        emitEventOnMain(mapOf("event" to "hardwareGamepadActive"))
+    }
+
+    private fun emitGamepadUiAction(action: String) {
+        emitEventOnMain(
+            mapOf(
+                "event" to "gamepadUiAction",
+                "action" to action
+            )
         )
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        val bit = mapKeyCodeToRetroBit(keyCode)
-        if (bit != 0 && isRunning.get()) {
-            hardwareJoypadMask.set(hardwareJoypadMask.get() or bit)
-            pushCombinedInputToNative()
-            mainHandler.post {
-                try {
-                    eventSink?.success(mapOf("event" to "hardwareGamepadActive"))
-                } catch (_: Throwable) {
+    private fun isPhysicalGamepadDevice(device: InputDevice?): Boolean {
+        if (device == null || device.isVirtual) return false
+        if (device.supportsSource(InputDevice.SOURCE_TOUCHSCREEN)) return false
+        return device.supportsSource(InputDevice.SOURCE_GAMEPAD) ||
+            device.supportsSource(InputDevice.SOURCE_JOYSTICK)
+    }
+
+    private fun hasConnectedPhysicalGamepad(): Boolean {
+        for (id in InputDevice.getDeviceIds()) {
+            val dev = InputDevice.getDevice(id) ?: continue
+            if (isPhysicalGamepadDevice(dev)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun isPhysicalGamepadEvent(event: InputEvent?): Boolean {
+        if (event == null || event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN)) {
+            return false
+        }
+        if (event.device?.isVirtual == true) {
+            return false
+        }
+        return event.isFromSource(InputDevice.SOURCE_GAMEPAD) ||
+            event.isFromSource(InputDevice.SOURCE_JOYSTICK) ||
+            event.isFromSource(InputDevice.SOURCE_DPAD)
+    }
+
+    private fun isDirectGamepadKeySource(event: KeyEvent?): Boolean {
+        if (event == null || event.deviceId <= 0 || event.device?.isVirtual == true) {
+            return false
+        }
+        return event.isFromSource(InputDevice.SOURCE_GAMEPAD) ||
+            event.isFromSource(InputDevice.SOURCE_JOYSTICK)
+    }
+
+    private fun applyStickDeadzone(raw: Float, deadzone: Float = 0.12f): Short {
+        val absVal = kotlin.math.abs(raw)
+        if (absVal < deadzone) return 0
+        val scaled = ((absVal - deadzone) / (1f - deadzone)).coerceIn(0f, 1f)
+        val signed = if (raw < 0f) -scaled else scaled
+        return (signed * 32767f).toInt().coerceIn(-32767, 32767).toShort()
+    }
+
+    private fun findMotionRange(
+        device: InputDevice?,
+        axis: Int,
+        source: Int
+    ): InputDevice.MotionRange? {
+        if (device == null) return null
+        return device.getMotionRange(axis, source) ?: device.getMotionRange(axis)
+    }
+
+    private fun readRightStickAxes(event: MotionEvent): Pair<Float, Float> {
+        val dev = event.device
+            ?: return Pair(
+                event.getAxisValue(MotionEvent.AXIS_Z),
+                event.getAxisValue(MotionEvent.AXIS_RZ)
+            )
+        val src = event.source
+        val zRange = findMotionRange(dev, MotionEvent.AXIS_Z, src)
+        val rzRange = findMotionRange(dev, MotionEvent.AXIS_RZ, src)
+        val rxRange = findMotionRange(dev, MotionEvent.AXIS_RX, src)
+        val ryRange = findMotionRange(dev, MotionEvent.AXIS_RY, src)
+
+        val zIsStick = zRange != null && zRange.min < -0.1f
+        val rzIsStick = rzRange != null && rzRange.min < -0.1f
+        val rxIsStick = rxRange != null && rxRange.min < -0.1f
+        val ryIsStick = ryRange != null && ryRange.min < -0.1f
+
+        return when {
+            zIsStick || rzIsStick -> Pair(
+                if (zIsStick) event.getAxisValue(MotionEvent.AXIS_Z) else 0f,
+                if (rzIsStick) event.getAxisValue(MotionEvent.AXIS_RZ) else 0f
+            )
+            rxIsStick || ryIsStick -> Pair(
+                if (rxIsStick) event.getAxisValue(MotionEvent.AXIS_RX) else 0f,
+                if (ryIsStick) event.getAxisValue(MotionEvent.AXIS_RY) else 0f
+            )
+            else -> Pair(0f, 0f)
+        }
+    }
+
+    private fun readAnalogTriggers(event: MotionEvent): Pair<Float, Float> {
+        var lTrig = maxOf(
+            event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
+            event.getAxisValue(MotionEvent.AXIS_BRAKE)
+        )
+        var rTrig = maxOf(
+            event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
+            event.getAxisValue(MotionEvent.AXIS_GAS)
+        )
+        val dev = event.device
+        if (dev != null) {
+            val src = event.source
+            val hasExplicitTriggers =
+                findMotionRange(dev, MotionEvent.AXIS_LTRIGGER, src) != null ||
+                    findMotionRange(dev, MotionEvent.AXIS_BRAKE, src) != null ||
+                    findMotionRange(dev, MotionEvent.AXIS_RTRIGGER, src) != null ||
+                    findMotionRange(dev, MotionEvent.AXIS_GAS, src) != null
+            if (!hasExplicitTriggers) {
+                val zRange = findMotionRange(dev, MotionEvent.AXIS_Z, src)
+                val rzRange = findMotionRange(dev, MotionEvent.AXIS_RZ, src)
+                if (zRange != null && zRange.min >= 0f) {
+                    lTrig = maxOf(lTrig, event.getAxisValue(MotionEvent.AXIS_Z))
+                }
+                if (rzRange != null && rzRange.min >= 0f) {
+                    rTrig = maxOf(rTrig, event.getAxisValue(MotionEvent.AXIS_RZ))
                 }
             }
+        }
+        return Pair(lTrig, rTrig)
+    }
+
+    private fun handleHardwareRetroKeyDown(bit: Int, repeatCount: Int) {
+        hardwareJoypadMask.set(hardwareJoypadMask.get() or bit)
+        pushCombinedInputToNative()
+        notifyHardwareGamepadActive()
+        if (bit == RETRO_SELECT && repeatCount == 0) {
+            mainHandler.removeCallbacks(selectHoldFastForwardRunnable)
+            mainHandler.postDelayed(selectHoldFastForwardRunnable, SELECT_HOLD_FAST_FORWARD_MS)
+        }
+    }
+
+    private fun handleHardwareRetroKeyUp(bit: Int) {
+        hardwareJoypadMask.set(hardwareJoypadMask.get() and bit.inv())
+        pushCombinedInputToNative()
+        if (bit == RETRO_SELECT) {
+            cancelHardwareSelectFastForward()
+        }
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.keyCode == KeyEvent.KEYCODE_BUTTON_MODE &&
+            !event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN) &&
+            event.device?.isVirtual != true
+        ) {
+            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                emitGamepadUiAction("guide")
+                notifyHardwareGamepadActive()
+            }
             return true
+        }
+
+        if (isPhysicalGamepadEvent(event)) {
+            if (isRunning.get() && !isPaused.get()) {
+                val bit = mapKeyCodeToRetroBit(event.keyCode, event)
+                if (bit != 0) {
+                    when (event.action) {
+                        KeyEvent.ACTION_DOWN -> handleHardwareRetroKeyDown(bit, event.repeatCount)
+                        KeyEvent.ACTION_UP -> handleHardwareRetroKeyUp(bit)
+                    }
+                    return true
+                }
+            } else {
+                val uiAction = when {
+                    event.keyCode == KeyEvent.KEYCODE_BACK && isDirectGamepadKeySource(event) -> "select"
+                    event.keyCode == KeyEvent.KEYCODE_MENU && isDirectGamepadKeySource(event) -> "start"
+                    event.keyCode == KeyEvent.KEYCODE_MEDIA_RECORD && isDirectGamepadKeySource(event) -> "select"
+                    else -> mapGenericHidKeyToUiAction(event.keyCode)
+                }
+                if (uiAction != null) {
+                    if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                        emitGamepadUiAction(uiAction)
+                        notifyHardwareGamepadActive()
+                    }
+                    return true
+                }
+                notifyHardwareGamepadActive()
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (isRunning.get() && !isPaused.get() && isPhysicalGamepadEvent(event)) {
+            val bit = mapKeyCodeToRetroBit(keyCode, event)
+            if (bit != 0) {
+                handleHardwareRetroKeyDown(bit, event?.repeatCount ?: 0)
+                return true
+            }
         }
         return super.onKeyDown(keyCode, event)
     }
 
     override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
-        val bit = mapKeyCodeToRetroBit(keyCode)
-        if (bit != 0 && isRunning.get()) {
-            hardwareJoypadMask.set(hardwareJoypadMask.get() and bit.inv())
-            pushCombinedInputToNative()
-            return true
+        if (isRunning.get() && !isPaused.get() && isPhysicalGamepadEvent(event)) {
+            val bit = mapKeyCodeToRetroBit(keyCode, event)
+            if (bit != 0) {
+                handleHardwareRetroKeyUp(bit)
+                return true
+            }
         }
         return super.onKeyUp(keyCode, event)
     }
 
     override fun onGenericMotionEvent(event: MotionEvent?): Boolean {
-        if (event != null &&
-            (event.source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK &&
-            isRunning.get()
-        ) {
-            val lx = (event.getAxisValue(MotionEvent.AXIS_X) * 32767f).toInt().coerceIn(-32767, 32767)
-            val ly = (event.getAxisValue(MotionEvent.AXIS_Y) * 32767f).toInt().coerceIn(-32767, 32767)
-            val lTrig = maxOf(
-                event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
-                event.getAxisValue(MotionEvent.AXIS_BRAKE)
-            )
-            val rTrig = maxOf(
-                event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
-                event.getAxisValue(MotionEvent.AXIS_GAS)
-            )
-            val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
-            val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
+        if (event != null && isPhysicalGamepadEvent(event)) {
+            if (event.action == MotionEvent.ACTION_CANCEL) {
+                if (isRunning.get() && !isPaused.get()) {
+                    hardwareLeftStickX.set(0)
+                    hardwareLeftStickY.set(0)
+                    hardwareRightStickX.set(0)
+                    hardwareRightStickY.set(0)
+                    hardwareAxisMask.set(0)
+                    pushCombinedInputToNative()
+                } else {
+                    resetUiGamepadMotionState()
+                }
+                return super.onGenericMotionEvent(event)
+            }
 
-            var axisBits = 0
-            if (lTrig >= 0.30f) axisBits = axisBits or RETRO_L2
-            if (rTrig >= 0.30f) axisBits = axisBits or RETRO_R2
-            if (hatX <= -0.5f) axisBits = axisBits or RETRO_LEFT
-            if (hatX >= 0.5f) axisBits = axisBits or RETRO_RIGHT
-            if (hatY <= -0.5f) axisBits = axisBits or RETRO_UP
-            if (hatY >= 0.5f) axisBits = axisBits or RETRO_DOWN
+            if (event.action == MotionEvent.ACTION_MOVE) {
+                val (lTrig, rTrig) = readAnalogTriggers(event)
+                val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
+                val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
+                val rawLx = event.getAxisValue(MotionEvent.AXIS_X)
+                val rawLy = event.getAxisValue(MotionEvent.AXIS_Y)
 
-            leftStickX.set(lx)
-            leftStickY.set(ly)
-            hardwareAxisMask.set(axisBits)
-            pushCombinedInputToNative()
-            if (kotlin.math.abs(lx) > 3000 || kotlin.math.abs(ly) > 3000 || axisBits != 0) {
-                mainHandler.post {
-                    try {
-                        eventSink?.success(mapOf("event" to "hardwareGamepadActive"))
-                    } catch (_: Throwable) {
+                if (isRunning.get() && !isPaused.get()) {
+                    val lx = applyStickDeadzone(rawLx)
+                    val ly = applyStickDeadzone(rawLy)
+                    val (rawRx, rawRy) = readRightStickAxes(event)
+                    val rx = applyStickDeadzone(rawRx)
+                    val ry = applyStickDeadzone(rawRy)
+
+                    var axisBits = 0
+                    if (lTrig >= 0.30f) axisBits = axisBits or RETRO_L2
+                    if (rTrig >= 0.30f) axisBits = axisBits or RETRO_R2
+                    if (hatX <= -0.5f) axisBits = axisBits or RETRO_LEFT
+                    if (hatX >= 0.5f) axisBits = axisBits or RETRO_RIGHT
+                    if (hatY <= -0.5f) axisBits = axisBits or RETRO_UP
+                    if (hatY >= 0.5f) axisBits = axisBits or RETRO_DOWN
+
+                    hardwareLeftStickX.set(lx.toInt())
+                    hardwareLeftStickY.set(ly.toInt())
+                    hardwareRightStickX.set(rx.toInt())
+                    hardwareRightStickY.set(ry.toInt())
+                    hardwareAxisMask.set(axisBits)
+                    pushCombinedInputToNative()
+
+                    if (kotlin.math.abs(lx.toInt()) > 3000 ||
+                        kotlin.math.abs(ly.toInt()) > 3000 ||
+                        kotlin.math.abs(rx.toInt()) > 3000 ||
+                        kotlin.math.abs(ry.toInt()) > 3000 ||
+                        axisBits != 0
+                    ) {
+                        notifyHardwareGamepadActive()
+                    }
+                    return true
+                }
+
+                // Modo UI (menu ou emulação pausada): direciona HAT/analógico esquerdo + L2/R2
+                val direction: String? = when {
+                    kotlin.math.abs(hatX) >= 0.55f || kotlin.math.abs(hatY) >= 0.55f -> {
+                        if (kotlin.math.abs(hatX) >= kotlin.math.abs(hatY)) {
+                            if (hatX < 0f) "dpadLeft" else "dpadRight"
+                        } else {
+                            if (hatY < 0f) "dpadUp" else "dpadDown"
+                        }
+                    }
+                    kotlin.math.abs(rawLx) >= 0.60f || kotlin.math.abs(rawLy) >= 0.60f -> {
+                        if (kotlin.math.abs(rawLx) >= kotlin.math.abs(rawLy)) {
+                            if (rawLx < 0f) "dpadLeft" else "dpadRight"
+                        } else {
+                            if (rawLy < 0f) "dpadUp" else "dpadDown"
+                        }
+                    }
+                    else -> null
+                }
+
+                val directionChanged = direction != currentUiDirection
+                if (directionChanged) {
+                    mainHandler.removeCallbacks(uiDirectionRepeatRunnable)
+                    currentUiDirection = direction
+                    if (direction != null) {
+                        emitGamepadUiAction(direction)
+                        notifyHardwareGamepadActive()
+                        mainHandler.postDelayed(uiDirectionRepeatRunnable, UI_MOTION_REPEAT_MS)
                     }
                 }
+
+                val lPressed = if (uiLeftTriggerPressed) lTrig >= 0.40f else lTrig >= 0.55f
+                val rPressed = if (uiRightTriggerPressed) rTrig >= 0.40f else rTrig >= 0.55f
+                val triggerChanged = (lPressed != uiLeftTriggerPressed) || (rPressed != uiRightTriggerPressed)
+                if (lPressed && !uiLeftTriggerPressed) {
+                    emitGamepadUiAction("l2")
+                    notifyHardwareGamepadActive()
+                }
+                if (rPressed && !uiRightTriggerPressed) {
+                    emitGamepadUiAction("r2")
+                    notifyHardwareGamepadActive()
+                }
+                uiLeftTriggerPressed = lPressed
+                uiRightTriggerPressed = rPressed
+
+                if (directionChanged ||
+                    triggerChanged ||
+                    direction != null ||
+                    lPressed ||
+                    rPressed ||
+                    event.isFromSource(InputDevice.SOURCE_JOYSTICK)
+                ) {
+                    return true
+                }
             }
-            return true
         }
         return super.onGenericMotionEvent(event)
     }
 
-    private fun mapKeyCodeToRetroBit(keyCode: Int): Int {
+    private fun mapGenericHidKeyToUiAction(keyCode: Int): String? {
         return when (keyCode) {
-            KeyEvent.KEYCODE_BUTTON_A -> RETRO_B
-            KeyEvent.KEYCODE_BUTTON_B -> RETRO_A
-            KeyEvent.KEYCODE_BUTTON_X -> RETRO_Y
-            KeyEvent.KEYCODE_BUTTON_Y -> RETRO_X
-            KeyEvent.KEYCODE_BUTTON_L1 -> RETRO_L
-            KeyEvent.KEYCODE_BUTTON_R1 -> RETRO_R
-            KeyEvent.KEYCODE_BUTTON_L2 -> RETRO_L2
-            KeyEvent.KEYCODE_BUTTON_R2 -> RETRO_R2
-            KeyEvent.KEYCODE_BUTTON_SELECT -> RETRO_SELECT
-            KeyEvent.KEYCODE_BUTTON_START -> RETRO_START
+            KeyEvent.KEYCODE_BUTTON_1 -> "a"
+            KeyEvent.KEYCODE_BUTTON_2 -> "b"
+            KeyEvent.KEYCODE_BUTTON_3 -> "x"
+            KeyEvent.KEYCODE_BUTTON_4 -> "y"
+            KeyEvent.KEYCODE_BUTTON_5 -> "l1"
+            KeyEvent.KEYCODE_BUTTON_6 -> "r1"
+            KeyEvent.KEYCODE_BUTTON_7 -> "l2"
+            KeyEvent.KEYCODE_BUTTON_8 -> "r2"
+            KeyEvent.KEYCODE_BUTTON_9 -> "select"
+            KeyEvent.KEYCODE_BUTTON_10 -> "start"
+            KeyEvent.KEYCODE_BUTTON_11 -> "l3"
+            KeyEvent.KEYCODE_BUTTON_12 -> "r3"
+            KeyEvent.KEYCODE_BUTTON_13 -> "select"
+            KeyEvent.KEYCODE_BUTTON_14 -> "start"
+            KeyEvent.KEYCODE_BUTTON_15 -> "l2"
+            KeyEvent.KEYCODE_BUTTON_16 -> "r2"
+            else -> null
+        }
+    }
+
+    private fun mapKeyCodeToRetroBit(keyCode: Int, event: KeyEvent? = null): Int {
+        return when (keyCode) {
+            KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_1 -> RETRO_B
+            KeyEvent.KEYCODE_BUTTON_B, KeyEvent.KEYCODE_BUTTON_2 -> RETRO_A
+            KeyEvent.KEYCODE_BUTTON_X, KeyEvent.KEYCODE_BUTTON_3 -> RETRO_Y
+            KeyEvent.KEYCODE_BUTTON_Y, KeyEvent.KEYCODE_BUTTON_4 -> RETRO_X
+            KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_5 -> RETRO_L
+            KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_6 -> RETRO_R
+            KeyEvent.KEYCODE_BUTTON_L2, KeyEvent.KEYCODE_BUTTON_7, KeyEvent.KEYCODE_BUTTON_15 -> RETRO_L2
+            KeyEvent.KEYCODE_BUTTON_R2, KeyEvent.KEYCODE_BUTTON_8, KeyEvent.KEYCODE_BUTTON_16 -> RETRO_R2
+            KeyEvent.KEYCODE_BUTTON_SELECT, KeyEvent.KEYCODE_BUTTON_9, KeyEvent.KEYCODE_BUTTON_13 -> RETRO_SELECT
+            KeyEvent.KEYCODE_BUTTON_START, KeyEvent.KEYCODE_BUTTON_10, KeyEvent.KEYCODE_BUTTON_14 -> RETRO_START
+            KeyEvent.KEYCODE_BUTTON_THUMBL, KeyEvent.KEYCODE_BUTTON_11 -> RETRO_L3
+            KeyEvent.KEYCODE_BUTTON_THUMBR, KeyEvent.KEYCODE_BUTTON_12 -> RETRO_R3
             KeyEvent.KEYCODE_DPAD_UP -> RETRO_UP
             KeyEvent.KEYCODE_DPAD_DOWN -> RETRO_DOWN
             KeyEvent.KEYCODE_DPAD_LEFT -> RETRO_LEFT
             KeyEvent.KEYCODE_DPAD_RIGHT -> RETRO_RIGHT
+            KeyEvent.KEYCODE_MENU -> if (isDirectGamepadKeySource(event)) RETRO_START else 0
+            KeyEvent.KEYCODE_MEDIA_RECORD -> if (isDirectGamepadKeySource(event)) RETRO_SELECT else 0
+            KeyEvent.KEYCODE_BACK -> if (isDirectGamepadKeySource(event)) RETRO_SELECT else 0
             else -> 0
         }
     }
@@ -875,19 +1479,27 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
     override fun onResume() {
         super.onResume()
+        applyEdgeToEdgeAndCutout()
         isActivityResumed.set(true)
         lifecyclePaused.set(false)
         syncPauseAndServiceState()
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            applyEdgeToEdgeAndCutout()
+        }
+    }
+
     override fun onPause() {
         isActivityResumed.set(false)
         lifecyclePaused.set(true)
+        resetUiGamepadMotionState()
+        cancelHardwareSelectFastForward()
+        resetAllInputAtomics()
+        pushCombinedInputToNative()
         if (isRunning.get()) {
-            touchJoypadMask.set(0)
-            hardwareJoypadMask.set(0)
-            hardwareAxisMask.set(0)
-            pushCombinedInputToNative()
             syncPauseAndServiceState()
         }
         super.onPause()
@@ -905,6 +1517,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         isActivityResumed.set(false)
         sessionToken.incrementAndGet()
         isRunning.set(false)
+        resetUiGamepadMotionState()
+        cancelHardwareSelectFastForward()
+        inputManager?.unregisterInputDeviceListener(inputDeviceListener)
+        inputManager = null
         EmulationForegroundService.stop(this)
 
         methodChannel?.setMethodCallHandler(null)
@@ -958,7 +1574,13 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private external fun nativeDrainAudioBuffer(outPcm: ShortArray): Int
     private external fun nativeGetSampleRate(): Int
     private external fun nativeGetTargetFps(): Double
-    private external fun nativeUpdateInput(joypadMask: Int, leftX: Short, leftY: Short)
+    private external fun nativeUpdateInput(
+        joypadMask: Int,
+        leftX: Short,
+        leftY: Short,
+        rightX: Short,
+        rightY: Short
+    )
     private external fun nativeSaveState(path: String): Boolean
     private external fun nativeLoadState(path: String): Boolean
     private external fun nativeGetFrameWidth(): Int

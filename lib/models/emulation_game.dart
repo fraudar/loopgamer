@@ -579,38 +579,62 @@ class EmulationGame {
     return 'mgba_libretro_android.so';
   }
 
-  String get romFormatLabel {
-    final lowerUrl = directRomUrl.toLowerCase();
-    if (lowerUrl.endsWith('.nsp')) return 'NSP';
-    if (lowerUrl.endsWith('.xci')) return 'XCI';
-    if (lowerUrl.endsWith('.nsz')) return 'NSZ';
-    if (lowerUrl.endsWith('.xcz')) return 'XCZ';
-    if (lowerUrl.endsWith('.nro')) return 'NRO';
-    if (lowerUrl.endsWith('.nca')) return 'NCA';
-    if (lowerUrl.endsWith('.rvz')) return 'RVZ';
-    if (lowerUrl.endsWith('.wbfs')) return 'WBFS';
-    if (lowerUrl.endsWith('.gcz')) return 'GCZ';
-    if (lowerUrl.endsWith('.gcm')) return 'GCM';
-    if (lowerUrl.endsWith('.3ds') ||
-        lowerUrl.endsWith('.cci') ||
-        lowerUrl.endsWith('.cxi')) {
+  static String? _romFormatFromPath(String? rawPath) {
+    if (rawPath == null || rawPath.trim().isEmpty) return null;
+    final lower = rawPath.split('?').first.split('#').first.trim().toLowerCase();
+    if (lower.endsWith('.nsp')) return 'NSP';
+    if (lower.endsWith('.xci')) return 'XCI';
+    if (lower.endsWith('.nsz')) return 'NSZ';
+    if (lower.endsWith('.xcz')) return 'XCZ';
+    if (lower.endsWith('.nro')) return 'NRO';
+    if (lower.endsWith('.nca')) return 'NCA';
+    if (lower.endsWith('.rvz')) return 'RVZ';
+    if (lower.endsWith('.wbfs')) return 'WBFS';
+    if (lower.endsWith('.gcz')) return 'GCZ';
+    if (lower.endsWith('.gcm')) return 'GCM';
+    if (lower.endsWith('.3ds') ||
+        lower.endsWith('.cci') ||
+        lower.endsWith('.cxi')) {
       return '3DS';
     }
-    if (lowerUrl.endsWith('.pkg')) return 'PKG';
-    if (lowerUrl.endsWith('.pce')) return 'PCE';
-    if (lowerUrl.endsWith('.sms')) return 'SMS';
-    if (lowerUrl.endsWith('.chd')) return 'CHD';
-    if (lowerUrl.endsWith('.iso') || lowerUrl.endsWith('.cso')) return 'ISO';
-    if (lowerUrl.endsWith('.nds')) return 'NDS';
-    if (lowerUrl.endsWith('.z64') || lowerUrl.endsWith('.n64')) return 'Z64';
-    if (lowerUrl.endsWith('.sfc') || lowerUrl.endsWith('.smc')) return 'SFC';
-    if (lowerUrl.endsWith('.md') || lowerUrl.endsWith('.gen')) return 'MD';
-    if (lowerUrl.endsWith('.gg')) return 'GG';
-    if (lowerUrl.endsWith('.nes')) return 'NES';
-    if (lowerUrl.endsWith('.gbc')) return 'GBC';
-    if (lowerUrl.endsWith('.gba')) return 'GBA';
-    if (lowerUrl.endsWith('.gb')) return 'GB';
-    if (lowerUrl.endsWith('.zip')) return 'ZIP';
+    if (lower.endsWith('.pkg')) return 'PKG';
+    if (lower.endsWith('.pce')) return 'PCE';
+    if (lower.endsWith('.sms')) return 'SMS';
+    if (lower.endsWith('.chd')) return 'CHD';
+    if (lower.endsWith('.cue')) return 'BIN/CUE';
+    if (lower.endsWith('.m3u')) return 'DISC';
+    if (lower.endsWith('.gdi')) return 'GDI';
+    if (lower.endsWith('.cdi')) return 'CDI';
+    if (lower.endsWith('.pbp')) return 'PBP';
+    if (lower.endsWith('.iso') || lower.endsWith('.cso')) return 'ISO';
+    if (lower.endsWith('.nds')) return 'NDS';
+    if (lower.endsWith('.z64') ||
+        lower.endsWith('.n64') ||
+        lower.endsWith('.v64')) {
+      return 'Z64';
+    }
+    if (lower.endsWith('.sfc') || lower.endsWith('.smc')) return 'SFC';
+    if (lower.endsWith('.md') ||
+        lower.endsWith('.gen') ||
+        lower.endsWith('.smd')) {
+      return 'MD';
+    }
+    if (lower.endsWith('.gg')) return 'GG';
+    if (lower.endsWith('.nes')) return 'NES';
+    if (lower.endsWith('.gbc')) return 'GBC';
+    if (lower.endsWith('.gba')) return 'GBA';
+    if (lower.endsWith('.gb')) return 'GB';
+    if (lower.endsWith('.bin')) return 'BIN';
+    if (lower.endsWith('.zip')) return 'ZIP';
+    if (lower.endsWith('.7z')) return '7Z';
+    return null;
+  }
+
+  String get romFormatLabel {
+    final fromLocal = _romFormatFromPath(localRomPath);
+    if (fromLocal != null) return fromLocal;
+    final fromUrl = _romFormatFromPath(directRomUrl);
+    if (fromUrl != null) return fromUrl;
     final p = platformSlug.toLowerCase();
     if (p == 'gamecube') return 'RVZ';
     if (p == 'wii') return 'WBFS';
@@ -712,6 +736,7 @@ class EmulationGame {
 
   String get formattedSize {
     if (estimatedSizeBytes <= 0) return 'Tam. n/d';
+    if (estimatedSizeBytes < 1024) return '< 1 KB';
     final mb = estimatedSizeBytes / (1024 * 1024);
     if (mb >= 1024) {
       return '${(mb / 1024).toStringAsFixed(2)} GB';

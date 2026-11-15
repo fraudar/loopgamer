@@ -25,6 +25,8 @@ class RetroJoypadMask {
   static const int r = 1 << 11;
   static const int l2 = 1 << 12;
   static const int r2 = 1 << 13;
+  static const int l3 = 1 << 14;
+  static const int r3 = 1 << 15;
 }
 
 class SaveStateSlotInfo {
@@ -115,6 +117,7 @@ class EmulatorService {
   final bool _ownsDio;
   final Dio _dio;
   bool _isDisposed = false;
+  bool _isHardwareGamepadConnected = false;
   String? _lastError;
   final Map<String, DateTime> _lastChannelLogAt = {};
 
@@ -129,9 +132,22 @@ class EmulatorService {
     onListen: _ensureEventSubscription,
     onCancel: _maybeCancelEventSubscription,
   );
+  late final StreamController<Map<String, dynamic>> _gamepadUiActionController =
+      StreamController<Map<String, dynamic>>.broadcast(
+    onListen: _ensureEventSubscription,
+    onCancel: _maybeCancelEventSubscription,
+  );
+  late final StreamController<bool> _hardwareGamepadStateController =
+      StreamController<bool>.broadcast(
+    onListen: _ensureEventSubscription,
+    onCancel: _maybeCancelEventSubscription,
+  );
 
   /// Último erro registrado em operações de save/load ou canal nativo.
   String? get lastError => _lastError;
+
+  /// Indica se um gamepad físico está conectado/ativo segundo eventos nativos.
+  bool get isHardwareGamepadConnected => _isHardwareGamepadConnected;
 
   Stream<LibretroTelemetryEvent> get telemetryStream =>
       _telemetryController.stream;
@@ -139,17 +155,48 @@ class EmulatorService {
   /// Stream emitido quando botões ou analógicos de um gamepad físico são detectados
   Stream<void> get hardwareGamepadStream => _gamepadController.stream;
 
+  /// Stream de ações de UI disparadas pelo gamepad físico (ex.: menu, quick save).
+  Stream<Map<String, dynamic>> get gamepadUiActionStream =>
+      _gamepadUiActionController.stream;
+
+  /// Stream de mudanças no estado de conexão do gamepad físico.
+  Stream<bool> get hardwareGamepadStateStream =>
+      _hardwareGamepadStateController.stream;
+
   void _ensureEventSubscription() {
     if (_isDisposed || _eventSubscription != null) return;
     try {
       _eventSubscription = _eventChannel.receiveBroadcastStream().listen(
         (event) {
           if (_isDisposed || event is! Map) return;
+          final eventName = event['event'];
           if (event.containsKey('fps') && !_telemetryController.isClosed) {
             _telemetryController.add(LibretroTelemetryEvent.fromMap(event));
-          } else if (event['event'] == 'hardwareGamepadActive' &&
-              !_gamepadController.isClosed) {
-            _gamepadController.add(null);
+          } else if (eventName == 'hardwareGamepadActive') {
+            if (!_isHardwareGamepadConnected) {
+              _isHardwareGamepadConnected = true;
+              if (!_hardwareGamepadStateController.isClosed) {
+                _hardwareGamepadStateController.add(true);
+              }
+            }
+            if (!_gamepadController.isClosed) {
+              _gamepadController.add(null);
+            }
+          } else if (eventName == 'hardwareGamepadState') {
+            final connected = event['connected'] == true;
+            _isHardwareGamepadConnected = connected;
+            if (!_hardwareGamepadStateController.isClosed) {
+              _hardwareGamepadStateController.add(connected);
+            }
+            if (connected && !_gamepadController.isClosed) {
+              _gamepadController.add(null);
+            }
+          } else if (eventName == 'gamepadUiAction') {
+            if (!_gamepadUiActionController.isClosed) {
+              _gamepadUiActionController.add(
+                Map<String, dynamic>.from(event),
+              );
+            }
           }
         },
         onError: (Object error) {
@@ -162,7 +209,10 @@ class EmulatorService {
   }
 
   void _maybeCancelEventSubscription() {
-    if (!_telemetryController.hasListener && !_gamepadController.hasListener) {
+    if (!_telemetryController.hasListener &&
+        !_gamepadController.hasListener &&
+        !_gamepadUiActionController.hasListener &&
+        !_hardwareGamepadStateController.hasListener) {
       unawaited(_eventSubscription?.cancel());
       _eventSubscription = null;
     }
@@ -385,8 +435,9 @@ class EmulatorService {
         );
       }
 
-      final extractedOk = await Isolate.run(
-        () => _extractCoreSoFromZipSync(tempZipPath, coreFile.path),
+      final extractedOk = await _runExtractCoreSoInIsolate(
+        tempZipPath,
+        coreFile.path,
       );
       if (!extractedOk || !await isValidElfSharedLibrary(coreFile)) {
         try {
@@ -410,6 +461,13 @@ class EmulatorService {
         debugPrint('[EmulatorService] Falha ao limpar zip de core: $e');
       }
     }
+  }
+
+  static Future<bool> _runExtractCoreSoInIsolate(
+    String zipPath,
+    String outPath,
+  ) {
+    return Isolate.run(() => _extractCoreSoFromZipSync(zipPath, outPath));
   }
 
   static bool _extractCoreSoFromZipSync(String zipPath, String outPath) {
@@ -514,7 +572,7 @@ class EmulatorService {
       }
       final tmpPath = tmpZip.path;
       final sysPath = systemDir.path;
-      await Isolate.run(() => _extractDolphinAssetsSync(tmpPath, sysPath));
+      await _runExtractDolphinAssetsInIsolate(tmpPath, sysPath);
     } catch (e) {
       debugPrint('[EmulatorService] Falha ao baixar/extrair Dolphin Sys: $e');
     } finally {
@@ -526,6 +584,13 @@ class EmulatorService {
         debugPrint('[EmulatorService] Falha ao limpar zip do Dolphin Sys: $e');
       }
     }
+  }
+
+  static Future<void> _runExtractDolphinAssetsInIsolate(
+    String zipPath,
+    String systemDirPath,
+  ) {
+    return Isolate.run(() => _extractDolphinAssetsSync(zipPath, systemDirPath));
   }
 
   static void _extractDolphinAssetsSync(String zipPath, String systemDirPath) {
@@ -559,6 +624,54 @@ class EmulatorService {
     }
   }
 
+  /// Limpa com segurança arquivos temporários criados pelo `file_picker`.
+  static Future<void> cleanFilePickerTempCache({String? pickedPath}) async {
+    Directory? tempDir;
+    Directory? cacheDir;
+    Directory? supportDir;
+    try {
+      tempDir = await getTemporaryDirectory();
+    } catch (_) {}
+    try {
+      cacheDir = await getApplicationCacheDirectory();
+    } catch (_) {}
+    try {
+      supportDir = await getApplicationSupportDirectory();
+    } catch (_) {}
+
+    final fpDirs = <String>{
+      if (tempDir != null) '${tempDir.path}/file_picker',
+      if (cacheDir != null) '${cacheDir.path}/file_picker',
+    };
+    for (final dirPath in fpDirs) {
+      try {
+        final dir = Directory(dirPath);
+        if (await dir.exists()) {
+          await dir.delete(recursive: true);
+        }
+      } catch (_) {}
+    }
+
+    if (pickedPath != null && pickedPath.trim().isNotEmpty) {
+      try {
+        final pickedFile = File(pickedPath);
+        if (await pickedFile.exists()) {
+          final normPicked = pickedFile.absolute.path.replaceAll('\\', '/');
+          final inFilePickerDir = normPicked.contains('/file_picker/');
+          final inTempDir = tempDir != null &&
+              supportDir?.path != tempDir.path &&
+              normPicked.startsWith('${tempDir.path.replaceAll('\\', '/')}/');
+          final inCacheDir = cacheDir != null &&
+              supportDir?.path != cacheDir.path &&
+              normPicked.startsWith('${cacheDir.path.replaceAll('\\', '/')}/');
+          if (inFilePickerDir || inTempDir || inCacheDir) {
+            await pickedFile.delete();
+          }
+        }
+      } catch (_) {}
+    }
+  }
+
   Future<bool> hasPs3Firmware() async {
     final systemDir = await getApplicationSupportDirectory();
     final rootPup = File('${systemDir.path}/PS3UPDAT.PUP');
@@ -577,6 +690,34 @@ class EmulatorService {
     return false;
   }
 
+  Future<bool> removePs3Firmware() async {
+    try {
+      final systemDir = await getApplicationSupportDirectory();
+      final filesToDelete = [
+        File('${systemDir.path}/PS3UPDAT.PUP'),
+        File('${systemDir.path}/rpcs3/PS3UPDAT.PUP'),
+      ];
+      for (final f in filesToDelete) {
+        if (await f.exists()) {
+          await f.delete();
+        }
+      }
+      final dirsToDelete = [
+        Directory('${systemDir.path}/rpcs3/dev_flash'),
+        Directory('${systemDir.path}/rpcs3/dev_flash2'),
+      ];
+      for (final d in dirsToDelete) {
+        if (await d.exists()) {
+          await d.delete(recursive: true);
+        }
+      }
+      return true;
+    } catch (e) {
+      debugPrint('[EmulatorService] Falha ao remover firmware PS3: $e');
+      return false;
+    }
+  }
+
   Future<String?> importPs3Firmware() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.any,
@@ -585,25 +726,29 @@ class EmulatorService {
     final pickedPath = result?.files.single.path;
     if (pickedPath == null) return null;
 
-    final sourceFile = File(pickedPath);
-    if (!await sourceFile.exists()) return null;
-    final len = await sourceFile.length();
-    if (len < 1024 * 1024) {
-      throw StateError(
-        'Arquivo inválido para PS3UPDAT.PUP (tamanho inferior a 1 MB). Selecione o firmware oficial PS3UPDAT.PUP.',
-      );
-    }
+    try {
+      final sourceFile = File(pickedPath);
+      if (!await sourceFile.exists()) return null;
+      final len = await sourceFile.length();
+      if (len < 1024 * 1024) {
+        throw StateError(
+          'Arquivo inválido para PS3UPDAT.PUP (tamanho inferior a 1 MB). Selecione o firmware oficial PS3UPDAT.PUP.',
+        );
+      }
 
-    final systemDir = await getApplicationSupportDirectory();
-    final rpcs3Dir = Directory('${systemDir.path}/rpcs3');
-    if (!await rpcs3Dir.exists()) {
-      await rpcs3Dir.create(recursive: true);
+      final systemDir = await getApplicationSupportDirectory();
+      final rpcs3Dir = Directory('${systemDir.path}/rpcs3');
+      if (!await rpcs3Dir.exists()) {
+        await rpcs3Dir.create(recursive: true);
+      }
+      final targetRoot = File('${systemDir.path}/PS3UPDAT.PUP');
+      final targetRpcs3 = File('${rpcs3Dir.path}/PS3UPDAT.PUP');
+      await sourceFile.copy(targetRoot.path);
+      await sourceFile.copy(targetRpcs3.path);
+      return targetRoot.path;
+    } finally {
+      await cleanFilePickerTempCache(pickedPath: pickedPath);
     }
-    final targetRoot = File('${systemDir.path}/PS3UPDAT.PUP');
-    final targetRpcs3 = File('${rpcs3Dir.path}/PS3UPDAT.PUP');
-    await sourceFile.copy(targetRoot.path);
-    await sourceFile.copy(targetRpcs3.path);
-    return targetRoot.path;
   }
 
   Future<int> startSession({
@@ -623,6 +768,7 @@ class EmulatorService {
     String customDriverName = '',
     bool adrenoTurbo = false,
     String freedrenoPreset = '',
+    bool? singleTrigger,
     Map<String, String>? coreOptions,
     void Function(double coreProgress)? onCoreDownloadProgress,
   }) async {
@@ -733,6 +879,7 @@ SoundSpeedHack = True
         'customDriverName': customDriverName,
         'adrenoTurbo': adrenoTurbo,
         'freedrenoPreset': freedrenoPreset,
+        if (singleTrigger != null) 'singleTrigger': singleTrigger,
         'coreOptions': serializedCoreOptions,
       },
     );
@@ -803,13 +950,22 @@ SoundSpeedHack = True
     required int joypadMask,
     double leftStickX = 0.0,
     double leftStickY = 0.0,
+    double? rightStickX,
+    double? rightStickY,
   }) async {
     try {
-      await _methodChannel.invokeMethod<void>('updateInput', {
+      final payload = <String, dynamic>{
         'joypadMask': joypadMask,
         'leftX': (leftStickX * 32767).round(),
         'leftY': (leftStickY * 32767).round(),
-      });
+      };
+      if (rightStickX != null) {
+        payload['rightX'] = (rightStickX * 32767).round();
+      }
+      if (rightStickY != null) {
+        payload['rightY'] = (rightStickY * 32767).round();
+      }
+      await _methodChannel.invokeMethod<void>('updateInput', payload);
     } catch (e) {
       _logChannelError('updateInput', e, throttle: true);
     }
@@ -959,6 +1115,54 @@ SoundSpeedHack = True
     }
   }
 
+  /// Sincroniza a notificação persistente de progresso de downloads no Android.
+  static Future<void> syncDownloadNotification({
+    required int activeCount,
+    required int queuedCount,
+    int completedCount = 0,
+    int failedCount = 0,
+    int progressPercent = 0,
+    bool indeterminate = false,
+    String title = '',
+    String detail = '',
+  }) async {
+    try {
+      await _methodChannel.invokeMethod<void>('syncDownloadNotification', {
+        'activeCount': activeCount,
+        'queuedCount': queuedCount,
+        'completedCount': completedCount,
+        'failedCount': failedCount,
+        'progressPercent': progressPercent.clamp(0, 100),
+        'indeterminate': indeterminate,
+        'title': title,
+        'detail': detail,
+      });
+    } on MissingPluginException {
+      // Ignora em ambientes sem ponte Android ativa (ex.: testes unitários).
+    } catch (e) {
+      debugPrint(
+        '[EmulatorService] MethodChannel "syncDownloadNotification" falhou: $e',
+      );
+    }
+  }
+
+  /// Solicita permissão de notificações no Android 13+ (não bloqueante).
+  static Future<bool> requestNotificationPermission() async {
+    try {
+      final granted = await _methodChannel.invokeMethod<bool>(
+        'requestNotificationPermission',
+      );
+      return granted ?? false;
+    } on MissingPluginException {
+      return false;
+    } catch (e) {
+      debugPrint(
+        '[EmulatorService] MethodChannel "requestNotificationPermission" falhou: $e',
+      );
+      return false;
+    }
+  }
+
   /// Libera streams e fecha o cliente HTTP quando próprio.
   void dispose() {
     if (_isDisposed) return;
@@ -970,6 +1174,12 @@ SoundSpeedHack = True
     }
     if (!_gamepadController.isClosed) {
       unawaited(_gamepadController.close());
+    }
+    if (!_gamepadUiActionController.isClosed) {
+      unawaited(_gamepadUiActionController.close());
+    }
+    if (!_hardwareGamepadStateController.isClosed) {
+      unawaited(_hardwareGamepadStateController.close());
     }
     if (_ownsDio) {
       _dio.close(force: true);

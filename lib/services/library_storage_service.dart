@@ -64,6 +64,13 @@ class LibraryStorageService {
   }) async {
     final file = File(filePath);
     if (!await file.exists()) return '00000000';
+    return _runComputeCrc32InIsolate(filePath, maxBytes);
+  }
+
+  static Future<String> _runComputeCrc32InIsolate(
+    String filePath,
+    int? maxBytes,
+  ) {
     return Isolate.run(() => _computeCrc32Sync(filePath, maxBytes: maxBytes));
   }
 
@@ -103,10 +110,238 @@ class LibraryStorageService {
   Future<String> computeRomCrc32Hex(String filePath, {int? maxBytes}) =>
       computeFileCrc32Hex(filePath, maxBytes: maxBytes);
 
-  Future<List<EmulationGame>> loadPersistedLibrary() =>
-      _synchronized(_loadPersistedLibraryUnlocked);
+  static String _basename(String filePath) {
+    final cleaned = filePath.replaceAll(RegExp(r'[/\\]+$'), '');
+    if (cleaned.isEmpty) return filePath;
+    final parts = cleaned.split(RegExp(r'[/\\]'));
+    return parts.isEmpty ? cleaned : parts.last;
+  }
 
-  Future<List<EmulationGame>> _loadPersistedLibraryUnlocked() async {
+  static Directory? _findDedicatedGameFolder(File romFile) {
+    var current = romFile.parent;
+    for (int depth = 0; depth < 6; depth++) {
+      final name = _basename(current.path);
+      final parent = current.parent;
+      if (parent.path == current.path) break;
+      final parentName = _basename(parent.path).toLowerCase();
+      if (parentName == 'roms' &&
+          (name.startsWith('game_') || name.startsWith('arcade_'))) {
+        return current;
+      }
+      current = parent;
+    }
+    return null;
+  }
+
+  static bool _isInsideGameOrArcadeFolder(String localPath) {
+    if (_findDedicatedGameFolder(File(localPath)) != null) {
+      return true;
+    }
+    final normalized = localPath.replaceAll('\\', '/').toLowerCase();
+    return normalized.contains('/game_') || normalized.contains('/arcade_');
+  }
+
+  static Future<String> _uniqueFileKey(File file) async {
+    try {
+      return await file.resolveSymbolicLinks();
+    } catch (_) {
+      return file.absolute.path.replaceAll('\\', '/');
+    }
+  }
+
+  static Future<List<String>> _extractDescriptorRefs(File descriptorFile) async {
+    try {
+      final bytes = await descriptorFile.readAsBytes();
+      final text = utf8.decode(bytes, allowMalformed: true);
+      final lines = text.split(RegExp(r'\r?\n'));
+      final lower = descriptorFile.path.toLowerCase();
+      final refs = <String>[];
+
+      if (lower.endsWith('.cue')) {
+        final quotedDouble =
+            RegExp(r'^\s*FILE\s+"([^"]+)"', caseSensitive: false);
+        final quotedSingle =
+            RegExp(r"^\s*FILE\s+'([^']+)'", caseSensitive: false);
+        final unquoted = RegExp(r'^\s*FILE\s+(\S+)', caseSensitive: false);
+        for (final line in lines) {
+          final match = quotedDouble.firstMatch(line) ??
+              quotedSingle.firstMatch(line) ??
+              unquoted.firstMatch(line);
+          final ref = match?.group(1)?.trim();
+          if (ref != null && ref.isNotEmpty) {
+            refs.add(ref);
+          }
+        }
+      } else if (lower.endsWith('.m3u')) {
+        for (final rawLine in lines) {
+          final line = rawLine.trim();
+          if (line.isEmpty || line.startsWith('#')) continue;
+          refs.add(line);
+        }
+      } else if (lower.endsWith('.gdi')) {
+        final quoted = RegExp(r'"([^"]+)"');
+        for (final rawLine in lines) {
+          final line = rawLine.trim();
+          if (line.isEmpty || RegExp(r'^\d+$').hasMatch(line)) continue;
+          final qMatch = quoted.firstMatch(line);
+          if (qMatch != null) {
+            final ref = qMatch.group(1)?.trim();
+            if (ref != null && ref.isNotEmpty) refs.add(ref);
+          } else {
+            final parts = line.split(RegExp(r'\s+'));
+            if (parts.length >= 5 && parts[4].isNotEmpty) {
+              refs.add(parts[4]);
+            }
+          }
+        }
+      }
+      return refs;
+    } catch (e) {
+      debugPrint(
+        '[LibraryStorageService] Falha ao inspecionar descritor ${descriptorFile.path}: $e',
+      );
+      return const [];
+    }
+  }
+
+  static Future<void> _collectDescriptorFilesRecursive(
+    File descriptorFile,
+    Set<String> seenKeys,
+    List<File> collected,
+  ) async {
+    if (!await descriptorFile.exists()) return;
+    final key = await _uniqueFileKey(descriptorFile);
+    if (!seenKeys.add(key)) return;
+    collected.add(descriptorFile);
+
+    final refs = await _extractDescriptorRefs(descriptorFile);
+    final parentDir = descriptorFile.parent;
+    for (final rawRef in refs) {
+      final normalizedRef = rawRef
+          .replaceAll('"', '')
+          .replaceAll("'", '')
+          .replaceAll('\\', '/')
+          .trim();
+      if (normalizedRef.isEmpty) continue;
+
+      final baseName = _basename(normalizedRef);
+      File? companion;
+      if (!normalizedRef.startsWith('/') &&
+          !normalizedRef.contains('..') &&
+          !RegExp(r'^[a-zA-Z]:').hasMatch(normalizedRef)) {
+        final relCandidate = File('${parentDir.path}/$normalizedRef');
+        if (await relCandidate.exists()) {
+          companion = relCandidate;
+        }
+      }
+      if (companion == null &&
+          baseName.isNotEmpty &&
+          baseName != '.' &&
+          baseName != '..') {
+        final baseCandidate = File('${parentDir.path}/$baseName');
+        if (await baseCandidate.exists()) {
+          companion = baseCandidate;
+        }
+      }
+      if (companion == null) continue;
+
+      final lowerComp = companion.path.toLowerCase();
+      if (lowerComp.endsWith('.cue') ||
+          lowerComp.endsWith('.m3u') ||
+          lowerComp.endsWith('.gdi')) {
+        await _collectDescriptorFilesRecursive(companion, seenKeys, collected);
+      } else {
+        final compKey = await _uniqueFileKey(companion);
+        if (seenKeys.add(compKey)) {
+          collected.add(companion);
+        }
+      }
+    }
+  }
+
+  /// Resolve o tamanho real instalado em disco para uma ROM (incluindo pastas `game_<id>`/`arcade_<id>`
+  /// e faixas companion de `.cue`/`.m3u`/`.gdi`), preservando [fallbackBytes] contra clobber de stubs.
+  static Future<int> resolveInstalledRomSizeBytes(
+    String localRomPath, {
+    int fallbackBytes = 0,
+  }) async {
+    final safeFallback = fallbackBytes > 0 ? fallbackBytes : 0;
+    final romFile = File(localRomPath);
+    if (!await romFile.exists()) {
+      return safeFallback;
+    }
+
+    int measuredBytes = 0;
+    try {
+      final dedicatedFolder = _findDedicatedGameFolder(romFile);
+      if (dedicatedFolder != null && await dedicatedFolder.exists()) {
+        final mainBase = _basename(localRomPath).toLowerCase();
+        final entities = await dedicatedFolder
+            .list(recursive: true, followLinks: false)
+            .toList();
+        final regularFiles = entities.whereType<File>().toList();
+        final hasOtherFiles = regularFiles.any(
+          (f) {
+            final base = _basename(f.path).toLowerCase();
+            return base != 'neogeo.zip' && !base.endsWith('.part');
+          },
+        );
+        final seenKeys = <String>{};
+        for (final f in regularFiles) {
+          final base = _basename(f.path).toLowerCase();
+          if (base.endsWith('.part') && !mainBase.endsWith('.part')) {
+            continue;
+          }
+          if (base == 'neogeo.zip' &&
+              mainBase != 'neogeo.zip' &&
+              hasOtherFiles) {
+            continue;
+          }
+          final key = await _uniqueFileKey(f);
+          if (!seenKeys.add(key)) continue;
+          measuredBytes += await f.length();
+        }
+      } else {
+        final lower = localRomPath.toLowerCase();
+        if (lower.endsWith('.cue') ||
+            lower.endsWith('.m3u') ||
+            lower.endsWith('.gdi')) {
+          final collected = <File>[];
+          await _collectDescriptorFilesRecursive(
+            romFile,
+            <String>{},
+            collected,
+          );
+          for (final f in collected) {
+            measuredBytes += await f.length();
+          }
+        } else {
+          measuredBytes = await romFile.length();
+        }
+      }
+    } catch (e) {
+      debugPrint(
+        '[LibraryStorageService] Falha ao medir tamanho de $localRomPath: $e',
+      );
+      try {
+        measuredBytes = await romFile.length();
+      } catch (_) {
+        measuredBytes = 0;
+      }
+    }
+
+    if (measuredBytes < 1024 && safeFallback >= 1024) {
+      return safeFallback;
+    }
+    return measuredBytes > 0 ? measuredBytes : safeFallback;
+  }
+
+  Future<List<EmulationGame>> loadPersistedLibrary() =>
+      _synchronized(() => _loadPersistedLibraryUnlocked(persistRepairs: true));
+
+  Future<List<EmulationGame>> _loadPersistedLibraryUnlocked({
+    bool persistRepairs = true,
+  }) async {
     final file = await _manifestFile();
     if (!await file.exists()) return const [];
 
@@ -149,6 +384,7 @@ class LibraryStorageService {
     }
 
     final List<EmulationGame> validGames = [];
+    bool repairedAnySize = false;
     for (int i = 0; i < rawList.length; i++) {
       final rawItem = rawList[i];
       if (rawItem is! Map) {
@@ -194,6 +430,23 @@ class LibraryStorageService {
 
         final canonical = item['canonicalNoIntroName'];
         final regionRaw = item['region'];
+        final savedSize = (item['estimatedSizeBytes'] as num?)?.toInt() ?? 0;
+        final lowerPath = localPath.toLowerCase();
+        final shouldRecomputeSize = savedSize < 1024 ||
+            lowerPath.endsWith('.cue') ||
+            lowerPath.endsWith('.m3u') ||
+            lowerPath.endsWith('.gdi') ||
+            _isInsideGameOrArcadeFolder(localPath);
+        final resolvedSize = shouldRecomputeSize
+            ? await resolveInstalledRomSizeBytes(
+                localPath,
+                fallbackBytes: savedSize,
+              )
+            : savedSize;
+        if (resolvedSize != savedSize) {
+          repairedAnySize = true;
+        }
+
         validGames.add(
           EmulationGame(
             igdbId: igdbId,
@@ -224,8 +477,7 @@ class LibraryStorageService {
                 item['logoUrl'] is String ? item['logoUrl'] as String : null,
             crc32:
                 item['crc32'] is String ? item['crc32'] as String : '00000000',
-            estimatedSizeBytes:
-                (item['estimatedSizeBytes'] as num?)?.toInt() ?? 0,
+            estimatedSizeBytes: resolvedSize,
             localRomPath: localPath,
           ),
         );
@@ -235,16 +487,25 @@ class LibraryStorageService {
         );
       }
     }
+    if (repairedAnySize && persistRepairs) {
+      try {
+        await _writeManifestUnlocked(validGames);
+      } catch (e) {
+        debugPrint(
+          '[LibraryStorageService] Falha ao persistir reparo de tamanhos no manifesto: $e',
+        );
+      }
+    }
     return validGames;
   }
 
   Future<void> saveGameToLibrary(EmulationGame game, String localRomPath) {
     return _synchronized(() async {
-      final existing = await _loadPersistedLibraryUnlocked();
-      final romFile = File(localRomPath);
-      final fileSize = await romFile.exists()
-          ? await romFile.length()
-          : game.estimatedSizeBytes;
+      final existing = await _loadPersistedLibraryUnlocked(persistRepairs: false);
+      final fileSize = await resolveInstalledRomSizeBytes(
+        localRomPath,
+        fallbackBytes: game.estimatedSizeBytes,
+      );
 
       final updated = [
         for (final g in existing)
@@ -277,7 +538,8 @@ class LibraryStorageService {
 
   Future<void> removeGameFromLibrary(int igdbId) {
     return _synchronized(() async {
-      final existing = await _loadPersistedLibraryUnlocked();
+      final existing =
+          await _loadPersistedLibraryUnlocked(persistRepairs: false);
       final updated = existing.where((g) => g.igdbId != igdbId).toList();
       await _writeManifestUnlocked(updated);
     });

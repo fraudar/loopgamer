@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:ui';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -22,8 +23,18 @@ import 'services/rom_download_service.dart';
 import 'services/settings_storage_service.dart';
 import 'theme/hydra_tokens.dart';
 
+const SystemUiOverlayStyle _kLoopEdgeOverlayStyle = SystemUiOverlayStyle(
+  statusBarColor: Colors.transparent,
+  statusBarIconBrightness: Brightness.light,
+  statusBarBrightness: Brightness.dark,
+  systemNavigationBarColor: Colors.transparent,
+  systemNavigationBarIconBrightness: Brightness.light,
+  systemNavigationBarDividerColor: Colors.transparent,
+);
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setSystemUIOverlayStyle(_kLoopEdgeOverlayStyle);
   await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   runApp(const LoopGamerApp());
 }
@@ -36,6 +47,7 @@ class LoopGamerApp extends StatefulWidget {
 }
 
 class _LoopGamerAppState extends State<LoopGamerApp> {
+  final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
   final IgdbSteamGridService _apiService = IgdbSteamGridService();
   final RomDownloadService _downloadService = RomDownloadService();
   final LibraryStorageService _libraryStorage = LibraryStorageService();
@@ -53,8 +65,12 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
 
   StreamSubscription<RomDownloadEvent>? _downloadEventsSub;
   StreamSubscription<void>? _gamepadSub;
+  StreamSubscription<bool>? _gamepadStateSub;
+  StreamSubscription<Map<String, dynamic>>? _gamepadUiSub;
 
   int _selectedTab = 0;
+  bool _isPlayerActive = false;
+  bool _isImportingExternalIso = false;
   AppSettings _settings = const AppSettings();
   UserLibraryMeta _userMeta = const UserLibraryMeta();
   bool _isLoadingCatalog = true;
@@ -70,6 +86,7 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
   @override
   void initState() {
     super.initState();
+    SystemChrome.setSystemUIOverlayStyle(_kLoopEdgeOverlayStyle);
     unawaited(
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
     );
@@ -78,12 +95,26 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
       unawaited(_handleStatusUpdated(event.game, event.status));
     });
     if (!Platform.environment.containsKey('FLUTTER_TEST')) {
+      _hardwareGamepadNotifier.value =
+          _emulatorService.isHardwareGamepadConnected;
       _gamepadSub = _emulatorService.hardwareGamepadStream.listen(
         (_) {
           if (mounted && !_hardwareGamepadNotifier.value) {
             _hardwareGamepadNotifier.value = true;
           }
         },
+        onError: (_) {},
+      );
+      _gamepadStateSub = _emulatorService.hardwareGamepadStateStream.listen(
+        (connected) {
+          if (mounted && _hardwareGamepadNotifier.value != connected) {
+            _hardwareGamepadNotifier.value = connected;
+          }
+        },
+        onError: (_) {},
+      );
+      _gamepadUiSub = _emulatorService.gamepadUiActionStream.listen(
+        _handleGlobalGamepadUiAction,
         onError: (_) {},
       );
     }
@@ -99,6 +130,14 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
     final gpSub = _gamepadSub;
     if (gpSub != null) {
       unawaited(gpSub.cancel());
+    }
+    final gpStateSub = _gamepadStateSub;
+    if (gpStateSub != null) {
+      unawaited(gpStateSub.cancel());
+    }
+    final gpUiSub = _gamepadUiSub;
+    if (gpUiSub != null) {
+      unawaited(gpUiSub.cancel());
     }
     _emulatorService.dispose();
     _downloadService.dispose();
@@ -162,10 +201,30 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
           (game) => _downloadService.resolveExistingRomPath(game.igdbId),
         ),
       );
+      final resolvedSizes = await Future.wait(
+        List<Future<int>>.generate(catalogSnapshot.length, (i) async {
+          final localPath = resolvedPaths[i];
+          if (localPath == null) return 0;
+          return LibraryStorageService.resolveInstalledRomSizeBytes(
+            localPath,
+            fallbackBytes: catalogSnapshot[i].estimatedSizeBytes,
+          );
+        }),
+      );
       for (int i = 0; i < catalogSnapshot.length; i++) {
         final localPath = resolvedPaths[i];
         if (localPath != null) {
-          nextStatuses[catalogSnapshot[i].igdbId] = RomDownloadStatus(
+          final baseGame = catalogSnapshot[i];
+          final sizeBytes = resolvedSizes[i];
+          if (sizeBytes > 0 && sizeBytes != baseGame.estimatedSizeBytes ||
+              baseGame.localRomPath != localPath) {
+            _catalogById[baseGame.igdbId] = baseGame.copyWith(
+              estimatedSizeBytes:
+                  sizeBytes > 0 ? sizeBytes : baseGame.estimatedSizeBytes,
+              localRomPath: localPath,
+            );
+          }
+          nextStatuses[baseGame.igdbId] = RomDownloadStatus(
             state: RomActionState.readyToPlay,
             progress: 1.0,
             localPath: localPath,
@@ -266,7 +325,9 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
         a.errorMessage == b.errorMessage &&
         a.speedLabel == b.speedLabel &&
         a.warningMessage == b.warningMessage &&
-        a.crcVerified == b.crcVerified;
+        a.crcVerified == b.crcVerified &&
+        a.isQueued == b.isQueued &&
+        a.queuePosition == b.queuePosition;
   }
 
   Future<void> _handleStatusUpdated(
@@ -294,8 +355,23 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
     if (status.state == RomActionState.readyToPlay &&
         status.localPath != null &&
         (prev?.state != RomActionState.readyToPlay ||
-            prev?.localPath != status.localPath)) {
-      await _libraryStorage.saveGameToLibrary(game, status.localPath!);
+            prev?.localPath != status.localPath ||
+            game.estimatedSizeBytes < 1024)) {
+      final resolvedBytes =
+          await LibraryStorageService.resolveInstalledRomSizeBytes(
+        status.localPath!,
+        fallbackBytes: game.estimatedSizeBytes,
+      );
+      final normalizedGame = game.copyWith(
+        estimatedSizeBytes:
+            resolvedBytes > 0 ? resolvedBytes : game.estimatedSizeBytes,
+        localRomPath: status.localPath,
+      );
+      await _libraryStorage.saveGameToLibrary(normalizedGame, status.localPath!);
+      if (!mounted) return;
+      _catalogById[game.igdbId] = normalizedGame;
+      _refreshCatalogListCache();
+      setState(() {});
     }
   }
 
@@ -370,6 +446,438 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
     _syncSummaryNotifiers(frozen);
   }
 
+  bool _isPrimaryFocusTextInput() {
+    final ctx = FocusManager.instance.primaryFocus?.context;
+    return ctx?.widget is EditableText;
+  }
+
+  void _openSettingsFromGuideButton() {
+    if (!mounted || _isPlayerActive) return;
+    if (!_hardwareGamepadNotifier.value) {
+      _hardwareGamepadNotifier.value = true;
+    }
+    _navigatorKey.currentState?.popUntil((route) => route.isFirst);
+    if (_selectedTab != 3) {
+      setState(() => _selectedTab = 3);
+    }
+  }
+
+  void _stepSectionFromGamepad(int delta) {
+    if (!mounted || _isPlayerActive) return;
+    if (_navigatorKey.currentState?.canPop() ?? false) return;
+    if (_isPrimaryFocusTextInput()) return;
+    if (!_hardwareGamepadNotifier.value) {
+      _hardwareGamepadNotifier.value = true;
+    }
+    setState(() {
+      _selectedTab = (_selectedTab + delta + 4) % 4;
+    });
+  }
+
+  void _dispatchSyntheticKeyDown(
+    LogicalKeyboardKey logicalKey,
+    PhysicalKeyboardKey physicalKey,
+  ) {
+    final primary = FocusManager.instance.primaryFocus;
+    if (primary != null) {
+      final syntheticEvent = KeyDownEvent(
+        physicalKey: physicalKey,
+        logicalKey: logicalKey,
+        timeStamp: Duration.zero,
+      );
+      final chain = <FocusNode>[primary, ...primary.ancestors];
+      for (final node in chain) {
+        final result = node.onKeyEvent?.call(node, syntheticEvent);
+        if (result == KeyEventResult.handled) {
+          return;
+        }
+      }
+    }
+
+    if (logicalKey == LogicalKeyboardKey.arrowUp) {
+      primary?.focusInDirection(TraversalDirection.up);
+    } else if (logicalKey == LogicalKeyboardKey.arrowDown) {
+      primary?.focusInDirection(TraversalDirection.down);
+    } else if (logicalKey == LogicalKeyboardKey.arrowLeft) {
+      primary?.focusInDirection(TraversalDirection.left);
+    } else if (logicalKey == LogicalKeyboardKey.arrowRight) {
+      primary?.focusInDirection(TraversalDirection.right);
+    } else if (logicalKey == LogicalKeyboardKey.gameButtonA ||
+        logicalKey == LogicalKeyboardKey.enter) {
+      final ctx = primary?.context;
+      if (ctx != null) {
+        Actions.maybeInvoke<ActivateIntent>(ctx, const ActivateIntent());
+      }
+    } else if (logicalKey == LogicalKeyboardKey.gameButtonB ||
+        logicalKey == LogicalKeyboardKey.escape) {
+      final nav = _navigatorKey.currentState;
+      if (nav != null && nav.canPop()) {
+        unawaited(nav.maybePop());
+      } else if (_selectedTab != 0 && mounted) {
+        setState(() => _selectedTab = 0);
+      }
+    }
+  }
+
+  void _handleGlobalGamepadUiAction(Map<String, dynamic> event) {
+    if (!mounted || _isPlayerActive) return;
+    if (!_hardwareGamepadNotifier.value) {
+      _hardwareGamepadNotifier.value = true;
+    }
+    final action = (event['action'] as String?) ?? '';
+    switch (action) {
+      case 'guide':
+        _openSettingsFromGuideButton();
+        return;
+      case 'l1':
+      case 'l2':
+        _stepSectionFromGamepad(-1);
+        return;
+      case 'r1':
+      case 'r2':
+        _stepSectionFromGamepad(1);
+        return;
+      case 'dpadUp':
+        _dispatchSyntheticKeyDown(
+          LogicalKeyboardKey.arrowUp,
+          PhysicalKeyboardKey.arrowUp,
+        );
+        return;
+      case 'dpadDown':
+        _dispatchSyntheticKeyDown(
+          LogicalKeyboardKey.arrowDown,
+          PhysicalKeyboardKey.arrowDown,
+        );
+        return;
+      case 'dpadLeft':
+        _dispatchSyntheticKeyDown(
+          LogicalKeyboardKey.arrowLeft,
+          PhysicalKeyboardKey.arrowLeft,
+        );
+        return;
+      case 'dpadRight':
+        _dispatchSyntheticKeyDown(
+          LogicalKeyboardKey.arrowRight,
+          PhysicalKeyboardKey.arrowRight,
+        );
+        return;
+      case 'a':
+        _dispatchSyntheticKeyDown(
+          LogicalKeyboardKey.gameButtonA,
+          PhysicalKeyboardKey.keyA,
+        );
+        return;
+      case 'b':
+        _dispatchSyntheticKeyDown(
+          LogicalKeyboardKey.gameButtonB,
+          PhysicalKeyboardKey.keyB,
+        );
+        return;
+      case 'x':
+        _dispatchSyntheticKeyDown(
+          LogicalKeyboardKey.gameButtonX,
+          PhysicalKeyboardKey.keyX,
+        );
+        return;
+      case 'y':
+        _dispatchSyntheticKeyDown(
+          LogicalKeyboardKey.gameButtonY,
+          PhysicalKeyboardKey.keyY,
+        );
+        return;
+      default:
+        return;
+    }
+  }
+
+  KeyEventResult _handleRootAppKeyEvent(FocusNode node, KeyEvent event) {
+    if (_isPlayerActive) return KeyEventResult.ignored;
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.gameButtonMode) {
+      if (event is KeyDownEvent) {
+        _openSettingsFromGuideButton();
+      }
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.gameButtonLeft1 ||
+        key == LogicalKeyboardKey.gameButtonLeft2) {
+      if (!(_navigatorKey.currentState?.canPop() ?? false) &&
+          !_isPrimaryFocusTextInput()) {
+        if (event is KeyDownEvent) {
+          _stepSectionFromGamepad(-1);
+        }
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+    if (key == LogicalKeyboardKey.gameButtonRight1 ||
+        key == LogicalKeyboardKey.gameButtonRight2) {
+      if (!(_navigatorKey.currentState?.canPop() ?? false) &&
+          !_isPrimaryFocusTextInput()) {
+        if (event is KeyDownEvent) {
+          _stepSectionFromGamepad(1);
+        }
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+    if ((key == LogicalKeyboardKey.gameButtonB ||
+            key == LogicalKeyboardKey.gameButton2 ||
+            key == LogicalKeyboardKey.goBack) &&
+        !_isPrimaryFocusTextInput()) {
+      if (event is KeyDownEvent) {
+        final nav = _navigatorKey.currentState;
+        if (nav != null && nav.canPop()) {
+          unawaited(nav.maybePop());
+          return KeyEventResult.handled;
+        }
+        if (_selectedTab != 0 && mounted) {
+          setState(() => _selectedTab = 0);
+          return KeyEventResult.handled;
+        }
+      }
+    }
+    return KeyEventResult.ignored;
+  }
+
+  Future<void> _handleImportExternalIsoFromLibrary(
+    BuildContext navContext,
+  ) async {
+    if (_isImportingExternalIso) return;
+    _isImportingExternalIso = true;
+    String? pickedPath;
+    var keepPickedPathForCopy = false;
+
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.any,
+        allowMultiple: false,
+      );
+      final picked = result?.files.single;
+      pickedPath = picked?.path;
+      if (pickedPath == null || !mounted || !navContext.mounted) {
+        return;
+      }
+
+      final rawFileName =
+          (picked?.name ?? pickedPath.split(Platform.pathSeparator).last)
+              .trim();
+      final dotIdx = rawFileName.lastIndexOf('.');
+      final rawStem = dotIdx > 0 ? rawFileName.substring(0, dotIdx) : rawFileName;
+      final defaultTitle = rawStem
+          .replaceAll('_', ' ')
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .trim();
+      final detectedSlug = RomDownloadService.inferPlatformSlugFromExtension(
+        rawFileName,
+        fallbackSlug: 'ps2',
+      );
+      var selectedSlug = kRommPlatforms.any((p) => p.slug == detectedSlug)
+          ? detectedSlug
+          : kRommPlatforms.first.slug;
+
+      final titleController = TextEditingController(
+        text: defaultTitle.isEmpty ? 'Jogo Importado' : defaultTitle,
+      );
+      bool confirmed = false;
+      try {
+        confirmed = await showDialog<bool>(
+              context: navContext,
+              builder: (ctx) => StatefulBuilder(
+                builder: (ctx, setDialogState) => AlertDialog(
+                  backgroundColor: HydraTokens.bgNearBlack,
+                  shape: HydraTokens.dialogShape,
+                  title: const Text(
+                    'Importar ISO / ROM externa',
+                    style: TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: HydraTokens.textPrimary,
+                    ),
+                  ),
+                  content: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 440),
+                    child: SingleChildScrollView(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            rawFileName,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontFamily: 'JetBrainsMono',
+                              fontSize: 11,
+                              color: HydraTokens.primaryAurora,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          TextField(
+                            controller: titleController,
+                            style: const TextStyle(
+                              fontFamily: 'Rubik',
+                              fontSize: 13.5,
+                              color: HydraTokens.textPrimary,
+                            ),
+                            decoration: const InputDecoration(
+                              labelText: 'Nome do jogo na Biblioteca',
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          DropdownButtonFormField<String>(
+                            value: selectedSlug,
+                            dropdownColor: HydraTokens.bgNearBlack,
+                            decoration: const InputDecoration(
+                              labelText: 'Console / Plataforma',
+                              border: OutlineInputBorder(),
+                            ),
+                            items: kRommPlatforms
+                                .map(
+                                  (p) => DropdownMenuItem<String>(
+                                    value: p.slug,
+                                    child: Text(
+                                      '${p.fullName} (${p.shortName})',
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontFamily: 'Rubik',
+                                        fontSize: 13,
+                                        color: HydraTokens.textPrimary,
+                                      ),
+                                    ),
+                                  ),
+                                )
+                                .toList(),
+                            onChanged: (value) {
+                              if (value != null) {
+                                setDialogState(() => selectedSlug = value);
+                              }
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  actions: [
+                    TextButton(
+                      style: TextButton.styleFrom(
+                        minimumSize: const Size(48, 48),
+                      ),
+                      onPressed: () => Navigator.of(ctx).pop(false),
+                      child: const Text('Cancelar'),
+                    ),
+                    FilledButton(
+                      style: FilledButton.styleFrom(
+                        minimumSize: const Size(48, 48),
+                        backgroundColor: HydraTokens.primaryAurora,
+                        foregroundColor: HydraTokens.bgPureBlack,
+                      ),
+                      onPressed: () => Navigator.of(ctx).pop(true),
+                      child: const Text(
+                        'Importar',
+                        style: TextStyle(
+                          fontFamily: 'ReadexPro',
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ) ??
+            false;
+      } finally {
+        final finalTitle = titleController.text.trim();
+        titleController.dispose();
+        if (confirmed && mounted) {
+          keepPickedPathForCopy = true;
+          int importId =
+              900000000 + (pickedPath.hashCode.abs() % 90000000);
+          while (_catalogById.containsKey(importId)) {
+            importId++;
+          }
+          if (navContext.mounted) {
+            ScaffoldMessenger.of(navContext).showSnackBar(
+              const SnackBar(
+                content: Text('Importando arquivo para a Biblioteca...'),
+                duration: Duration(seconds: 2),
+              ),
+            );
+          }
+          final imported = await _downloadService.importExternalRomFile(
+            igdbId: importId,
+            sourcePath: pickedPath,
+            platformSlug: selectedSlug,
+          );
+          if (imported != null && mounted) {
+            final platformSpec = kRommPlatforms.firstWhere(
+              (p) => p.slug == selectedSlug,
+              orElse: () => kRommPlatforms.first,
+            );
+            final displayTitle = finalTitle.isEmpty
+                ? (defaultTitle.isEmpty ? rawFileName : defaultTitle)
+                : finalTitle;
+            final importedGame = EmulationGame(
+              igdbId: importId,
+              name: displayTitle,
+              canonicalNoIntroName: displayTitle,
+              summary: 'ROM/ISO importada localmente (${platformSpec.fullName}).',
+              genres: const ['Importado'],
+              developer: 'Arquivo Local',
+              releaseYear: null,
+              rating: null,
+              platformName: platformSpec.fullName,
+              platformSlug: platformSpec.slug,
+              directRomUrl: '',
+              estimatedSizeBytes: imported.totalBytes,
+              localRomPath: imported.localPath,
+            );
+            await _handleStatusUpdated(
+              importedGame,
+              RomDownloadStatus(
+                state: RomActionState.readyToPlay,
+                progress: 1.0,
+                localPath: imported.localPath,
+                crcVerified: true,
+              ),
+            );
+            if (navContext.mounted) {
+              ScaffoldMessenger.of(navContext).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    '${importedGame.name} (${importedGame.formattedSize}) adicionado à Biblioteca.',
+                  ),
+                ),
+              );
+            }
+          } else if (navContext.mounted) {
+            ScaffoldMessenger.of(navContext).showSnackBar(
+              const SnackBar(
+                content: Text('Não foi possível importar o arquivo selecionado.'),
+              ),
+            );
+          }
+        }
+      }
+    } catch (e) {
+      if (navContext.mounted) {
+        ScaffoldMessenger.of(navContext).showSnackBar(
+          SnackBar(content: Text('Falha ao importar ISO/ROM: $e')),
+        );
+      }
+    } finally {
+      if (!keepPickedPathForCopy) {
+        await EmulatorService.cleanFilePickerTempCache(pickedPath: pickedPath);
+      }
+      _isImportingExternalIso = false;
+    }
+  }
+
   Future<void> _launchLibretroPlayer(
     BuildContext navContext,
     EmulationGame game,
@@ -377,17 +885,23 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
   ) async {
     final navigator = Navigator.of(navContext);
     navigator.popUntil((route) => route.isFirst);
-    await navigator.push(
-      MaterialPageRoute<void>(
-        builder: (_) => LibretroPlayerScreen(
-          game: game,
-          romPath: localRomPath,
-          emulatorService: _emulatorService,
-          initialSettings: _settings,
-          onSettingsChanged: _handleSettingsUpdated,
+    _isPlayerActive = true;
+    try {
+      await navigator.push(
+        MaterialPageRoute<void>(
+          builder: (_) => LibretroPlayerScreen(
+            game: game,
+            romPath: localRomPath,
+            emulatorService: _emulatorService,
+            initialSettings: _settings,
+            onSettingsChanged: _handleSettingsUpdated,
+          ),
         ),
-      ),
-    );
+      );
+    } finally {
+      _isPlayerActive = false;
+    }
+    SystemChrome.setSystemUIOverlayStyle(_kLoopEdgeOverlayStyle);
     unawaited(
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
     );
@@ -400,9 +914,16 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: _navigatorKey,
       title: 'LoopGamer',
       debugShowCheckedModeBanner: false,
       theme: HydraTokens.buildAppTheme(),
+      builder: (context, child) => Focus(
+        canRequestFocus: false,
+        skipTraversal: true,
+        onKeyEvent: _handleRootAppKeyEvent,
+        child: child ?? const SizedBox.shrink(),
+      ),
       localizationsDelegates: const [
         GlobalMaterialLocalizations.delegate,
         GlobalWidgetsLocalizations.delegate,
@@ -454,6 +975,7 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                         onLaunchGameInLibretro: (game, path) => unawaited(
                           _launchLibretroPlayer(navContext, game, path),
                         ),
+                        isActive: _selectedTab == 1,
                         isLoadingCatalog: _isLoadingCatalog,
                         catalogError: _catalogError,
                         onRetryCatalog: () => unawaited(_loadRealCatalog()),
@@ -481,6 +1003,9 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                             downloadStatuses: statuses,
                             onImportNewRomPressed: () =>
                                 setState(() => _selectedTab = 1),
+                            onImportExternalIsoPressed: () => unawaited(
+                              _handleImportExternalIsoFromLibrary(navContext),
+                            ),
                             onLaunchGame: (game, path) => unawaited(
                               _launchLibretroPlayer(navContext, game, path),
                             ),

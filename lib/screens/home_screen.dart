@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:phosphor_flutter/phosphor_flutter.dart';
 import '../models/emulation_game.dart';
 import '../models/user_library_meta.dart';
@@ -53,8 +54,21 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final FocusNode _screenFocusNode = FocusNode(debugLabel: 'HomeScreenFocus');
+  final ScrollController _heroScrollController = ScrollController();
   int _selectedFeaturedIndex = 0;
   String _selectedPlatformSlug = 'todos';
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.isActive) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && widget.isActive) {
+          _screenFocusNode.requestFocus();
+        }
+      });
+    }
+  }
 
   @override
   void didUpdateWidget(covariant HomeScreen oldWidget) {
@@ -74,8 +88,24 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _heroScrollController.dispose();
     _screenFocusNode.dispose();
     super.dispose();
+  }
+
+  void _scrollHeroToIndex(int index) {
+    if (!_heroScrollController.hasClients) return;
+    const itemExtent = 210.0;
+    final pos = _heroScrollController.position;
+    final desired = (index * itemExtent - (pos.viewportDimension * 0.25))
+        .clamp(0.0, pos.maxScrollExtent);
+    unawaited(
+      _heroScrollController.animateTo(
+        desired,
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOutCubic,
+      ),
+    );
   }
 
   Map<int, RomDownloadStatus> _currentStatuses() =>
@@ -196,36 +226,54 @@ class _HomeScreenState extends State<HomeScreen> {
     return Focus(
       focusNode: _screenFocusNode,
       autofocus: widget.isActive,
-      onKeyEvent: (node, event) => handleGamepadNavigationKey(
-        event: event,
-        itemCount: shelfGames.length,
-        currentIndex: safeIndex,
-        onIndexChanged: (next) {
-          setState(() => _selectedFeaturedIndex = next);
-        },
-        axis: Axis.horizontal,
-        wrapAround: true,
-        onActivate: (idx) {
-          if (idx >= 0 && idx < shelfGames.length) {
-            _openDetails(shelfGames[idx]);
-          }
-        },
-        onSecondaryAction: (_) => widget.onOpenSearchTab?.call(),
-        allowSecondaryWhenEmpty: true,
-        isActive: widget.isActive,
-      ),
+      canRequestFocus: widget.isActive,
+      descendantsAreFocusable: widget.isActive,
+      onKeyEvent: (node, event) {
+        // Permite que LB/RB e LT/RT subam para alternar as abas principais do app.
+        if (event.logicalKey == LogicalKeyboardKey.gameButtonLeft1 ||
+            event.logicalKey == LogicalKeyboardKey.gameButtonRight1 ||
+            event.logicalKey == LogicalKeyboardKey.gameButtonLeft2 ||
+            event.logicalKey == LogicalKeyboardKey.gameButtonRight2) {
+          return KeyEventResult.ignored;
+        }
+        return handleGamepadNavigationKey(
+          event: event,
+          itemCount: shelfGames.length,
+          currentIndex: safeIndex,
+          onIndexChanged: (next) {
+            setState(() => _selectedFeaturedIndex = next);
+            _scrollHeroToIndex(next);
+          },
+          axis: Axis.horizontal,
+          wrapAround: true,
+          onActivate: (idx) {
+            if (idx >= 0 && idx < shelfGames.length) {
+              _openDetails(shelfGames[idx]);
+            }
+          },
+          onSecondaryAction: (_) => widget.onOpenSearchTab?.call(),
+          allowSecondaryWhenEmpty: true,
+          isActive: widget.isActive,
+        );
+      },
       child: content,
     );
   }
 
   Widget _buildFullCatalogStateScreen(BuildContext context) {
+    final topInset = MediaQuery.paddingOf(context).top;
     return Scaffold(
       backgroundColor: HydraTokens.bgPureBlack,
-      body: SafeArea(
-        child: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: widget.isLoadingCatalog
+      body: DecoratedBox(
+        decoration: const BoxDecoration(
+          gradient: HydraTokens.heroBackgroundGradient,
+        ),
+        child: SafeArea(
+          top: false,
+          child: Center(
+            child: Padding(
+              padding: EdgeInsets.fromLTRB(24, 24 + topInset, 24, 24),
+              child: widget.isLoadingCatalog
                 ? const LoopEmptyState.loading(
                     title: 'Carregando catálogo...',
                     subtitle: 'Buscando jogos, metadados e capas do sistema.',
@@ -249,6 +297,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         onAction:
                             widget.onRetryCatalog ?? widget.onOpenSearchTab,
                       ),
+            ),
           ),
         ),
       ),
@@ -375,6 +424,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   builder: (context, statuses) => SizedBox(
                     height: 162,
                     child: ListView.separated(
+                      controller: _heroScrollController,
                       scrollDirection: Axis.horizontal,
                       itemCount: shelfGames.length,
                       separatorBuilder: (_, __) => const SizedBox(width: 14),
@@ -394,6 +444,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                 _openDetails(game);
                               } else {
                                 setState(() => _selectedFeaturedIndex = idx);
+                                _scrollHeroToIndex(idx);
                               }
                             },
                             onActionTap: () => _executeGameAction(game, status),
@@ -637,15 +688,8 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                         const SizedBox(width: 6),
                         _ShortcutBarAction(
-                          onTap: shelfGames.isEmpty
-                              ? null
-                              : () {
-                                  final nextIdx =
-                                      (safeIndex + 1) % shelfGames.length;
-                                  setState(
-                                      () => _selectedFeaturedIndex = nextIdx);
-                                },
-                          semanticLabel: 'Trocar destaque (botões LB e RB)',
+                          onTap: widget.onOpenLibraryTab,
+                          semanticLabel: 'Alternar seções (botões LB e RB)',
                           child: const Row(
                             children: [
                               _ControllerKeyBadge(label: 'LB', pill: true),
@@ -653,7 +697,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               _ControllerKeyBadge(label: 'RB', pill: true),
                               SizedBox(width: 6),
                               Text(
-                                'Trocar',
+                                'Seções',
                                 style: TextStyle(
                                   fontFamily: 'ReadexPro',
                                   fontSize: 11.5,
@@ -712,16 +756,55 @@ class _HomeScreenState extends State<HomeScreen> {
     required List<EmulationGame> filteredCatalog,
   }) {
     final heroGame = shelfGames.isNotEmpty ? shelfGames[safeIndex] : null;
+    final topInset = MediaQuery.paddingOf(context).top;
 
     return Scaffold(
       backgroundColor: HydraTokens.bgPureBlack,
-      body: SafeArea(
-        child: CustomScrollView(
-          slivers: [
-            // 1. Top Search Pill + Botão Lateral (>= 48dp)
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(18, 12, 18, 10),
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            height: topInset + 250,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                if (heroGame != null)
+                  Opacity(
+                    opacity: 0.28,
+                    child: LoopCoverImage(
+                      url: heroGame.resolvedHeroBannerUrl,
+                      fit: BoxFit.cover,
+                      preset: LoopCoverImagePreset.hero,
+                    ),
+                  ),
+                const DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      stops: [0.0, 0.55, 1.0],
+                      colors: [
+                        Color(0x55000000),
+                        Color(0xCC000000),
+                        HydraTokens.bgPureBlack,
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          SafeArea(
+            top: false,
+            child: CustomScrollView(
+              slivers: [
+                // 1. Top Search Pill + Botão Lateral (>= 48dp)
+                SliverToBoxAdapter(
+                  child: Padding(
+                    padding: EdgeInsets.fromLTRB(18, topInset + 12, 18, 10),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -1510,10 +1593,12 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
               ),
-          ],
+            ],
+          ),
         ),
-      ),
-    );
+      ],
+    ),
+  );
   }
 }
 

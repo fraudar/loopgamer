@@ -18,6 +18,7 @@ class LibraryScreen extends StatefulWidget {
     required this.downloadingGames,
     required this.downloadStatuses,
     required this.onImportNewRomPressed,
+    this.onImportExternalIsoPressed,
     required this.onLaunchGame,
     required this.onRemoveGame,
     required this.onCancelDownload,
@@ -30,6 +31,7 @@ class LibraryScreen extends StatefulWidget {
   final List<EmulationGame> downloadingGames;
   final Map<int, RomDownloadStatus> downloadStatuses;
   final VoidCallback onImportNewRomPressed;
+  final VoidCallback? onImportExternalIsoPressed;
   final void Function(EmulationGame game, String localRomPath) onLaunchGame;
   final Future<void> Function(EmulationGame game) onRemoveGame;
   final void Function(EmulationGame game) onCancelDownload;
@@ -52,6 +54,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   String _activeFilter = 'todos';
   bool _hasFocus = false;
   bool _gamepadNavActive = false;
+  double _landscapeCardExtent = 146.0;
 
   @override
   void initState() {
@@ -142,7 +145,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         : _portraitScrollController;
     if (!controller.hasClients) return;
 
-    final itemExtent = isLandscape ? 146.0 : 110.0;
+    final itemExtent = isLandscape ? _landscapeCardExtent : 110.0;
     final viewport = controller.position.viewportDimension;
     final targetStart = idx * itemExtent;
     final targetEnd = targetStart + itemExtent;
@@ -641,18 +644,53 @@ class _LibraryScreenState extends State<LibraryScreen> {
       );
     }
 
-    return LoopEmptyState(
-      title: 'Nenhum jogo instalado ainda',
-      subtitle: isLandscape
-          ? 'Baixe jogos no catálogo em segundo plano ou importe um arquivo ROM local.'
-          : 'Escolha qualquer título na aba Início ou no Catálogo de ROMs para baixar em segundo plano.',
-      actionLabel: 'Explorar Catálogo',
-      actionIcon: PhosphorIcons.compass(PhosphorIconsStyle.bold),
-      onAction: widget.onImportNewRomPressed,
-      compact: isLandscape,
-      backgroundColor: isLandscape
-          ? HydraTokens.bgNearBlack.withOpacity(0.92)
-          : HydraTokens.bgNearBlack,
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        LoopEmptyState(
+          title: 'Nenhum jogo instalado ainda',
+          subtitle: isLandscape
+              ? 'Baixe jogos no catálogo ou importe uma ISO/ROM externa direto aqui.'
+              : 'Escolha títulos no Catálogo de ROMs ou importe uma ISO/ROM externa direto aqui.',
+          actionLabel: 'Importar ISO / ROM',
+          actionIcon: PhosphorIcons.folderPlus(PhosphorIconsStyle.bold),
+          onAction:
+              widget.onImportExternalIsoPressed ?? widget.onImportNewRomPressed,
+          compact: isLandscape,
+          backgroundColor: isLandscape
+              ? HydraTokens.bgNearBlack.withOpacity(0.92)
+              : HydraTokens.bgNearBlack,
+        ),
+        const SizedBox(height: 10),
+        Semantics(
+          button: true,
+          label: 'Explorar catálogo de ROMs',
+          child: OutlinedButton.icon(
+            style: OutlinedButton.styleFrom(
+              foregroundColor: HydraTokens.textPrimary,
+              backgroundColor: HydraTokens.bgNearBlack,
+              minimumSize: const Size(48, 48),
+              side: const BorderSide(color: HydraTokens.borderSubtle10),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+            ),
+            onPressed: widget.onImportNewRomPressed,
+            icon: PhosphorIcon(
+              PhosphorIcons.compass(PhosphorIconsStyle.bold),
+              size: 16,
+            ),
+            label: const Text(
+              'Explorar Catálogo',
+              style: TextStyle(
+                fontFamily: 'ReadexPro',
+                fontSize: 12.5,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -679,28 +717,37 @@ class _LibraryScreenState extends State<LibraryScreen> {
           });
         }
       },
-      onKeyEvent: (node, event) => handleGamepadNavigationKey(
-        event: event,
-        itemCount: items.length,
-        currentIndex: safeIdx,
-        axis: isLandscape ? Axis.horizontal : Axis.vertical,
-        isActive: widget.isActive,
-        onIndexChanged: (next) => _selectIndex(
-          next,
-          isLandscape: isLandscape,
-          viaGamepad: true,
-        ),
-        onActivate: (idx) {
-          final g = items[idx];
-          final st = widget.downloadStatuses[g.igdbId];
-          final path = st?.localPath ?? g.localRomPath;
-          if (path != null && st?.state != RomActionState.downloading) {
-            widget.onLaunchGame(g, path);
-          }
-        },
-        onSecondaryAction: (idx) => _toggleFavorite(items[idx]),
-        onTertiaryAction: (idx) => unawaited(_confirmAndRemoveGame(items[idx])),
-      ),
+      onKeyEvent: (node, event) {
+        if (event.logicalKey == LogicalKeyboardKey.gameButtonLeft1 ||
+            event.logicalKey == LogicalKeyboardKey.gameButtonRight1 ||
+            event.logicalKey == LogicalKeyboardKey.gameButtonLeft2 ||
+            event.logicalKey == LogicalKeyboardKey.gameButtonRight2) {
+          return KeyEventResult.ignored;
+        }
+        return handleGamepadNavigationKey(
+          event: event,
+          itemCount: items.length,
+          currentIndex: safeIdx,
+          axis: isLandscape ? Axis.horizontal : Axis.vertical,
+          isActive: widget.isActive,
+          onIndexChanged: (next) => _selectIndex(
+            next,
+            isLandscape: isLandscape,
+            viaGamepad: true,
+          ),
+          onActivate: (idx) {
+            final g = items[idx];
+            final st = widget.downloadStatuses[g.igdbId];
+            final path = st?.localPath ?? g.localRomPath;
+            if (path != null && st?.state != RomActionState.downloading) {
+              widget.onLaunchGame(g, path);
+            }
+          },
+          onSecondaryAction: (idx) => _toggleFavorite(items[idx]),
+          onTertiaryAction: (idx) =>
+              unawaited(_confirmAndRemoveGame(items[idx])),
+        );
+      },
       child: content,
     );
   }
@@ -781,6 +828,52 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
+                        Row(
+                          children: [
+                            Text(
+                              '${items.length} ${items.length == 1 ? 'jogo na biblioteca' : 'jogos na biblioteca'}',
+                              style: const TextStyle(
+                                fontFamily: 'ReadexPro',
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600,
+                                color: HydraTokens.textSecondary,
+                              ),
+                            ),
+                            const Spacer(),
+                            Semantics(
+                              button: true,
+                              label: 'Importar ISO ou ROM externa',
+                              child: FilledButton.icon(
+                                style: FilledButton.styleFrom(
+                                  backgroundColor: HydraTokens.primaryAurora,
+                                  foregroundColor: HydraTokens.bgPureBlack,
+                                  minimumSize: const Size(48, 48),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 14,
+                                    vertical: 10,
+                                  ),
+                                ),
+                                onPressed: widget.onImportExternalIsoPressed ??
+                                    widget.onImportNewRomPressed,
+                                icon: PhosphorIcon(
+                                  PhosphorIcons.folderPlus(
+                                    PhosphorIconsStyle.bold,
+                                  ),
+                                  size: 16,
+                                ),
+                                label: const Text(
+                                  'Importar ISO / ROM',
+                                  style: TextStyle(
+                                    fontFamily: 'ReadexPro',
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
                         Expanded(
                           child: LayoutBuilder(
                             builder: (context, constraints) {
@@ -794,6 +887,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                   (selectedHeight * 0.885).clamp(102.0, 186.0);
                               final normalWidth =
                                   normalHeight * (132.0 / 186.0);
+                              _landscapeCardExtent = normalWidth + 14.0;
 
                               return Center(
                                 child: SizedBox(
@@ -1316,9 +1410,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
     List<EmulationGame> items,
     int safeIdx,
   ) {
+    final topInset = MediaQuery.paddingOf(context).top;
     return Scaffold(
       backgroundColor: HydraTokens.bgPureBlack,
       body: SafeArea(
+        top: false,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -1329,62 +1425,90 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   bottom: BorderSide(color: HydraTokens.borderSubtle8),
                 ),
               ),
-              padding: const EdgeInsets.fromLTRB(20, 16, 20, 14),
-              child: Row(
+              padding: EdgeInsets.fromLTRB(20, topInset + 14, 20, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'Minha Biblioteca',
-                          style: TextStyle(
-                            fontFamily: 'ReadexPro',
-                            fontSize: 20,
-                            fontWeight: FontWeight.w700,
-                            color: HydraTokens.textPrimary,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          items.isEmpty
-                              ? 'Seus jogos e downloads aparecem aqui'
-                              : '${items.length} ${items.length == 1 ? 'jogo' : 'jogos'} • Segure para opções',
-                          style: const TextStyle(
-                            fontFamily: 'Rubik',
-                            fontSize: 12,
-                            color: HydraTokens.textSecondary,
-                          ),
-                        ),
-                      ],
+                  const Text(
+                    'Minha Biblioteca',
+                    style: TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontSize: 20,
+                      fontWeight: FontWeight.w700,
+                      color: HydraTokens.textPrimary,
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  Semantics(
-                    button: true,
-                    label: 'Explorar catálogo de ROMs',
-                    child: OutlinedButton(
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: HydraTokens.textPrimary,
-                        backgroundColor: HydraTokens.bgNearBlack,
-                        minimumSize: const Size(48, 48),
-                        side: const BorderSide(
-                          color: HydraTokens.borderSubtle10,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                      ),
-                      onPressed: widget.onImportNewRomPressed,
-                      child: const Text(
-                        'Explorar Catálogo',
-                        style: TextStyle(
-                          fontFamily: 'ReadexPro',
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
+                  const SizedBox(height: 2),
+                  Text(
+                    items.isEmpty
+                        ? 'Seus jogos, downloads e ISOs importadas aparecem aqui'
+                        : '${items.length} ${items.length == 1 ? 'jogo' : 'jogos'} • Segure para opções',
+                    style: const TextStyle(
+                      fontFamily: 'Rubik',
+                      fontSize: 12,
+                      color: HydraTokens.textSecondary,
                     ),
+                  ),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      Semantics(
+                        button: true,
+                        label: 'Importar ISO ou ROM externa',
+                        child: FilledButton.icon(
+                          style: FilledButton.styleFrom(
+                            backgroundColor: HydraTokens.primaryAurora,
+                            foregroundColor: HydraTokens.bgPureBlack,
+                            minimumSize: const Size(48, 48),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                          ),
+                          onPressed: widget.onImportExternalIsoPressed ??
+                              widget.onImportNewRomPressed,
+                          icon: PhosphorIcon(
+                            PhosphorIcons.folderPlus(PhosphorIconsStyle.bold),
+                            size: 16,
+                          ),
+                          label: const Text(
+                            'Importar ISO / ROM',
+                            style: TextStyle(
+                              fontFamily: 'ReadexPro',
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ),
+                      Semantics(
+                        button: true,
+                        label: 'Explorar catálogo de ROMs',
+                        child: OutlinedButton(
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: HydraTokens.textPrimary,
+                            backgroundColor: HydraTokens.bgNearBlack,
+                            minimumSize: const Size(48, 48),
+                            side: const BorderSide(
+                              color: HydraTokens.borderSubtle10,
+                            ),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                          ),
+                          onPressed: widget.onImportNewRomPressed,
+                          child: const Text(
+                            'Explorar Catálogo',
+                            style: TextStyle(
+                              fontFamily: 'ReadexPro',
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -1478,7 +1602,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         return HydraTexturedCard(
                           backgroundColor: HydraTokens.bgNearBlack,
                           borderRadius: 12,
-                          highlightedBorder: isSelected && _gamepadNavActive,
+                          highlightedBorder:
+                              isSelected && (_gamepadNavActive || _hasFocus),
                           padding: const EdgeInsets.symmetric(
                             horizontal: 10,
                             vertical: 8,
