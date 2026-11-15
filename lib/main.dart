@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -417,18 +418,9 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
 
           return Scaffold(
             backgroundColor: HydraTokens.bgPureBlack,
-            body: Column(
+            body: Stack(
               children: [
-                if (isLandscape)
-                  _GameHubLandscapeTopBar(
-                    currentIndex: _selectedTab,
-                    libraryBadgeCountListenable: _libraryBadgeCountNotifier,
-                    hasActiveDownloadListenable: _hasActiveDownloadNotifier,
-                    hardwareGamepadListenable: _hardwareGamepadNotifier,
-                    onSelectTab: (index) =>
-                        setState(() => _selectedTab = index),
-                  ),
-                Expanded(
+                Positioned.fill(
                   child: IndexedStack(
                     index: _selectedTab,
                     children: [
@@ -514,6 +506,20 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                     ],
                   ),
                 ),
+                if (isLandscape)
+                  Positioned(
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    child: _GameHubLandscapeTopBar(
+                      currentIndex: _selectedTab,
+                      libraryBadgeCountListenable: _libraryBadgeCountNotifier,
+                      hasActiveDownloadListenable: _hasActiveDownloadNotifier,
+                      hardwareGamepadListenable: _hardwareGamepadNotifier,
+                      onSelectTab: (index) =>
+                          setState(() => _selectedTab = index),
+                    ),
+                  ),
               ],
             ),
             bottomNavigationBar: isLandscape
@@ -581,7 +587,137 @@ class _LiveTopBarClockState extends State<_LiveTopBarClock> {
   }
 }
 
-/// Top Bar Estilo GameHub para Modo Deitado (Landscape)
+/// Indicador real de Wi-Fi na barra superior (sem estado estático falso).
+class _LiveTopBarWifi extends StatefulWidget {
+  const _LiveTopBarWifi();
+
+  @override
+  State<_LiveTopBarWifi> createState() => _LiveTopBarWifiState();
+}
+
+class _LiveTopBarWifiState extends State<_LiveTopBarWifi>
+    with WidgetsBindingObserver {
+  Timer? _timer;
+  bool _connected = true;
+  bool _wifi = true;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(_refreshNetwork());
+    _timer = Timer.periodic(const Duration(seconds: 15), (_) {
+      unawaited(_refreshNetwork());
+    });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_refreshNetwork());
+    }
+  }
+
+  Future<void> _refreshNetwork() async {
+    final status = await EmulatorService.fetchNetworkStatus();
+    if (!mounted) return;
+    if (status.connected != _connected || status.wifi != _wifi) {
+      setState(() {
+        _connected = status.connected;
+        _wifi = status.wifi;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final String label;
+    final PhosphorIconData icon;
+    final Color color;
+
+    if (_wifi) {
+      label = 'Wi-Fi conectado';
+      icon = PhosphorIcons.wifiHigh(PhosphorIconsStyle.bold);
+      color = HydraTokens.textPrimary;
+    } else if (_connected) {
+      label = 'Sem Wi-Fi (dados móveis)';
+      icon = PhosphorIcons.wifiSlash(PhosphorIconsStyle.regular);
+      color = HydraTokens.textSecondary;
+    } else {
+      label = 'Sem conexão';
+      icon = PhosphorIcons.wifiSlash(PhosphorIconsStyle.regular);
+      color = HydraTokens.textMuted;
+    }
+
+    return Semantics(
+      label: label,
+      excludeSemantics: true,
+      child: Tooltip(
+        message: label,
+        child: PhosphorIcon(
+          icon,
+          size: 16,
+          color: color,
+        ),
+      ),
+    );
+  }
+}
+
+/// Cápsula translúcida estilo iOS para a barra flutuante no modo horizontal.
+class _IosFloatingCapsule extends StatelessWidget {
+  const _IosFloatingCapsule({
+    required this.child,
+    this.padding = EdgeInsets.zero,
+  });
+
+  final Widget child;
+  final EdgeInsetsGeometry padding;
+
+  @override
+  Widget build(BuildContext context) {
+    final radius = BorderRadius.circular(999);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        borderRadius: radius,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.32),
+            blurRadius: 14,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: radius,
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+          child: Container(
+            padding: padding,
+            decoration: BoxDecoration(
+              color: HydraTokens.surfaceTopBar.withOpacity(0.76),
+              borderRadius: radius,
+              border: Border.all(
+                color: Colors.white.withOpacity(0.14),
+                width: 1.0,
+              ),
+            ),
+            child: child,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Top Bar flutuante estilo iOS (cápsulas arredondadas sem faixa preta de fundo)
 class _GameHubLandscapeTopBar extends StatelessWidget {
   const _GameHubLandscapeTopBar({
     required this.currentIndex,
@@ -599,11 +735,10 @@ class _GameHubLandscapeTopBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      color: HydraTokens.bgPureBlack.withOpacity(0.95),
-      padding: const EdgeInsets.fromLTRB(14, 2, 14, 2),
-      child: SafeArea(
-        bottom: false,
+    return SafeArea(
+      bottom: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
         child: ValueListenableBuilder<int>(
           valueListenable: libraryBadgeCountListenable,
           builder: (context, libraryBadgeCount, _) =>
@@ -650,47 +785,47 @@ class _GameHubLandscapeTopBar extends StatelessWidget {
               ];
 
               return Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Expanded(
-                    child: SingleChildScrollView(
-                      scrollDirection: Axis.horizontal,
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          for (int i = 0; i < navItems.length; i++) ...[
-                            Semantics(
-                              button: true,
-                              selected: i == currentIndex,
-                              label: navItems[i].label,
-                              child: ConstrainedBox(
-                                constraints: const BoxConstraints(
-                                  minWidth: 48,
-                                  minHeight: 48,
-                                ),
-                                child: InkWell(
-                                  borderRadius: BorderRadius.circular(18),
-                                  onTap: () => onSelectTab(i),
-                                  child: Center(
-                                    widthFactor: 1.0,
+                  Flexible(
+                    child: _IosFloatingCapsule(
+                      padding: const EdgeInsets.all(4),
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            for (int i = 0; i < navItems.length; i++) ...[
+                              Semantics(
+                                button: true,
+                                selected: i == currentIndex,
+                                label: navItems[i].label,
+                                child: Material(
+                                  color: Colors.transparent,
+                                  child: InkWell(
+                                    borderRadius: BorderRadius.circular(999),
+                                    onTap: () => onSelectTab(i),
                                     child: AnimatedContainer(
                                       duration:
                                           const Duration(milliseconds: 180),
+                                      curve: Curves.easeOutCubic,
                                       padding: const EdgeInsets.symmetric(
-                                        horizontal: 10,
-                                        vertical: 6,
+                                        horizontal: 11,
+                                        vertical: 7,
                                       ),
                                       decoration: BoxDecoration(
                                         color: i == currentIndex
-                                            ? Colors.white.withOpacity(0.12)
+                                            ? Colors.white.withOpacity(0.16)
                                             : Colors.transparent,
-                                        borderRadius: BorderRadius.circular(18),
+                                        borderRadius:
+                                            BorderRadius.circular(999),
                                       ),
                                       child: Row(
                                         mainAxisSize: MainAxisSize.min,
                                         children: [
                                           PhosphorIcon(
                                             navItems[i].icon,
-                                            size: 17,
+                                            size: 16,
                                             color: i == currentIndex
                                                 ? HydraTokens.textPrimary
                                                 : HydraTokens.textSecondary,
@@ -718,9 +853,7 @@ class _GameHubLandscapeTopBar extends StatelessWidget {
                                                 vertical: 1,
                                               ),
                                               decoration: BoxDecoration(
-                                                color: hasActiveDownload
-                                                    ? HydraTokens.accentAmber
-                                                    : HydraTokens.textPrimary,
+                                                color: HydraTokens.primaryAurora,
                                                 borderRadius:
                                                     BorderRadius.circular(8),
                                               ),
@@ -742,83 +875,115 @@ class _GameHubLandscapeTopBar extends StatelessWidget {
                                   ),
                                 ),
                               ),
-                            ),
-                            const SizedBox(width: 4),
+                              if (i < navItems.length - 1)
+                                const SizedBox(width: 2),
+                            ],
                           ],
-                        ],
+                        ),
                       ),
                     ),
                   ),
-                  const SizedBox(width: 4),
-                  Semantics(
-                    button: true,
-                    label: 'Buscar ROMs',
-                    child: IconButton(
-                      tooltip: 'Buscar ROMs',
-                      constraints: const BoxConstraints(
-                        minWidth: 48,
-                        minHeight: 48,
-                      ),
-                      onPressed: () => onSelectTab(1),
-                      icon: PhosphorIcon(
-                        PhosphorIcons.magnifyingGlass(PhosphorIconsStyle.bold),
-                        size: 17,
-                        color: HydraTokens.textPrimary,
-                      ),
+                  const SizedBox(width: 10),
+                  _IosFloatingCapsule(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 4,
                     ),
-                  ),
-                  Semantics(
-                    button: true,
-                    label: hasActiveDownload
-                        ? 'Biblioteca com downloads ativos'
-                        : 'Abrir Biblioteca',
-                    child: IconButton(
-                      tooltip: hasActiveDownload
-                          ? 'Downloads em andamento'
-                          : 'Abrir Biblioteca',
-                      constraints: const BoxConstraints(
-                        minWidth: 48,
-                        minHeight: 48,
-                      ),
-                      onPressed: () => onSelectTab(2),
-                      icon: PhosphorIcon(
-                        PhosphorIcons.floppyDisk(PhosphorIconsStyle.regular),
-                        size: 17,
-                        color: hasActiveDownload
-                            ? HydraTokens.accentAmber
-                            : HydraTokens.textPrimary,
-                      ),
-                    ),
-                  ),
-                  ValueListenableBuilder<bool>(
-                    valueListenable: hardwareGamepadListenable,
-                    builder: (context, gamepadActive, _) {
-                      if (!gamepadActive) return const SizedBox.shrink();
-                      return Padding(
-                        padding: const EdgeInsets.only(right: 4),
-                        child: Tooltip(
-                          message: 'Controle físico ativo',
-                          child: Semantics(
-                            label: 'Controle físico ativo',
-                            child: PhosphorIcon(
-                              PhosphorIcons.gameController(
-                                PhosphorIconsStyle.fill,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Semantics(
+                          button: true,
+                          label: 'Buscar ROMs',
+                          excludeSemantics: true,
+                          child: Tooltip(
+                            message: 'Buscar ROMs',
+                            child: Material(
+                              color: Colors.transparent,
+                              child: InkWell(
+                                customBorder: const CircleBorder(),
+                                onTap: () => onSelectTab(1),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(7),
+                                  child: PhosphorIcon(
+                                    PhosphorIcons.magnifyingGlass(
+                                      PhosphorIconsStyle.bold,
+                                    ),
+                                    size: 16,
+                                    color: HydraTokens.textPrimary,
+                                  ),
+                                ),
                               ),
-                              size: 17,
-                              color: HydraTokens.accentTeal,
                             ),
                           ),
                         ),
-                      );
-                    },
+                        Semantics(
+                          button: true,
+                          label: hasActiveDownload
+                              ? 'Downloads em andamento'
+                              : 'Abrir Biblioteca',
+                          excludeSemantics: true,
+                          child: Tooltip(
+                            message: hasActiveDownload
+                                ? 'Downloads em andamento'
+                                : 'Abrir Biblioteca',
+                            child: Material(
+                              color: Colors.transparent,
+                              child: InkWell(
+                                customBorder: const CircleBorder(),
+                                onTap: () => onSelectTab(2),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(7),
+                                  child: PhosphorIcon(
+                                    PhosphorIcons.floppyDisk(
+                                      hasActiveDownload
+                                          ? PhosphorIconsStyle.fill
+                                          : PhosphorIconsStyle.regular,
+                                    ),
+                                    size: 16,
+                                    color: HydraTokens.textPrimary,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        ValueListenableBuilder<bool>(
+                          valueListenable: hardwareGamepadListenable,
+                          builder: (context, gamepadActive, _) {
+                            if (!gamepadActive) return const SizedBox.shrink();
+                            return Padding(
+                              padding:
+                                  const EdgeInsets.symmetric(horizontal: 4),
+                              child: Tooltip(
+                                message: 'Controle físico ativo',
+                                child: Semantics(
+                                  label: 'Controle físico ativo',
+                                  child: PhosphorIcon(
+                                    PhosphorIcons.gameController(
+                                      PhosphorIconsStyle.fill,
+                                    ),
+                                    size: 16,
+                                    color: HydraTokens.accentTeal,
+                                  ),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                        Container(
+                          width: 1,
+                          height: 14,
+                          margin: const EdgeInsets.symmetric(horizontal: 6),
+                          color: Colors.white.withOpacity(0.18),
+                        ),
+                        const _LiveTopBarWifi(),
+                        const SizedBox(width: 6),
+                        const _LiveTopBarClock(),
+                        const SizedBox(width: 6),
+                      ],
+                    ),
                   ),
-                  Container(
-                    width: 1,
-                    height: 14,
-                    margin: const EdgeInsets.symmetric(horizontal: 8),
-                    color: Colors.white.withOpacity(0.22),
-                  ),
-                  const _LiveTopBarClock(),
                 ],
               );
             },
@@ -952,9 +1117,7 @@ class _GameHubPortraitDockBar extends StatelessWidget {
                                             vertical: 1,
                                           ),
                                           decoration: BoxDecoration(
-                                            color: isDownloading
-                                                ? HydraTokens.accentAmber
-                                                : HydraTokens.textPrimary,
+                                            color: HydraTokens.primaryAurora,
                                             borderRadius:
                                                 BorderRadius.circular(8),
                                           ),

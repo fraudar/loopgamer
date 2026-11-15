@@ -1,9 +1,12 @@
 package org.loopgamer.emulator
 
+import android.content.Context
 import android.graphics.SurfaceTexture
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
@@ -402,6 +405,24 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     stopLibretroLoopInternal()
                     mainHandler.post { result.success(null) }
                 }
+            }
+
+            "getNetworkStatus" -> {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                val caps = cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+                val hasWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                val hasTransport = hasWifi ||
+                    caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true ||
+                    caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true
+                val hasInternet = hasTransport &&
+                    (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true ||
+                        hasWifi)
+                result.success(
+                    mapOf(
+                        "connected" to hasInternet,
+                        "wifi" to hasWifi
+                    )
+                )
             }
 
             else -> result.notImplemented()

@@ -939,6 +939,26 @@ SoundSpeedHack = True
     }
   }
 
+  /// Consulta o estado real de Wi-Fi / conectividade via Android ConnectivityManager.
+  static Future<({bool connected, bool wifi})> fetchNetworkStatus() async {
+    try {
+      final res = await _methodChannel.invokeMapMethod<String, dynamic>(
+        'getNetworkStatus',
+      );
+      if (res == null) {
+        return (connected: true, wifi: true);
+      }
+      return (
+        connected: res['connected'] as bool? ?? false,
+        wifi: res['wifi'] as bool? ?? false,
+      );
+    } on MissingPluginException {
+      return (connected: true, wifi: true);
+    } catch (_) {
+      return (connected: false, wifi: false);
+    }
+  }
+
   /// Libera streams e fecha o cliente HTTP quando próprio.
   void dispose() {
     if (_isDisposed) return;

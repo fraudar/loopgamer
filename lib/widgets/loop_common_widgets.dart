@@ -131,7 +131,7 @@ class LoopProgressIndicator extends StatelessWidget {
     this.showLabelRow = true,
     this.minHeight = 6.0,
     this.borderRadius = 6.0,
-    this.color = HydraTokens.accentAmber,
+    this.color = HydraTokens.primaryAurora,
     this.backgroundColor = HydraTokens.surfaceElevated2,
     this.semanticsLabel,
   });
@@ -253,7 +253,7 @@ class _LoopPlatformChipState extends State<LoopPlatformChip> {
 
   @override
   Widget build(BuildContext context) {
-    final focusColor = widget.accentColor ?? HydraTokens.accentAmber;
+    final focusColor = widget.accentColor ?? HydraTokens.primaryAurora;
     final semanticText = widget.semanticsLabel ??
         (widget.count != null
             ? '${widget.label}, ${widget.count} jogos'
@@ -438,7 +438,7 @@ class LoopEmptyState extends StatelessWidget {
                   height: 30,
                   child: CircularProgressIndicator(
                     strokeWidth: 2.8,
-                    color: HydraTokens.accentAmber,
+                    color: HydraTokens.primaryAurora,
                   ),
                 )
               else
@@ -565,15 +565,15 @@ class _LoopRecentGameCardState extends State<LoopRecentGameCard> {
             borderRadius: BorderRadius.circular(12),
             border: Border.all(
               color: _focused
-                  ? HydraTokens.accentAmber
+                  ? HydraTokens.primaryAurora
                   : HydraTokens.borderSubtle10,
               width: _focused ? 2.0 : 1.0,
             ),
             boxShadow: _focused
                 ? HydraTokens.neonBoxGlow(
-                    opacity: 0.28,
+                    opacity: 0.22,
                     blur: 12,
-                    color: HydraTokens.accentAmber,
+                    color: HydraTokens.primaryAurora,
                   )
                 : null,
           ),

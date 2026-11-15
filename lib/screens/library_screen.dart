@@ -51,6 +51,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   int _selectedIndex = 0;
   String _activeFilter = 'todos';
   bool _hasFocus = false;
+  bool _gamepadNavActive = false;
 
   @override
   void initState() {
@@ -123,8 +124,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return all;
   }
 
-  void _selectIndex(int nextIndex, {required bool isLandscape}) {
-    setState(() => _selectedIndex = nextIndex);
+  void _selectIndex(
+    int nextIndex, {
+    required bool isLandscape,
+    bool viaGamepad = false,
+  }) {
+    setState(() {
+      _selectedIndex = nextIndex;
+      _gamepadNavActive = viaGamepad;
+    });
     _scrollToSelected(nextIndex, isLandscape: isLandscape);
   }
 
@@ -134,7 +142,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         : _portraitScrollController;
     if (!controller.hasClients) return;
 
-    final itemExtent = isLandscape ? 146.0 : 168.0;
+    final itemExtent = isLandscape ? 146.0 : 110.0;
     final viewport = controller.position.viewportDimension;
     final targetStart = idx * itemExtent;
     final targetEnd = targetStart + itemExtent;
@@ -274,7 +282,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   children: [
                     for (final col in cols)
                       CheckboxListTile(
-                        activeColor: HydraTokens.accentAmber,
+                        activeColor: HydraTokens.primaryAurora,
                         checkColor: HydraTokens.bgPureBlack,
                         title: Text(
                           col,
@@ -312,7 +320,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 },
                 child: const Text(
                   '+ Nova Coleção',
-                  style: TextStyle(color: HydraTokens.accentAmber),
+                  style: TextStyle(color: HydraTokens.primaryAurora),
                 ),
               ),
               FilledButton(
@@ -449,8 +457,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                             ? PhosphorIcons.star(PhosphorIconsStyle.fill)
                             : PhosphorIcons.star(PhosphorIconsStyle.regular),
                         color: isFav
-                            ? HydraTokens.accentAmber
-                            : HydraTokens.textPrimary,
+                            ? HydraTokens.primaryAurora
+                            : HydraTokens.textSecondary,
                       ),
                       title: Text(
                         isFav
@@ -470,7 +478,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       contentPadding: const EdgeInsets.symmetric(horizontal: 8),
                       leading: PhosphorIcon(
                         PhosphorIcons.folders(PhosphorIconsStyle.regular),
-                        color: HydraTokens.accentAmber,
+                        color: HydraTokens.textPrimary,
                       ),
                       title: const Text(
                         'Organizar em Coleções...',
@@ -664,8 +672,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
       canRequestFocus: widget.isActive,
       descendantsAreFocusable: widget.isActive,
       onFocusChange: (hasFocus) {
-        if (_hasFocus != hasFocus) {
-          setState(() => _hasFocus = hasFocus);
+        if (_hasFocus != hasFocus || (!hasFocus && _gamepadNavActive)) {
+          setState(() {
+            _hasFocus = hasFocus;
+            if (!hasFocus) _gamepadNavActive = false;
+          });
         }
       },
       onKeyEvent: (node, event) => handleGamepadNavigationKey(
@@ -674,7 +685,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
         currentIndex: safeIdx,
         axis: isLandscape ? Axis.horizontal : Axis.vertical,
         isActive: widget.isActive,
-        onIndexChanged: (next) => _selectIndex(next, isLandscape: isLandscape),
+        onIndexChanged: (next) => _selectIndex(
+          next,
+          isLandscape: isLandscape,
+          viaGamepad: true,
+        ),
         onActivate: (idx) {
           final g = items[idx];
           final st = widget.downloadStatuses[g.igdbId];
@@ -743,15 +758,26 @@ class _LibraryScreenState extends State<LibraryScreen> {
           ),
 
           SafeArea(
+            top: false,
             child: items.isEmpty
                 ? Center(
                     child: SingleChildScrollView(
-                      padding: const EdgeInsets.all(24),
+                      padding: EdgeInsets.fromLTRB(
+                        24,
+                        MediaQuery.paddingOf(context).top + 58,
+                        24,
+                        24,
+                      ),
                       child: _buildEmptyLibraryState(isLandscape: true),
                     ),
                   )
                 : Padding(
-                    padding: const EdgeInsets.fromLTRB(28, 10, 28, 12),
+                    padding: EdgeInsets.fromLTRB(
+                      28,
+                      MediaQuery.paddingOf(context).top + 58,
+                      28,
+                      12,
+                    ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
@@ -789,9 +815,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                           status?.localPath ?? game.localRomPath;
 
                                       final highlightColor = _hasFocus
-                                          ? HydraTokens.accentAmber
+                                          ? HydraTokens.primaryAurora
                                           : HydraTokens.primaryAurora
-                                              .withOpacity(0.90);
+                                              .withOpacity(0.85);
 
                                       return Center(
                                         child: Semantics(
@@ -852,10 +878,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                                 boxShadow: isSelected &&
                                                         _hasFocus
                                                     ? HydraTokens.neonBoxGlow(
-                                                        opacity: 0.34,
-                                                        blur: 20,
+                                                        opacity: 0.28,
+                                                        blur: 18,
                                                         color: HydraTokens
-                                                            .accentAmber,
+                                                            .primaryAurora,
                                                       )
                                                     : [
                                                         BoxShadow(
@@ -911,7 +937,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                                                 strokeWidth:
                                                                     3.5,
                                                                 color: HydraTokens
-                                                                    .accentAmber,
+                                                                    .primaryAurora,
                                                                 backgroundColor:
                                                                     Colors
                                                                         .white24,
@@ -1044,9 +1070,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                             )
                           : PhosphorIcons.clock(PhosphorIconsStyle.regular),
                       size: 13,
-                      color: selectedDownloading
-                          ? HydraTokens.accentAmber
-                          : HydraTokens.textPrimary,
+                      color: HydraTokens.textPrimary,
                     ),
                     const SizedBox(width: 5),
                     Text(
@@ -1062,7 +1086,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         fontSize: 11,
                         fontWeight: FontWeight.w700,
                         color: selectedDownloading
-                            ? HydraTokens.accentAmber
+                            ? HydraTokens.primaryAurora
                             : HydraTokens.textPrimary,
                       ),
                     ),
@@ -1098,7 +1122,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                           : PhosphorIcons.star(PhosphorIconsStyle.regular),
                       size: 18,
                       color: isFavorite
-                          ? HydraTokens.accentAmber
+                          ? HydraTokens.primaryAurora
                           : HydraTokens.textSecondary,
                     ),
                   ),
@@ -1325,7 +1349,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         Text(
                           items.isEmpty
                               ? 'Seus jogos e downloads aparecem aqui'
-                              : '${items.length} ${items.length == 1 ? 'jogo' : 'jogos'} • Toque para jogar',
+                              : '${items.length} ${items.length == 1 ? 'jogo' : 'jogos'} • Segure para opções',
                           style: const TextStyle(
                             fontFamily: 'Rubik',
                             fontSize: 12,
@@ -1387,7 +1411,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       label: '★ Favoritos',
                       count: widget.userMeta.favorites.length,
                       selected: _activeFilter == 'favoritos',
-                      accentColor: HydraTokens.accentAmber,
+                      accentColor: HydraTokens.primaryAurora,
                       compact: true,
                       onTap: () => setState(() {
                         _activeFilter = 'favoritos';
@@ -1438,7 +1462,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       controller: _portraitScrollController,
                       padding: const EdgeInsets.fromLTRB(18, 10, 18, 24),
                       itemCount: items.length,
-                      separatorBuilder: (_, __) => const SizedBox(height: 12),
+                      separatorBuilder: (_, __) => const SizedBox(height: 10),
                       itemBuilder: (context, index) {
                         final game = items[index];
                         final status = widget.downloadStatuses[game.igdbId];
@@ -1448,346 +1472,247 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         final romPath = status?.localPath ?? game.localRomPath;
                         final isSelected = index == safeIdx;
                         final isFav = widget.userMeta.isFavorite(game.igdbId);
+                        final playtime =
+                            widget.userMeta.playtimeOf(game.igdbId);
 
-                        return AnimatedContainer(
-                          duration: const Duration(milliseconds: 160),
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(15),
-                            border: isSelected && _hasFocus
-                                ? Border.all(
-                                    color: HydraTokens.accentAmber,
-                                    width: 2.0,
-                                  )
-                                : null,
-                            boxShadow: isSelected && _hasFocus
-                                ? HydraTokens.neonBoxGlow(
-                                    opacity: 0.25,
-                                    blur: 12,
-                                    color: HydraTokens.accentAmber,
-                                  )
-                                : null,
+                        return HydraTexturedCard(
+                          backgroundColor: HydraTokens.bgNearBlack,
+                          borderRadius: 12,
+                          highlightedBorder: isSelected && _gamepadNavActive,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 8,
                           ),
-                          child: HydraTexturedCard(
-                            backgroundColor: HydraTokens.bgNearBlack,
-                            borderRadius: 14,
-                            highlightedBorder: !isDownloading && isSelected,
-                            padding: const EdgeInsets.all(12),
-                            onTap: (!isDownloading && romPath != null)
-                                ? () {
-                                    _selectIndex(index, isLandscape: false);
-                                    widget.onLaunchGame(game, romPath);
-                                  }
-                                : () => _selectIndex(index, isLandscape: false),
-                            onLongPress: () {
-                              _selectIndex(index, isLandscape: false);
-                              unawaited(_showLongPressOptions(game));
-                            },
-                            child: Column(
-                              children: [
-                                Row(
+                          onTap: (!isDownloading && romPath != null)
+                              ? () {
+                                  _selectIndex(index, isLandscape: false);
+                                  widget.onLaunchGame(game, romPath);
+                                }
+                              : () => _selectIndex(index, isLandscape: false),
+                          onLongPress: () {
+                            _selectIndex(index, isLandscape: false);
+                            unawaited(_showLongPressOptions(game));
+                          },
+                          child: Row(
+                            children: [
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: SizedBox(
+                                  width: 56,
+                                  height: 76,
+                                  child: Stack(
+                                    fit: StackFit.expand,
+                                    children: [
+                                      LoopCoverImage(
+                                        url: game.resolvedGridCoverUrl,
+                                        fit: BoxFit.cover,
+                                        cacheWidth: 128,
+                                        cacheHeight: 176,
+                                      ),
+                                      if (isFav && !isDownloading)
+                                        Positioned(
+                                          top: 4,
+                                          right: 4,
+                                          child: Container(
+                                            padding: const EdgeInsets.all(3),
+                                            decoration: BoxDecoration(
+                                              color:
+                                                  Colors.black.withOpacity(0.72),
+                                              borderRadius:
+                                                  BorderRadius.circular(5),
+                                            ),
+                                            child: PhosphorIcon(
+                                              PhosphorIcons.star(
+                                                PhosphorIconsStyle.fill,
+                                              ),
+                                              size: 10,
+                                              color: HydraTokens.primaryAurora,
+                                            ),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    ClipRRect(
-                                      borderRadius: BorderRadius.circular(10),
-                                      child: SizedBox(
-                                        width: 68,
-                                        height: 94,
-                                        child: LoopCoverImage(
-                                          url: game.resolvedGridCoverUrl,
-                                          fit: BoxFit.cover,
-                                          cacheWidth: 144,
-                                          cacheHeight: 196,
+                                    Row(
+                                      children: [
+                                        Flexible(
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 6,
+                                              vertical: 1.5,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: Colors.white
+                                                  .withOpacity(0.08),
+                                              borderRadius:
+                                                  BorderRadius.circular(4),
+                                            ),
+                                            child: Text(
+                                              game.platformName,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: const TextStyle(
+                                                fontFamily: 'JetBrainsMono',
+                                                fontSize: 9.5,
+                                                fontWeight: FontWeight.w700,
+                                                color: HydraTokens.textPrimary,
+                                              ),
+                                            ),
+                                          ),
                                         ),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 14),
-                                    Expanded(
-                                      child: Column(
-                                        crossAxisAlignment:
-                                            CrossAxisAlignment.start,
-                                        children: [
-                                          Row(
-                                            children: [
-                                              Container(
-                                                padding:
-                                                    const EdgeInsets.symmetric(
-                                                  horizontal: 7,
-                                                  vertical: 2,
-                                                ),
-                                                decoration: BoxDecoration(
-                                                  color: Colors.white
-                                                      .withOpacity(0.08),
-                                                  borderRadius:
-                                                      BorderRadius.circular(5),
-                                                ),
-                                                child: Text(
-                                                  game.platformName,
-                                                  style: const TextStyle(
-                                                    fontFamily: 'JetBrainsMono',
-                                                    fontSize: 10,
-                                                    fontWeight: FontWeight.w700,
-                                                    color:
-                                                        HydraTokens.textPrimary,
-                                                  ),
-                                                ),
-                                              ),
-                                              const SizedBox(width: 8),
-                                              Expanded(
-                                                child: Text(
-                                                  isDownloading
-                                                      ? (status?.speedLabel ??
-                                                          'Baixando em 2º plano...')
-                                                      : '${game.formattedSize} • ${game.romFormatLabel}',
-                                                  maxLines: 1,
-                                                  overflow:
-                                                      TextOverflow.ellipsis,
-                                                  style: TextStyle(
-                                                    fontFamily: 'JetBrainsMono',
-                                                    fontSize: 11,
-                                                    color: isDownloading
-                                                        ? HydraTokens
-                                                            .accentAmber
-                                                        : HydraTokens
-                                                            .textSecondary,
-                                                  ),
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                          const SizedBox(height: 6),
-                                          Text(
-                                            game.name,
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: const TextStyle(
-                                              fontFamily: 'ReadexPro',
-                                              fontSize: 15.5,
-                                              fontWeight: FontWeight.w700,
-                                              color: HydraTokens.textPrimary,
-                                            ),
-                                          ),
-                                          if (!isDownloading) ...[
-                                            const SizedBox(height: 3),
-                                            Row(
-                                              children: [
-                                                PhosphorIcon(
-                                                  PhosphorIcons.clock(
-                                                    PhosphorIconsStyle.regular,
-                                                  ),
-                                                  size: 11,
-                                                  color: HydraTokens.textPrimary,
-                                                ),
-                                                const SizedBox(width: 4),
-                                                Text(
-                                                  formatPlaytime(
-                                                    widget.userMeta
-                                                        .playtimeOf(game.igdbId)
-                                                        .totalSeconds,
-                                                  ),
-                                                  style: const TextStyle(
-                                                    fontFamily: 'JetBrainsMono',
-                                                    fontSize: 10.5,
-                                                    fontWeight: FontWeight.w700,
-                                                    color:
-                                                        HydraTokens.textPrimary,
-                                                  ),
-                                                ),
-                                                if (widget.userMeta
-                                                        .playtimeOf(game.igdbId)
-                                                        .lastPlayed !=
-                                                    null) ...[
-                                                  const SizedBox(width: 8),
-                                                  Flexible(
-                                                    child: Text(
-                                                      '• ${formatLastPlayed(widget.userMeta.playtimeOf(game.igdbId).lastPlayed)}',
-                                                      maxLines: 1,
-                                                      overflow:
-                                                          TextOverflow.ellipsis,
-                                                      style: const TextStyle(
-                                                        fontFamily: 'Rubik',
-                                                        fontSize: 11,
-                                                        color: HydraTokens
-                                                            .textMuted,
-                                                      ),
-                                                    ),
-                                                  ),
-                                                ],
-                                              ],
-                                            ),
-                                          ],
-                                          const SizedBox(height: 4),
-                                          Text(
+                                        const SizedBox(width: 6),
+                                        Flexible(
+                                          child: Text(
                                             isDownloading
-                                                ? 'Progresso: ${LoopProgressIndicator.formatPercent(progress)}'
-                                                : (game.developer.isNotEmpty
-                                                    ? game.developer
-                                                    : game.platformName),
+                                                ? (status?.speedLabel ??
+                                                    'Baixando em 2º plano...')
+                                                : '${game.formattedSize} • ${game.romFormatLabel}',
                                             maxLines: 1,
                                             overflow: TextOverflow.ellipsis,
-                                            style: const TextStyle(
-                                              fontFamily: 'Rubik',
-                                              fontSize: 11.5,
-                                              color: HydraTokens.textSecondary,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                    Semantics(
-                                      button: true,
-                                      label: 'Opções de ${game.name}',
-                                      child: Tooltip(
-                                        message: 'Opções do jogo',
-                                        child: IconButton(
-                                          onPressed: () {
-                                            _selectIndex(
-                                              index,
-                                              isLandscape: false,
-                                            );
-                                            unawaited(
-                                              _showLongPressOptions(game),
-                                            );
-                                          },
-                                          constraints: const BoxConstraints(
-                                            minWidth: 48,
-                                            minHeight: 48,
-                                          ),
-                                          icon: PhosphorIcon(
-                                            PhosphorIcons.dotsThreeVertical(
-                                              PhosphorIconsStyle.bold,
-                                            ),
-                                            size: 20,
-                                            color: HydraTokens.textSecondary,
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(height: 10),
-                                if (isDownloading)
-                                  Row(
-                                    children: [
-                                      Expanded(
-                                        child: LoopProgressIndicator(
-                                          progress: progress,
-                                          label: status?.speedLabel ??
-                                              'Baixando em 2º plano',
-                                          color: HydraTokens.accentAmber,
-                                          semanticsLabel:
-                                              'Progresso de download de ${game.name}',
-                                        ),
-                                      ),
-                                      const SizedBox(width: 12),
-                                      OutlinedButton(
-                                        style: OutlinedButton.styleFrom(
-                                          foregroundColor:
-                                              HydraTokens.accentDanger,
-                                          minimumSize: const Size(48, 48),
-                                          side: BorderSide(
-                                            color: HydraTokens.accentDanger
-                                                .withOpacity(0.5),
-                                          ),
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 14,
-                                          ),
-                                          shape: RoundedRectangleBorder(
-                                            borderRadius:
-                                                BorderRadius.circular(10),
-                                          ),
-                                        ),
-                                        onPressed: () =>
-                                            widget.onCancelDownload(game),
-                                        child: const Text(
-                                          'Cancelar',
-                                          style: TextStyle(
-                                            fontFamily: 'ReadexPro',
-                                            fontSize: 12,
-                                            fontWeight: FontWeight.w600,
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  )
-                                else
-                                  Row(
-                                    children: [
-                                      Semantics(
-                                        button: true,
-                                        toggled: isFav,
-                                        label: isFav
-                                            ? 'Remover ${game.name} dos favoritos'
-                                            : 'Adicionar ${game.name} aos favoritos',
-                                        child: Tooltip(
-                                          message: isFav
-                                              ? 'Remover dos favoritos'
-                                              : 'Adicionar aos favoritos',
-                                          child: IconButton(
-                                            onPressed: () =>
-                                                _toggleFavorite(game),
-                                            constraints: const BoxConstraints(
-                                              minWidth: 48,
-                                              minHeight: 48,
-                                            ),
-                                            style: IconButton.styleFrom(
-                                              backgroundColor: Colors.white
-                                                  .withOpacity(0.06),
-                                              shape: RoundedRectangleBorder(
-                                                borderRadius:
-                                                    BorderRadius.circular(10),
-                                              ),
-                                            ),
-                                            icon: PhosphorIcon(
-                                              isFav
-                                                  ? PhosphorIcons.star(
-                                                      PhosphorIconsStyle.fill,
-                                                    )
-                                                  : PhosphorIcons.star(
-                                                      PhosphorIconsStyle
-                                                          .regular,
-                                                    ),
-                                              size: 18,
-                                              color: isFav
-                                                  ? HydraTokens.accentAmber
+                                            style: TextStyle(
+                                              fontFamily: 'JetBrainsMono',
+                                              fontSize: 10.5,
+                                              color: isDownloading
+                                                  ? HydraTokens.primaryAurora
                                                   : HydraTokens.textSecondary,
                                             ),
                                           ),
                                         ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      game.name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontFamily: 'ReadexPro',
+                                        fontSize: 14.5,
+                                        fontWeight: FontWeight.w700,
+                                        color: HydraTokens.textPrimary,
                                       ),
-                                      const Spacer(),
-                                      FilledButton(
-                                        style: FilledButton.styleFrom(
-                                          backgroundColor:
-                                              HydraTokens.primaryAurora,
-                                          foregroundColor:
-                                              HydraTokens.bgPureBlack,
-                                          minimumSize: const Size(92, 48),
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 18,
+                                    ),
+                                    const SizedBox(height: 4),
+                                    if (isDownloading)
+                                      LoopProgressIndicator(
+                                        progress: progress,
+                                        label:
+                                            '${LoopProgressIndicator.formatPercent(progress)} • 2º plano',
+                                        color: HydraTokens.primaryAurora,
+                                        semanticsLabel:
+                                            'Progresso de download de ${game.name}',
+                                      )
+                                    else
+                                      Row(
+                                        children: [
+                                          PhosphorIcon(
+                                            PhosphorIcons.clock(
+                                              PhosphorIconsStyle.regular,
+                                            ),
+                                            size: 11,
+                                            color: HydraTokens.textSecondary,
                                           ),
-                                          shape: RoundedRectangleBorder(
-                                            borderRadius:
-                                                BorderRadius.circular(10),
+                                          const SizedBox(width: 4),
+                                          Text(
+                                            formatPlaytime(
+                                              playtime.totalSeconds,
+                                            ),
+                                            style: const TextStyle(
+                                              fontFamily: 'JetBrainsMono',
+                                              fontSize: 10.5,
+                                              fontWeight: FontWeight.w600,
+                                              color: HydraTokens.textSecondary,
+                                            ),
                                           ),
-                                        ),
-                                        onPressed: romPath == null
-                                            ? null
-                                            : () => widget.onLaunchGame(
-                                                  game,
-                                                  romPath,
+                                          if (playtime.lastPlayed != null) ...[
+                                            const SizedBox(width: 6),
+                                            Flexible(
+                                              child: Text(
+                                                '• ${formatLastPlayed(playtime.lastPlayed)}',
+                                                maxLines: 1,
+                                                overflow:
+                                                    TextOverflow.ellipsis,
+                                                style: const TextStyle(
+                                                  fontFamily: 'Rubik',
+                                                  fontSize: 10.5,
+                                                  color: HydraTokens.textMuted,
                                                 ),
-                                        child: const Text(
-                                          'Jogar',
-                                          style: TextStyle(
-                                            fontFamily: 'ReadexPro',
-                                            fontWeight: FontWeight.w700,
-                                          ),
-                                        ),
+                                              ),
+                                            ),
+                                          ],
+                                        ],
                                       ),
-                                    ],
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              if (isDownloading)
+                                OutlinedButton(
+                                  style: OutlinedButton.styleFrom(
+                                    foregroundColor: HydraTokens.accentDanger,
+                                    minimumSize: const Size(76, 48),
+                                    tapTargetSize:
+                                        MaterialTapTargetSize.shrinkWrap,
+                                    side: BorderSide(
+                                      color: HydraTokens.accentDanger
+                                          .withOpacity(0.5),
+                                    ),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 12,
+                                    ),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
                                   ),
-                              ],
-                            ),
+                                  onPressed: () =>
+                                      widget.onCancelDownload(game),
+                                  child: const Text(
+                                    'Cancelar',
+                                    style: TextStyle(
+                                      fontFamily: 'ReadexPro',
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                )
+                              else
+                                FilledButton(
+                                  style: FilledButton.styleFrom(
+                                    backgroundColor: HydraTokens.primaryAurora,
+                                    foregroundColor: HydraTokens.bgPureBlack,
+                                    minimumSize: const Size(72, 48),
+                                    tapTargetSize:
+                                        MaterialTapTargetSize.shrinkWrap,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 16,
+                                    ),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                  ),
+                                  onPressed: romPath == null
+                                      ? null
+                                      : () => widget.onLaunchGame(
+                                            game,
+                                            romPath,
+                                          ),
+                                  child: const Text(
+                                    'Jogar',
+                                    style: TextStyle(
+                                      fontFamily: 'ReadexPro',
+                                      fontSize: 12.5,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ),
+                            ],
                           ),
                         );
                       },
@@ -1845,9 +1770,9 @@ class _NewCollectionChipButtonState extends State<_NewCollectionChipButton> {
                     borderRadius: BorderRadius.circular(16),
                     border: Border.all(
                       color: _focused
-                          ? HydraTokens.accentAmber
-                          : HydraTokens.accentAmber.withOpacity(0.65),
-                      width: _focused ? 2.0 : 1.0,
+                          ? HydraTokens.primaryAurora
+                          : HydraTokens.borderSubtle10,
+                      width: _focused ? 1.5 : 1.0,
                     ),
                   ),
                   child: Row(
@@ -1856,7 +1781,7 @@ class _NewCollectionChipButtonState extends State<_NewCollectionChipButton> {
                       PhosphorIcon(
                         PhosphorIcons.plus(PhosphorIconsStyle.bold),
                         size: 12,
-                        color: HydraTokens.accentAmber,
+                        color: HydraTokens.primaryAurora,
                       ),
                       const SizedBox(width: 4),
                       const Text(
@@ -1865,7 +1790,7 @@ class _NewCollectionChipButtonState extends State<_NewCollectionChipButton> {
                           fontFamily: 'ReadexPro',
                           fontSize: 11,
                           fontWeight: FontWeight.w600,
-                          color: HydraTokens.accentAmber,
+                          color: HydraTokens.primaryAurora,
                         ),
                       ),
                     ],
