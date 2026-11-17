@@ -5,8 +5,11 @@ import 'package:phosphor_flutter/phosphor_flutter.dart';
 import '../models/app_settings.dart';
 import '../models/emulation_game.dart';
 import '../models/user_library_meta.dart';
-import '../services/cover_cache_service.dart';
+import '../services/game_asset_service.dart';
 import '../theme/hydra_tokens.dart';
+import '../theme/ps5_hydra_theme.dart';
+import 'animated_game_logo.dart';
+import 'procedural_cover.dart';
 
 /// Helper compartilhado de navegação por D-pad / teclado para listas e grids.
 ///
@@ -265,23 +268,23 @@ class _LoopPlatformChipState extends State<LoopPlatformChip> {
 
   @override
   Widget build(BuildContext context) {
-    final focusColor = widget.accentColor ?? HydraTokens.primaryAurora;
+    const focusColor = PS5HydraTheme.auroraSpringMint;
     final semanticText = widget.semanticsLabel ??
         (widget.count != null
             ? '${widget.label}, ${widget.count} jogos'
             : widget.label);
 
     final bgColor = widget.selected
-        ? HydraTokens.primaryAurora
-        : HydraTokens.bgNearBlack;
+        ? HydraTokens.surfaceElevated2
+        : PS5HydraTheme.obsidianGlass;
     final borderColor = _focused
         ? focusColor
         : (widget.selected
-            ? HydraTokens.primaryAurora
-            : HydraTokens.borderSubtle10);
-    final textColor = widget.selected
-        ? HydraTokens.bgPureBlack
-        : (_focused ? HydraTokens.textPrimary : HydraTokens.textSecondary);
+            ? PS5HydraTheme.textPrimary.withOpacity(0.55)
+            : PS5HydraTheme.borderSubtle);
+    final textColor = (widget.selected || _focused)
+        ? PS5HydraTheme.textPrimary
+        : PS5HydraTheme.textSecondary;
 
     return Semantics(
       button: true,
@@ -345,7 +348,7 @@ class _LoopPlatformChipState extends State<LoopPlatformChip> {
                           fontSize: 10,
                           fontWeight: FontWeight.w700,
                           color: widget.selected
-                              ? HydraTokens.bgPureBlack.withOpacity(0.75)
+                              ? PS5HydraTheme.textPrimary.withOpacity(0.85)
                               : HydraTokens.textMuted,
                         ),
                       ),
@@ -523,15 +526,16 @@ class LoopEmptyState extends StatelessWidget {
   }
 }
 
-/// Cartão reutilizável "Jogados recentemente" adaptável para portrait e landscape,
-/// com suporte a foco visível de controle/D-pad e `Semantics`.
+/// Cartão vertical 3:4 estilo PS5 para "Continuar jogando" em horizontal,
+/// com capa 3:4 no topo, gradiente escuro, Clear Logo e tempo embaixo,
+/// e `AnimatedScale(1.05x)` + glow neon `#00F5A0` no foco/mouse.
 class LoopRecentGameCard extends StatefulWidget {
   const LoopRecentGameCard({
     super.key,
     required this.game,
     required this.playtimeSeconds,
     required this.onTap,
-    this.isLandscape = false,
+    this.isLandscape = true,
     this.width,
     this.cover,
     this.focusNode,
@@ -553,131 +557,143 @@ class LoopRecentGameCard extends StatefulWidget {
 
 class _LoopRecentGameCardState extends State<LoopRecentGameCard> {
   bool _focused = false;
+  bool _hovered = false;
 
   @override
   Widget build(BuildContext context) {
     final playtimeLabel = formatPlaytime(widget.playtimeSeconds);
-    final cardWidth = widget.width ?? (widget.isLandscape ? 176.0 : 170.0);
-    final coverWidth = widget.isLandscape ? 72.0 : 68.0;
-    final bgColor = widget.isLandscape
-        ? HydraTokens.bgPureBlack.withOpacity(0.58)
-        : HydraTokens.bgNearBlack;
+    final cardWidth = widget.width ?? 138.0;
+    final active = _focused || _hovered;
+    final cachedCover = GameAssetService.instance
+        .getCachedAssets(
+          widget.game.name,
+          platformSlug: widget.game.platformSlug,
+        )
+        ?.coverImageUrl;
 
     return Semantics(
       button: true,
       label:
           '${widget.game.name}, ${widget.game.platformName}, tempo jogado $playtimeLabel',
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(minHeight: 48),
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 160),
-          width: cardWidth,
-          decoration: BoxDecoration(
-            color: bgColor,
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(
-              color: _focused
-                  ? HydraTokens.primaryAurora
-                  : HydraTokens.borderSubtle10,
-              width: _focused ? 2.0 : 1.0,
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() => _hovered = false),
+        child: AnimatedScale(
+          scale: active ? 1.05 : 1.0,
+          duration: PS5HydraTheme.animFast,
+          curve: Curves.easeOut,
+          child: AnimatedContainer(
+            duration: PS5HydraTheme.animMedium,
+            curve: Curves.easeOut,
+            width: cardWidth,
+            decoration: BoxDecoration(
+              color: PS5HydraTheme.obsidianGlass,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: active
+                    ? PS5HydraTheme.auroraSpringMint
+                    : PS5HydraTheme.borderSubtle,
+                width: active ? 1.8 : 1.0,
+              ),
+              boxShadow: active ? PS5HydraTheme.glowFocus : null,
             ),
-            boxShadow: _focused
-                ? HydraTokens.neonBoxGlow(
-                    opacity: 0.22,
-                    blur: 12,
-                    color: HydraTokens.primaryAurora,
-                  )
-                : null,
-          ),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(11),
-            child: Material(
-              color: Colors.transparent,
-              child: InkWell(
-                focusNode: widget.focusNode,
-                autofocus: widget.autofocus,
-                onFocusChange: (hasFocus) {
-                  if (_focused != hasFocus) {
-                    setState(() => _focused = hasFocus);
-                  }
-                },
-                onTap: widget.onTap,
-                child: Row(
-                  children: [
-                    SizedBox(
-                      width: coverWidth,
-                      height: double.infinity,
-                      child: widget.cover ??
-                          LoopCoverImage(
-                            url: widget.game.resolvedGridCoverUrl,
-                            fit: BoxFit.cover,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(13),
+              child: Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  focusNode: widget.focusNode,
+                  autofocus: widget.autofocus,
+                  onFocusChange: (hasFocus) {
+                    if (_focused != hasFocus) {
+                      setState(() => _focused = hasFocus);
+                    }
+                  },
+                  onTap: widget.onTap,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      // Capa 3:4 preenchendo o topo/card
+                      widget.cover ??
+                          ProceduralCover(
+                            title: widget.game.name,
+                            platformName: widget.game.platformName,
+                            imageUrl: cachedCover ??
+                                widget.game.gridCoverUrl ??
+                                widget.game.resolvedGridCoverUrl,
+                            borderRadius: 0,
+                            compact: true,
+                            showBottomLabel: false,
                           ),
-                    ),
-                    Expanded(
-                      child: Padding(
-                        padding: const EdgeInsets.all(8),
+                      // Gradiente escuro para legibilidade embaixo
+                      const DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            stops: [0.30, 0.70, 1.0],
+                            colors: [
+                              Colors.transparent,
+                              Color(0xB8000000),
+                              Color(0xF5000000),
+                            ],
+                          ),
+                        ),
+                      ),
+                      // Clear Logo / título + tempo jogado na base
+                      Positioned(
+                        left: 10,
+                        right: 10,
+                        bottom: 10,
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisAlignment: MainAxisAlignment.center,
+                          mainAxisSize: MainAxisSize.min,
                           children: [
-                            Text(
-                              widget.game.name,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
+                            AnimatedGameLogo(
+                              game: widget.game,
+                              height: 24,
+                              maxWidthFraction: 1.0,
+                              enableStagger: false,
+                              maxLines: 1,
+                              fallbackStyle: const TextStyle(
                                 fontFamily: 'ReadexPro',
-                                fontSize: 11.5,
+                                fontSize: 12,
                                 fontWeight: FontWeight.w700,
-                                color: HydraTokens.textPrimary,
+                                color: PS5HydraTheme.textPrimary,
                               ),
                             ),
-                            const SizedBox(height: 6),
-                            Container(
-                              padding: widget.isLandscape
-                                  ? const EdgeInsets.symmetric(
-                                      horizontal: 6,
-                                      vertical: 2,
-                                    )
-                                  : EdgeInsets.zero,
-                              decoration: widget.isLandscape
-                                  ? BoxDecoration(
-                                      color: HydraTokens.primaryAurora
-                                          .withOpacity(0.10),
-                                      borderRadius: BorderRadius.circular(6),
-                                    )
-                                  : null,
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  PhosphorIcon(
-                                    PhosphorIcons.clock(
-                                      PhosphorIconsStyle.bold,
-                                    ),
-                                    size: 10,
-                                    color: HydraTokens.textSecondary,
-                                  ),
-                                  const SizedBox(width: 4),
-                                  Flexible(
-                                    child: Text(
-                                      playtimeLabel,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        fontFamily: 'JetBrainsMono',
-                                        fontSize: 9.5,
-                                        fontWeight: FontWeight.w700,
-                                        color: HydraTokens.textPrimary,
-                                      ),
+                            const SizedBox(height: 4),
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                PhosphorIcon(
+                                  PhosphorIcons.clock(PhosphorIconsStyle.bold),
+                                  size: 10,
+                                  color: active
+                                      ? PS5HydraTheme.auroraSpringMint
+                                      : PS5HydraTheme.textSecondary,
+                                ),
+                                const SizedBox(width: 4),
+                                Flexible(
+                                  child: Text(
+                                    playtimeLabel,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontFamily: 'JetBrainsMono',
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w700,
+                                      color: PS5HydraTheme.textSecondary,
                                     ),
                                   ),
-                                ],
-                              ),
+                                ),
+                              ],
                             ),
                           ],
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),

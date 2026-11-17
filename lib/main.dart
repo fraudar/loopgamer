@@ -20,8 +20,10 @@ import 'services/emulator_service.dart';
 import 'services/igdb_steamgriddb_service.dart';
 import 'services/library_storage_service.dart';
 import 'services/rom_download_service.dart';
+import 'services/rom_platform_detector.dart';
 import 'services/settings_storage_service.dart';
 import 'theme/hydra_tokens.dart';
+import 'theme/ps5_hydra_theme.dart';
 
 const SystemUiOverlayStyle _kLoopEdgeOverlayStyle = SystemUiOverlayStyle(
   statusBarColor: Colors.transparent,
@@ -35,6 +37,10 @@ const SystemUiOverlayStyle _kLoopEdgeOverlayStyle = SystemUiOverlayStyle(
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setSystemUIOverlayStyle(_kLoopEdgeOverlayStyle);
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
+  ]);
   await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   runApp(const LoopGamerApp());
 }
@@ -89,6 +95,12 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
   void initState() {
     super.initState();
     SystemChrome.setSystemUIOverlayStyle(_kLoopEdgeOverlayStyle);
+    unawaited(
+      SystemChrome.setPreferredOrientations([
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]),
+    );
     unawaited(
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
     );
@@ -179,6 +191,10 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
 
       for (final g in savedGames) {
         _catalogById[g.igdbId] = g;
+        debugPrint(
+          '[Library] #${g.igdbId} "${g.name}" slug=${g.platformSlug} '
+          'path=${g.localRomPath}',
+        );
       }
 
       final catalogSnapshot = _catalogById.values.toList();
@@ -741,20 +757,35 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
           .replaceAll('_', ' ')
           .replaceAll(RegExp(r'\s+'), ' ')
           .trim();
-      final detectedSlug = RomDownloadService.inferPlatformSlugFromExtension(
+      final detection = await RomPlatformDetector.detect(
         resolvedFileName,
-        fallbackSlug: 'ps2',
+        filePath: pickedPath,
       );
-      var selectedSlug = kRommPlatforms.any((p) => p.slug == detectedSlug)
-          ? detectedSlug
-          : kRommPlatforms.first.slug;
+      debugPrint(
+        '[Import] arquivo="$resolvedFileName" path=$pickedPath '
+        'detectado=${detection?.slug ?? "null"} '
+        'fonte=${detection?.sourceLabel ?? "-"}',
+      );
+      if (!mounted || !navContext.mounted) return;
+      final selectableSlugs = kRommPlatforms
+          .map((p) => p.slug)
+          .where((slug) => slug != 'todos')
+          .toSet();
+      String? selectedSlug = detection != null &&
+              selectableSlugs.contains(detection.slug)
+          ? detection.slug
+          : null;
+
+      String platformLabel(String? slug) => kRommPlatforms
+          .firstWhere((p) => p.slug == slug, orElse: () => kRommPlatforms.first)
+          .fullName;
 
       final titleController = TextEditingController(
         text: defaultTitle.isEmpty ? 'Jogo Importado' : defaultTitle,
       );
-      bool confirmed = false;
+      String? chosenSlug;
       try {
-        confirmed = await showDialog<bool>(
+        chosenSlug = await showDialog<String?>(
               context: navContext,
               builder: (ctx) => StatefulBuilder(
                 builder: (ctx, setDialogState) {
@@ -764,6 +795,12 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                           .contains(selectedSlug);
                   final isArchiveWarning =
                       lowerExt.endsWith('.7z') || lowerExt.endsWith('.rar');
+                  final slug = selectedSlug;
+                  final platformCompatible = slug != null &&
+                      RomDownloadService.isImportExtensionCompatible(
+                        slug,
+                        resolvedFileName,
+                      );
                   return AlertDialog(
                     backgroundColor: HydraTokens.bgNearBlack,
                     shape: HydraTokens.dialogShape,
@@ -810,6 +847,30 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                                     : HydraTokens.textSecondary,
                               ),
                             ),
+                            if (selectedSlug == null) ...[
+                              const Text(
+                                'Plataforma não reconhecida. Escolha o console correto deste arquivo — o emulador é selecionado pela plataforma.',
+                                style: TextStyle(
+                                  fontFamily: 'Rubik',
+                                  fontSize: 11.5,
+                                  height: 1.4,
+                                  color: Color(0xFFFFB74D),
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                            ] else if (detection != null &&
+                                detection.slug == selectedSlug) ...[
+                              Text(
+                                'Plataforma detectada (${detection.sourceLabel}): ${platformLabel(selectedSlug)}.',
+                                style: const TextStyle(
+                                  fontFamily: 'Rubik',
+                                  fontSize: 11.5,
+                                  height: 1.4,
+                                  color: HydraTokens.textSecondary,
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                            ],
                             const SizedBox(height: 12),
                             TextField(
                               controller: titleController,
@@ -831,28 +892,51 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                                 labelText: 'Console / Plataforma',
                                 border: OutlineInputBorder(),
                               ),
-                              items: kRommPlatforms
-                                  .map(
-                                    (p) => DropdownMenuItem<String>(
-                                      value: p.slug,
-                                      child: Text(
-                                        '${p.fullName} (${p.shortName})',
-                                        overflow: TextOverflow.ellipsis,
-                                        style: const TextStyle(
-                                          fontFamily: 'Rubik',
-                                          fontSize: 13,
-                                          color: HydraTokens.textPrimary,
+                              items: [
+                                const DropdownMenuItem<String>(
+                                  value: null,
+                                  child: Text(
+                                    'Escolha o console...',
+                                    style: TextStyle(
+                                      fontFamily: 'Rubik',
+                                      fontSize: 13,
+                                      color: HydraTokens.textSecondary,
+                                    ),
+                                  ),
+                                ),
+                                ...kRommPlatforms
+                                    .where((p) => p.slug != 'todos')
+                                    .map(
+                                      (p) => DropdownMenuItem<String>(
+                                        value: p.slug,
+                                        child: Text(
+                                          '${p.fullName} (${p.shortName})',
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                            fontFamily: 'Rubik',
+                                            fontSize: 13,
+                                            color: HydraTokens.textPrimary,
+                                          ),
                                         ),
                                       ),
                                     ),
-                                  )
-                                  .toList(),
+                              ],
                               onChanged: (value) {
-                                if (value != null) {
-                                  setDialogState(() => selectedSlug = value);
-                                }
+                                setDialogState(() => selectedSlug = value);
                               },
                             ),
+                            if (slug != null && !platformCompatible) ...[
+                              const SizedBox(height: 8),
+                              Text(
+                                'A extensão "${dotIdx > 0 ? resolvedFileName.substring(dotIdx) : ''}" não é compatível com ${platformLabel(slug)}. Escolha outro console ou importe o arquivo correto.',
+                                style: const TextStyle(
+                                  fontFamily: 'Rubik',
+                                  fontSize: 11.5,
+                                  height: 1.4,
+                                  color: Color(0xFFF87171),
+                                ),
+                              ),
+                            ],
                           ],
                         ),
                       ),
@@ -862,7 +946,7 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                         style: TextButton.styleFrom(
                           minimumSize: const Size(48, 48),
                         ),
-                        onPressed: () => Navigator.of(ctx).pop(false),
+                        onPressed: () => Navigator.of(ctx).pop(),
                         child: const Text('Cancelar'),
                       ),
                       FilledButton(
@@ -871,7 +955,9 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                           backgroundColor: HydraTokens.primaryAurora,
                           foregroundColor: HydraTokens.bgPureBlack,
                         ),
-                        onPressed: () => Navigator.of(ctx).pop(true),
+                        onPressed: platformCompatible
+                            ? () => Navigator.of(ctx).pop(slug)
+                            : null,
                         child: const Text(
                           'Adicionar',
                           style: TextStyle(
@@ -884,12 +970,11 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                   );
                 },
               ),
-            ) ??
-            false;
+            );
       } finally {
         final finalTitle = titleController.text.trim();
         titleController.dispose();
-        if (confirmed && mounted) {
+        if (chosenSlug != null && mounted) {
           keepPickedPathForCopy = true;
           int importId =
               900000000 + (pickedPath.hashCode.abs() % 90000000);
@@ -900,7 +985,7 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
             final lowerExt = resolvedFileName.toLowerCase();
             final isConsoleZip = lowerExt.endsWith('.zip') &&
                 !const {'arcade', 'neogeo', 'fbneo', 'cps1', 'cps2', 'cps3'}
-                    .contains(selectedSlug);
+                    .contains(chosenSlug);
             ScaffoldMessenger.of(navContext).showSnackBar(
               SnackBar(
                 content: Text(
@@ -915,11 +1000,15 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
           final imported = await _downloadService.importExternalRomFile(
             igdbId: importId,
             sourcePath: pickedPath,
-            platformSlug: selectedSlug,
+            platformSlug: chosenSlug,
+          );
+          debugPrint(
+            '[Import] id=$importId slug=$chosenSlug '
+            'origem=$pickedPath -> ${imported?.localPath ?? "FALHOU"}',
           );
           if (imported != null && mounted) {
             final platformSpec = kRommPlatforms.firstWhere(
-              (p) => p.slug == selectedSlug,
+              (p) => p.slug == chosenSlug,
               orElse: () => kRommPlatforms.first,
             );
             final displayTitle = finalTitle.isEmpty
@@ -986,6 +1075,10 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
     EmulationGame game,
     String localRomPath,
   ) async {
+    debugPrint(
+      '[Launch] #${game.igdbId} "${game.name}" slug=${game.platformSlug} '
+      'core=${game.libretroCoreSoName} rom=$localRomPath',
+    );
     final navigator = Navigator.of(navContext);
     navigator.popUntil((route) => route.isFirst);
     _isPlayerActive = true;
@@ -1005,6 +1098,12 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
       _isPlayerActive = false;
     }
     SystemChrome.setSystemUIOverlayStyle(_kLoopEdgeOverlayStyle);
+    unawaited(
+      SystemChrome.setPreferredOrientations([
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]),
+    );
     unawaited(
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
     );
@@ -1038,10 +1137,8 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
       ],
       home: Builder(
         builder: (navContext) {
-          final isLandscape = HydraTokens.isWideLayout(navContext);
-
           return Scaffold(
-            backgroundColor: HydraTokens.bgPureBlack,
+            backgroundColor: PS5HydraTheme.pitchBlack,
             body: Stack(
               children: [
                 Positioned.fill(
@@ -1134,30 +1231,21 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                     ],
                   ),
                 ),
-                if (isLandscape)
-                  Positioned(
-                    top: 0,
-                    left: 0,
-                    right: 0,
-                    child: _GameHubLandscapeTopBar(
-                      currentIndex: _selectedTab,
-                      libraryBadgeCountListenable: _libraryBadgeCountNotifier,
-                      hasActiveDownloadListenable: _hasActiveDownloadNotifier,
-                      hardwareGamepadListenable: _hardwareGamepadNotifier,
-                      onSelectTab: (index) =>
-                          setState(() => _selectedTab = index),
-                    ),
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: _GameHubLandscapeTopBar(
+                    currentIndex: _selectedTab,
+                    libraryBadgeCountListenable: _libraryBadgeCountNotifier,
+                    hasActiveDownloadListenable: _hasActiveDownloadNotifier,
+                    hardwareGamepadListenable: _hardwareGamepadNotifier,
+                    onSelectTab: (index) =>
+                        setState(() => _selectedTab = index),
                   ),
+                ),
               ],
             ),
-            bottomNavigationBar: isLandscape
-                ? null
-                : _GameHubPortraitDockBar(
-                    currentIndex: _selectedTab,
-                    installedCountListenable: _libraryBadgeCountNotifier,
-                    isDownloadingListenable: _hasActiveDownloadNotifier,
-                    onSelect: (index) => setState(() => _selectedTab = index),
-                  ),
           );
         },
       ),
@@ -1420,92 +1508,126 @@ class _GameHubLandscapeTopBar extends StatelessWidget {
                       padding: const EdgeInsets.all(4),
                       child: SingleChildScrollView(
                         scrollDirection: Axis.horizontal,
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
+                        child: Stack(
                           children: [
-                            for (int i = 0; i < navItems.length; i++) ...[
-                              Semantics(
-                                button: true,
-                                selected: i == currentIndex,
-                                label: navItems[i].label,
-                                child: Material(
-                                  color: Colors.transparent,
-                                  child: InkWell(
-                                    borderRadius: BorderRadius.circular(999),
-                                    onTap: () => onSelectTab(i),
-                                    child: AnimatedContainer(
-                                      duration:
-                                          const Duration(milliseconds: 180),
-                                      curve: Curves.easeOutCubic,
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 11,
-                                        vertical: 7,
-                                      ),
-                                      decoration: BoxDecoration(
-                                        color: i == currentIndex
-                                            ? Colors.white.withOpacity(0.16)
-                                            : Colors.transparent,
-                                        borderRadius:
-                                            BorderRadius.circular(999),
-                                      ),
-                                      child: Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          PhosphorIcon(
-                                            navItems[i].icon,
-                                            size: 16,
-                                            color: i == currentIndex
-                                                ? HydraTokens.textPrimary
-                                                : HydraTokens.textSecondary,
+                            AnimatedPositioned(
+                              duration: PS5HydraTheme.animStandard,
+                              curve: Curves.easeOut,
+                              left: currentIndex * 100.0 + 18.0,
+                              bottom: 0,
+                              width: 64.0,
+                              height: 2.0,
+                              child: const DecoratedBox(
+                                decoration: BoxDecoration(
+                                  color: PS5HydraTheme.auroraSpringMint,
+                                ),
+                              ),
+                            ),
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: List.generate(navItems.length, (i) {
+                                final active = i == currentIndex;
+                                return SizedBox(
+                                  width: 100.0,
+                                  child: Semantics(
+                                    button: true,
+                                    selected: active,
+                                    label: navItems[i].label,
+                                    child: Material(
+                                      color: Colors.transparent,
+                                      child: InkWell(
+                                        borderRadius: BorderRadius.circular(999),
+                                        onTap: () => onSelectTab(i),
+                                        child: AnimatedContainer(
+                                          duration: const Duration(
+                                            milliseconds: 200,
                                           ),
-                                          const SizedBox(width: 5),
-                                          Text(
-                                            navItems[i].label,
-                                            style: TextStyle(
-                                              fontFamily: 'ReadexPro',
-                                              fontSize: 12,
-                                              fontWeight: i == currentIndex
-                                                  ? FontWeight.w700
-                                                  : FontWeight.w600,
-                                              color: i == currentIndex
-                                                  ? HydraTokens.textPrimary
-                                                  : HydraTokens.textSecondary,
-                                            ),
+                                          curve: Curves.easeOut,
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 8,
+                                            vertical: 7,
                                           ),
-                                          if (navItems[i].badge != null) ...[
-                                            const SizedBox(width: 5),
-                                            Container(
-                                              padding:
-                                                  const EdgeInsets.symmetric(
-                                                horizontal: 5,
-                                                vertical: 1,
+                                          decoration: BoxDecoration(
+                                            color: active
+                                                ? PS5HydraTheme.abyssalCard
+                                                : Colors.transparent,
+                                            borderRadius:
+                                                BorderRadius.circular(999),
+                                          ),
+                                          child: Row(
+                                            mainAxisAlignment:
+                                                MainAxisAlignment.center,
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              PhosphorIcon(
+                                                navItems[i].icon,
+                                                size: 15,
+                                                color: active
+                                                    ? PS5HydraTheme
+                                                        .auroraSpringMint
+                                                    : PS5HydraTheme
+                                                        .textSecondary,
                                               ),
-                                              decoration: BoxDecoration(
-                                                color: HydraTokens.primaryAurora,
-                                                borderRadius:
-                                                    BorderRadius.circular(8),
-                                              ),
-                                              child: Text(
-                                                navItems[i].badge!,
-                                                style: const TextStyle(
-                                                  fontFamily: 'JetBrainsMono',
-                                                  fontSize: 9,
-                                                  fontWeight: FontWeight.w700,
-                                                  color:
-                                                      HydraTokens.bgPureBlack,
+                                              const SizedBox(width: 5),
+                                              Flexible(
+                                                child: Text(
+                                                  navItems[i].label,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                    fontFamily: 'ReadexPro',
+                                                    fontSize: 11.5,
+                                                    fontWeight: active
+                                                        ? FontWeight.w700
+                                                        : FontWeight.w600,
+                                                    color: active
+                                                        ? PS5HydraTheme
+                                                            .textPrimary
+                                                        : PS5HydraTheme
+                                                            .textSecondary,
+                                                  ),
                                                 ),
                                               ),
-                                            ),
-                                          ],
-                                        ],
+                                              if (navItems[i].badge != null) ...[
+                                                const SizedBox(width: 4),
+                                                Container(
+                                                  padding: const EdgeInsets
+                                                      .symmetric(
+                                                    horizontal: 5,
+                                                    vertical: 1,
+                                                  ),
+                                                  decoration: BoxDecoration(
+                                                    color: PS5HydraTheme
+                                                        .auroraSpringMint,
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                      8,
+                                                    ),
+                                                  ),
+                                                  child: Text(
+                                                    navItems[i].badge!,
+                                                    style: const TextStyle(
+                                                      fontFamily:
+                                                          'JetBrainsMono',
+                                                      fontSize: 9,
+                                                      fontWeight:
+                                                          FontWeight.w700,
+                                                      color: PS5HydraTheme
+                                                          .textOnAurora,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ],
+                                            ],
+                                          ),
+                                        ),
                                       ),
                                     ),
                                   ),
-                                ),
-                              ),
-                              if (i < navItems.length - 1)
-                                const SizedBox(width: 2),
-                            ],
+                                );
+                              }),
+                            ),
                           ],
                         ),
                       ),
@@ -1613,179 +1735,6 @@ class _GameHubLandscapeTopBar extends StatelessWidget {
                     ),
                   ),
                 ],
-              );
-            },
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// Bottom Navigation Bar Estilo GameHub para Modo em Pé (Portrait)
-class _GameHubPortraitDockBar extends StatelessWidget {
-  const _GameHubPortraitDockBar({
-    required this.currentIndex,
-    required this.installedCountListenable,
-    required this.isDownloadingListenable,
-    required this.onSelect,
-  });
-
-  final int currentIndex;
-  final ValueListenable<int> installedCountListenable;
-  final ValueListenable<bool> isDownloadingListenable;
-  final ValueChanged<int> onSelect;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      decoration: const BoxDecoration(
-        color: HydraTokens.bgPureBlack,
-      ),
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 10),
-      child: SafeArea(
-        top: false,
-        child: ValueListenableBuilder<int>(
-          valueListenable: installedCountListenable,
-          builder: (context, installedCount, _) =>
-              ValueListenableBuilder<bool>(
-            valueListenable: isDownloadingListenable,
-            builder: (context, isDownloading, _) {
-              final items = [
-                (
-                  label: 'Início',
-                  outline: PhosphorIcons.planet(PhosphorIconsStyle.regular),
-                  fill: PhosphorIcons.planet(PhosphorIconsStyle.fill),
-                  badge: null,
-                ),
-                (
-                  label: 'ROMs',
-                  outline:
-                      PhosphorIcons.gameController(PhosphorIconsStyle.regular),
-                  fill: PhosphorIcons.gameController(PhosphorIconsStyle.fill),
-                  badge: null,
-                ),
-                (
-                  label: 'Biblioteca',
-                  outline:
-                      PhosphorIcons.squaresFour(PhosphorIconsStyle.regular),
-                  fill: PhosphorIcons.squaresFour(PhosphorIconsStyle.fill),
-                  badge: installedCount > 0 ? '$installedCount' : null,
-                ),
-                (
-                  label: 'Ajustes',
-                  outline: PhosphorIcons.slidersHorizontal(
-                    PhosphorIconsStyle.regular,
-                  ),
-                  fill:
-                      PhosphorIcons.slidersHorizontal(PhosphorIconsStyle.fill),
-                  badge: null,
-                ),
-              ];
-
-              return Container(
-                height: 64,
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                decoration: BoxDecoration(
-                  color: HydraTokens.surfaceTopBar,
-                  borderRadius: BorderRadius.circular(28),
-                  border: Border.all(color: Colors.white.withOpacity(0.08)),
-                  boxShadow: const [
-                    BoxShadow(
-                      color: Color(0xAA000000),
-                      blurRadius: 20,
-                      offset: Offset(0, 8),
-                    ),
-                  ],
-                ),
-                child: Row(
-                  children: List.generate(items.length, (i) {
-                    final active = i == currentIndex;
-                    final item = items[i];
-                    return Expanded(
-                      child: Semantics(
-                        button: true,
-                        selected: active,
-                        label: item.badge != null
-                            ? '${item.label}, ${item.badge} itens'
-                            : item.label,
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(22),
-                          onTap: () => onSelect(i),
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 180),
-                            curve: Curves.easeOutCubic,
-                            margin: const EdgeInsets.symmetric(horizontal: 3),
-                            decoration: BoxDecoration(
-                              color: active
-                                  ? HydraTokens.surfaceElevated2
-                                  : Colors.transparent,
-                              borderRadius: BorderRadius.circular(22),
-                            ),
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Stack(
-                                  clipBehavior: Clip.none,
-                                  children: [
-                                    PhosphorIcon(
-                                      active ? item.fill : item.outline,
-                                      size: 21,
-                                      color: active
-                                          ? HydraTokens.textPrimary
-                                          : HydraTokens.textSecondary,
-                                    ),
-                                    if (item.badge != null)
-                                      Positioned(
-                                        right: -9,
-                                        top: -5,
-                                        child: Container(
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 4.5,
-                                            vertical: 1,
-                                          ),
-                                          decoration: BoxDecoration(
-                                            color: HydraTokens.primaryAurora,
-                                            borderRadius:
-                                                BorderRadius.circular(8),
-                                          ),
-                                          child: Text(
-                                            item.badge!,
-                                            style: const TextStyle(
-                                              fontFamily: 'JetBrainsMono',
-                                              fontSize: 8.5,
-                                              fontWeight: FontWeight.w700,
-                                              color: HydraTokens.bgPureBlack,
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                  ],
-                                ),
-                                const SizedBox(height: 3),
-                                Text(
-                                  item.label,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    fontFamily: 'ReadexPro',
-                                    fontSize: 10.5,
-                                    fontWeight: active
-                                        ? FontWeight.w700
-                                        : FontWeight.w600,
-                                    color: active
-                                        ? HydraTokens.textPrimary
-                                        : HydraTokens.textSecondary,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                    );
-                  }),
-                ),
               );
             },
           ),

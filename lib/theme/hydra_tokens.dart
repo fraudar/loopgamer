@@ -3,45 +3,40 @@ import 'package:flutter/material.dart';
 class HydraTokens {
   HydraTokens._();
 
-  // Superfícies GameHub (Obsidian Carbon & Frosted Glass — sem estética artificial de IA)
-  static const Color bgPureBlack = Color(0xFF0A090E);
-  static const Color bgNearBlack = Color(0xFF13121A);
-  static const Color surfaceTopBar = Color(0xFF15141C);
-  static const Color surfaceCatalog = Color(0xFF181721);
-  static const Color surfaceElevated1 = Color(0xFF211F2C);
-  static const Color surfaceElevated2 = Color(0xFF2B2838);
+  // Superfícies Console-first (Preto Puro #000000 & Obsidian Neutro Preto/Branco)
+  static const Color bgPureBlack = Color(0xFF000000);
+  static const Color bgNearBlack = Color(0xFF0B0B0D);
+  static const Color surfaceTopBar = Color(0xFF0B0B0D);
+  static const Color surfaceCatalog = Color(0xFF121216);
+  static const Color surfaceElevated1 = Color(0xFF18181D);
+  static const Color surfaceElevated2 = Color(0xFF222228);
 
-  // Destaques e Acentos estilo GameHub (Branco Puro, Âmbar Dourado, Teal Real)
-  static const Color primaryAurora = Color(0xFFF5F5FA);
-  static const Color accentAmber = Color(0xFFF5A623);
-  static const Color accentTeal = Color(0xFF2DD4BF);
+  // Destaque monocromático branco (#FFFFFF) sobre superfícies escuras
+  static const Color primaryAurora = Color(0xFFFFFFFF);
+  static const Color accentAmber = Color(0xFFE4E4E7);
+  static const Color accentTeal = Color(0xFFFFFFFF);
   static const Color accentDanger = Color(0xFFEF4444);
-  static const Color accentSuccess = Color(0xFF10B981);
+  static const Color accentSuccess = Color(0xFFFFFFFF);
 
-  /// Alias legado que apontava para âmbar com nome errado; mantido por compatibilidade.
-  @Deprecated('Use accentAmber')
-  static const Color secondaryTeal = accentAmber;
+  /// Alias legado mantido por compatibilidade.
+  @Deprecated('Use primaryAurora')
+  static const Color secondaryTeal = primaryAurora;
 
-  // Hierarquia Tipográfica GameHub (contraste WCAG >= 4.5:1 sobre bgNearBlack)
-  static const Color textPrimary = Color(0xFFF7F7FB);
-  static const Color textSecondary = Color(0xFF9C9AA8);
-  static const Color textMuted = Color(0xFF9391A6);
+  // Hierarquia Tipográfica (contraste WCAG >= 4.5:1 sobre #000000)
+  static const Color textPrimary = Color(0xFFFAFAFA);
+  static const Color textSecondary = Color(0xFFA1A1AA);
+  static const Color textMuted = Color(0xFF71717A);
 
   // Bordas de 1px e Divisores
-  static const Color borderSubtle8 = Color(0x14FFFFFF);
-  static const Color borderSubtle10 = Color(0x22FFFFFF);
-
-  // Nota: tokens mortos nunca referenciados (surfaceBento, tertiaryOcean, accentCyanBorder,
-  // accentBlue, neonGlow, textTertiary70, textTertiary50, pillBg4, divider20,
-  // cardOverlayGradient, primaryAccentGradient, warmFeaturedGradient, internalCardPillGradient)
-  // foram removidos para manter o sistema de design enxuto.
+  static const Color borderSubtle8 = Color(0xFF27272A);
+  static const Color borderSubtle10 = Color(0x33FFFFFF);
 
   static const LinearGradient heroBackgroundGradient = LinearGradient(
     begin: Alignment.topCenter,
     end: Alignment.bottomCenter,
     colors: [
-      Color(0xFF181622),
-      Color(0xFF0A090E),
+      Color(0xFF121216),
+      Color(0xFF000000),
     ],
   );
 
@@ -51,10 +46,10 @@ class HydraTokens {
     side: BorderSide(color: borderSubtle10),
   );
 
-  /// Breakpoint unificado para layout amplo em landscape/tablet (>= 600dp e paisagem).
+  /// Layout largo (landscape) para telas utilitárias responsivas como Ajustes.
   static bool isWideLayout(BuildContext context) {
     final size = MediaQuery.sizeOf(context);
-    return size.width >= 600 && size.width > size.height;
+    return size.width > size.height;
   }
 
   /// Sombra/glow parametrizada respeitando [opacity], [blur] e [color].

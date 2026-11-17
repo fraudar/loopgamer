@@ -1,14 +1,20 @@
 import 'dart:async';
+import 'dart:ui';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:phosphor_flutter/phosphor_flutter.dart';
 import '../models/emulation_game.dart';
 import '../models/user_library_meta.dart';
-import '../services/cover_cache_service.dart';
+import '../services/game_asset_service.dart';
 import '../services/rom_download_service.dart';
 import '../theme/hydra_tokens.dart';
+import '../theme/ps5_hydra_theme.dart';
+import '../widgets/animated_fade_slide.dart';
+import '../widgets/animated_game_logo.dart';
 import '../widgets/loop_common_widgets.dart';
+import '../widgets/procedural_cover.dart';
 import 'game_detail_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -55,12 +61,14 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   final FocusNode _screenFocusNode = FocusNode(debugLabel: 'HomeScreenFocus');
   final ScrollController _heroScrollController = ScrollController();
+  final Map<int, GameAssets> _resolvedAssets = {};
   int _selectedFeaturedIndex = 0;
   String _selectedPlatformSlug = 'todos';
 
   @override
   void initState() {
     super.initState();
+    _prefetchShelfAssets();
     if (widget.isActive) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted && widget.isActive) {
@@ -73,6 +81,10 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void didUpdateWidget(covariant HomeScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.featuredGames != widget.featuredGames ||
+        oldWidget.popularGames != widget.popularGames) {
+      _prefetchShelfAssets();
+    }
     if (widget.isActive && !oldWidget.isActive) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted && widget.isActive) {
@@ -83,6 +95,34 @@ class _HomeScreenState extends State<HomeScreen> {
       if (_screenFocusNode.hasFocus) {
         _screenFocusNode.unfocus();
       }
+    }
+  }
+
+  void _prefetchShelfAssets() {
+    final games = widget.featuredGames.isNotEmpty
+        ? widget.featuredGames
+        : widget.popularGames;
+    final count = games.length < 12 ? games.length : 12;
+    for (int i = 0; i < count; i++) {
+      final game = games[i];
+      final cached = GameAssetService.instance.getCachedAssets(
+        game.name,
+        platformSlug: game.platformSlug,
+      );
+      if (cached != null) {
+        _resolvedAssets[game.igdbId] = cached;
+        continue;
+      }
+      unawaited(
+        GameAssetService.instance.fetchAssetsForGame(game).then((assets) {
+          if (!mounted) return;
+          if (assets.hasBackground || assets.hasCover || assets.hasLogo) {
+            setState(() {
+              _resolvedAssets[game.igdbId] = assets;
+            });
+          }
+        }),
+      );
     }
   }
 
@@ -174,8 +214,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final isLandscape = HydraTokens.isWideLayout(context);
-
     final shelfGames = widget.featuredGames.isNotEmpty
         ? widget.featuredGames
         : widget.popularGames;
@@ -204,23 +242,14 @@ class _HomeScreenState extends State<HomeScreen> {
     if (shelfGames.isEmpty && widget.popularGames.isEmpty) {
       content = _buildFullCatalogStateScreen(context);
     } else {
-      content = isLandscape
-          ? _buildGameHubLandscapeHome(
-              context,
-              shelfGames: shelfGames,
-              safeIndex: safeIndex,
-              recentGames: recentGames,
-              favoriteGames: favoriteGames,
-              filteredCatalog: filteredCatalog,
-            )
-          : _buildGameHubPortraitHome(
-              context,
-              shelfGames: shelfGames,
-              safeIndex: safeIndex,
-              recentGames: recentGames,
-              favoriteGames: favoriteGames,
-              filteredCatalog: filteredCatalog,
-            );
+      content = _buildGameHubLandscapeHome(
+        context,
+        shelfGames: shelfGames,
+        safeIndex: safeIndex,
+        recentGames: recentGames,
+        favoriteGames: favoriteGames,
+        filteredCatalog: filteredCatalog,
+      );
     }
 
     return Focus(
@@ -305,7 +334,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ==========================================================================
-  // MODO DEITADO (LANDSCAPE)
+  // MODO HORIZONTAL (CONSOLE-FIRST PS5 LANDSCAPE)
   // ==========================================================================
   Widget _buildGameHubLandscapeHome(
     BuildContext context, {
@@ -316,44 +345,68 @@ class _HomeScreenState extends State<HomeScreen> {
     required List<EmulationGame> filteredCatalog,
   }) {
     final activeGame = shelfGames.isNotEmpty ? shelfGames[safeIndex] : null;
+    final activeAssets =
+        activeGame != null ? _resolvedAssets[activeGame.igdbId] : null;
+    final activeBannerUrl =
+        activeAssets?.backgroundImageUrl ?? activeGame?.heroBannerUrl;
 
     return Scaffold(
-      backgroundColor: HydraTokens.bgPureBlack,
+      backgroundColor: PS5HydraTheme.pitchBlack,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // 1. Artwork atmosférica em tela cheia do jogo selecionado (alta definição)
+          // 1. Banner full-bleed do jogo em foco
           if (activeGame != null)
             AnimatedSwitcher(
-              duration: const Duration(milliseconds: 350),
+              duration: PS5HydraTheme.animStandard, // 300ms
+              switchInCurve: Curves.easeOut,
               child: SizedBox.expand(
-                key: ValueKey<int>(activeGame.igdbId),
-                child: LoopCoverImage(
-                  url: activeGame.resolvedHeroBannerUrl,
-                  fit: BoxFit.cover,
-                  preset: LoopCoverImagePreset.hero,
+                key: ValueKey<String>(
+                  activeBannerUrl ?? activeGame.resolvedHeroBannerUrl,
                 ),
+                child: activeBannerUrl != null && activeBannerUrl.isNotEmpty
+                    ? CachedNetworkImage(
+                        imageUrl: activeBannerUrl,
+                        cacheManager: SessionMemoryCacheManager.instance,
+                        fit: BoxFit.cover,
+                        errorWidget: (_, __, ___) => ProceduralCover(
+                          title: activeGame.name,
+                          platformName: activeGame.platformName,
+                          imageUrl: activeGame.resolvedHeroBannerUrl,
+                          borderRadius: 0,
+                          showBottomLabel: false,
+                        ),
+                      )
+                    : ProceduralCover(
+                        title: activeGame.name,
+                        platformName: activeGame.platformName,
+                        imageUrl: activeGame.resolvedHeroBannerUrl,
+                        borderRadius: 0,
+                        showBottomLabel: false,
+                      ),
               ),
             ),
 
-          // Vinheta cinematográfica
-          Container(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                stops: const [0.0, 0.35, 0.75, 1.0],
-                colors: [
-                  HydraTokens.bgPureBlack.withOpacity(0.55),
-                  HydraTokens.bgPureBlack.withOpacity(0.38),
-                  HydraTokens.bgPureBlack.withOpacity(0.84),
-                  HydraTokens.bgPureBlack.withOpacity(0.98),
-                ],
+          // Gradiente transparente -> #000000 na parte de baixo
+          Positioned.fill(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  stops: const [0.0, 0.35, 0.70, 1.0],
+                  colors: [
+                    PS5HydraTheme.pitchBlack.withOpacity(0.42),
+                    PS5HydraTheme.pitchBlack.withOpacity(0.55),
+                    PS5HydraTheme.pitchBlack.withOpacity(0.92),
+                    PS5HydraTheme.pitchBlack,
+                  ],
+                ),
               ),
             ),
           ),
 
-          // 2. Conteúdo rolável em Landscape (padding superior libera barra iOS flutuante; inferior evita barra de atalhos)
+          // 2. Conteúdo rolável em Landscape
           SafeArea(
             top: false,
             child: ListView(
@@ -373,11 +426,153 @@ class _HomeScreenState extends State<HomeScreen> {
                       fontFamily: 'PressStart2P',
                       fontSize: 13.5,
                       letterSpacing: 1.6,
-                      color: HydraTokens.primaryAurora,
+                      color: PS5HydraTheme.auroraSpringMint,
                     ),
                   ),
                 ),
-                const SizedBox(height: 10),
+                const SizedBox(height: 12),
+
+                // Bloco Hero focal com Clear Logo + Meta Row + Único CTA #00F5A0
+                if (activeGame != null) ...[
+                  _DownloadStatusesScope(
+                    listenable: widget.downloadStatusesListenable,
+                    fallback: widget.downloadStatuses,
+                    builder: (context, statuses) {
+                      final st = statuses[activeGame.igdbId] ??
+                          const RomDownloadStatus();
+                      final isReady = st.state == RomActionState.readyToPlay &&
+                          st.localPath != null;
+                      final isDownloading =
+                          st.state == RomActionState.downloading;
+                      final isExternal =
+                          activeGame.directRomUrl.startsWith('external://');
+                      final ctaText = isReady
+                          ? 'Jogar Agora'
+                          : isDownloading
+                              ? 'Cancelar (${LoopProgressIndicator.formatPercent(st.progress)})'
+                              : isExternal
+                                  ? 'Ver Detalhes'
+                                  : 'Baixar e Jogar';
+                      return ClipRRect(
+                        borderRadius:
+                            BorderRadius.circular(PS5HydraTheme.radiusCard),
+                        child: BackdropFilter(
+                          filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+                          child: Container(
+                            padding: const EdgeInsets.all(18),
+                            decoration: PS5HydraTheme.surfaceGlass(
+                              radius: PS5HydraTheme.radiusCard,
+                              alpha: 0.78,
+                            ),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                Expanded(
+                                  child: AnimatedHeroFadeSlideSwitcher(
+                                    duration: PS5HydraTheme.animStandard,
+                                    curve: Curves.easeOut,
+                                    slideFractionY: 0.10,
+                                    child: Column(
+                                      key: ValueKey<int>(activeGame.igdbId),
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        AnimatedGameLogo(
+                                          game: activeGame,
+                                          height: 44,
+                                          maxWidthFraction: 0.80,
+                                          enableStagger: false,
+                                          maxLines: 1,
+                                          fallbackStyle: const TextStyle(
+                                            fontFamily: 'ReadexPro',
+                                            fontSize: 24,
+                                            fontWeight: FontWeight.w700,
+                                            color: PS5HydraTheme.textPrimary,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 8),
+                                        Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Text(
+                                              activeGame.platformName,
+                                              style:
+                                                  PS5HydraTheme.metaMonoStyle,
+                                            ),
+                                            PS5HydraTheme.metaDivider(),
+                                            const Text(
+                                              'VULKAN',
+                                              style:
+                                                  PS5HydraTheme.metaMonoStyle,
+                                            ),
+                                            PS5HydraTheme.metaDivider(),
+                                            Text(
+                                              activeGame.formattedSize,
+                                              style:
+                                                  PS5HydraTheme.metaMonoStyle,
+                                            ),
+                                          ],
+                                        ),
+                                        const SizedBox(height: 8),
+                                        Text(
+                                          activeGame.summary,
+                                          maxLines: 2,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: PS5HydraTheme.bodySynopsisStyle
+                                              .copyWith(fontSize: 13),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 20),
+                                FilledButton.icon(
+                                  style: FilledButton.styleFrom(
+                                    backgroundColor:
+                                        PS5HydraTheme.auroraSpringMint,
+                                    foregroundColor: PS5HydraTheme.textOnAurora,
+                                    minimumSize: const Size(164, 48),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 20,
+                                    ),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(
+                                        PS5HydraTheme.radiusChip,
+                                      ),
+                                    ),
+                                  ),
+                                  onPressed: () =>
+                                      _executeGameAction(activeGame, st),
+                                  icon: PhosphorIcon(
+                                    isDownloading
+                                        ? PhosphorIcons.xCircle(
+                                            PhosphorIconsStyle.fill,
+                                          )
+                                        : PhosphorIcons.play(
+                                            PhosphorIconsStyle.fill,
+                                          ),
+                                    size: 17,
+                                  ),
+                                  label: Text(
+                                    ctaText,
+                                    style: const TextStyle(
+                                      fontFamily: 'ReadexPro',
+                                      fontSize: 13.5,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 18),
+                ],
+
                 SizedBox(
                   width: double.infinity,
                   child: Wrap(
@@ -392,9 +587,9 @@ class _HomeScreenState extends State<HomeScreen> {
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
                           fontFamily: 'ReadexPro',
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                          color: HydraTokens.textPrimary,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          color: PS5HydraTheme.textPrimary,
                         ),
                       ),
                       if (widget.isLoadingCatalog) const _CatalogSyncBadge(),
@@ -422,9 +617,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   listenable: widget.downloadStatusesListenable,
                   fallback: widget.downloadStatuses,
                   builder: (context, statuses) => SizedBox(
-                    height: 162,
+                    height: 174,
                     child: ListView.separated(
                       controller: _heroScrollController,
+                      clipBehavior: Clip.none,
                       scrollDirection: Axis.horizontal,
                       itemCount: shelfGames.length,
                       separatorBuilder: (_, __) => const SizedBox(width: 14),
@@ -438,6 +634,8 @@ class _HomeScreenState extends State<HomeScreen> {
                           child: _GameHubLandscapeHeroCard(
                             game: game,
                             status: status,
+                            bannerUrl:
+                                _resolvedAssets[game.igdbId]?.backgroundImageUrl,
                             isFocused: isFocused,
                             onTap: () {
                               if (isFocused) {
@@ -455,9 +653,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
 
-                const SizedBox(height: 22),
+                const SizedBox(height: 24),
 
-                // Seção dedicada: Continuar jogando
+                // Seção dedicada: Continuar jogando (Cards Verticais 3:4 estilo PS5)
                 _SectionHeaderRow(
                   icon: PhosphorIcons.clockCounterClockwise(
                     PhosphorIconsStyle.bold,
@@ -467,27 +665,35 @@ class _HomeScreenState extends State<HomeScreen> {
                       ? '${recentGames.length} títulos'
                       : null,
                 ),
-                const SizedBox(height: 10),
+                const SizedBox(height: 12),
                 if (recentGames.isNotEmpty)
                   SizedBox(
-                    height: 116,
+                    height: 192,
                     child: ListView.separated(
+                      clipBehavior: Clip.none,
                       scrollDirection: Axis.horizontal,
                       itemCount: recentGames.length,
-                      separatorBuilder: (_, __) => const SizedBox(width: 12),
+                      separatorBuilder: (_, __) => const SizedBox(width: 14),
                       itemBuilder: (context, idx) {
                         final game = recentGames[idx];
                         final playtimeSec = widget.userMeta
                             .playtimeOf(game.igdbId)
                             .totalSeconds;
+                        final cachedCover = _resolvedAssets[game.igdbId]
+                            ?.coverImageUrl;
                         return LoopRecentGameCard(
                           game: game,
                           playtimeSeconds: playtimeSec,
                           isLandscape: true,
-                          cover: LoopCoverImage(
-                            url: game.resolvedGridCoverUrl,
-                            fit: BoxFit.cover,
-                            preset: LoopCoverImagePreset.thumbnail,
+                          cover: ProceduralCover(
+                            title: game.name,
+                            platformName: game.platformName,
+                            imageUrl: cachedCover ??
+                                game.gridCoverUrl ??
+                                game.resolvedGridCoverUrl,
+                            borderRadius: 0,
+                            compact: true,
+                            showBottomLabel: false,
                           ),
                           onTap: () => _openDetails(game),
                         );
@@ -509,30 +715,32 @@ class _HomeScreenState extends State<HomeScreen> {
                     onAction: widget.onOpenSearchTab,
                   ),
 
-                const SizedBox(height: 20),
+                const SizedBox(height: 24),
 
-                // Seção dedicada: Favoritos
+                // Seção dedicada: Favoritos (Cards Verticais 3:4 estilo PS5)
                 _SectionHeaderRow(
                   icon: PhosphorIcons.star(PhosphorIconsStyle.fill),
-                  iconColor: HydraTokens.primaryAurora,
+                  iconColor: PS5HydraTheme.textPrimary,
                   title: 'Favoritos',
                   trailing: favoriteGames.isNotEmpty
                       ? '${favoriteGames.length} jogos'
                       : null,
                 ),
-                const SizedBox(height: 10),
+                const SizedBox(height: 12),
                 if (favoriteGames.isNotEmpty)
                   SizedBox(
-                    height: 116,
+                    height: 192,
                     child: ListView.separated(
+                      clipBehavior: Clip.none,
                       scrollDirection: Axis.horizontal,
                       itemCount: favoriteGames.length,
-                      separatorBuilder: (_, __) => const SizedBox(width: 12),
+                      separatorBuilder: (_, __) => const SizedBox(width: 14),
                       itemBuilder: (context, idx) {
                         final game = favoriteGames[idx];
                         return _HomeFavoriteCard(
                           game: game,
-                          isLandscape: true,
+                          coverUrl:
+                              _resolvedAssets[game.igdbId]?.coverImageUrl,
                           onTap: () => _openDetails(game),
                         );
                       },
@@ -551,7 +759,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     onAction: widget.onOpenLibraryTab,
                   ),
 
-                const SizedBox(height: 22),
+                const SizedBox(height: 24),
 
                 // Catálogo por Console + Filtros acessíveis LoopPlatformChip
                 Row(
@@ -562,7 +770,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         fontFamily: 'ReadexPro',
                         fontSize: 16,
                         fontWeight: FontWeight.w700,
-                        color: HydraTokens.textPrimary,
+                        color: PS5HydraTheme.textPrimary,
                       ),
                     ),
                     const SizedBox(width: 10),
@@ -571,12 +779,12 @@ class _HomeScreenState extends State<HomeScreen> {
                       style: const TextStyle(
                         fontFamily: 'Rubik',
                         fontSize: 12,
-                        color: HydraTokens.textSecondary,
+                        color: PS5HydraTheme.textSecondary,
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 10),
                 SingleChildScrollView(
                   scrollDirection: Axis.horizontal,
                   child: Row(
@@ -588,7 +796,6 @@ class _HomeScreenState extends State<HomeScreen> {
                           label: plat.shortName,
                           selected: active,
                           compact: true,
-                          accentColor: plat.accentColor,
                           onTap: () =>
                               setState(() => _selectedPlatformSlug = plat.slug),
                         ),
@@ -613,8 +820,9 @@ class _HomeScreenState extends State<HomeScreen> {
                     listenable: widget.downloadStatusesListenable,
                     fallback: widget.downloadStatuses,
                     builder: (context, statuses) => SizedBox(
-                      height: 126,
+                      height: 186,
                       child: ListView.separated(
+                        clipBehavior: Clip.none,
                         scrollDirection: Axis.horizontal,
                         itemCount: filteredCatalog.length,
                         separatorBuilder: (_, __) => const SizedBox(width: 14),
@@ -624,6 +832,8 @@ class _HomeScreenState extends State<HomeScreen> {
                               const RomDownloadStatus();
                           return _GameHubLandscapeSecondaryCard(
                             game: game,
+                            coverUrl:
+                                _resolvedAssets[game.igdbId]?.coverImageUrl,
                             status: status,
                             onTap: () => _openDetails(game),
                           );
@@ -635,7 +845,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
 
-          // 3. Barra flutuante inferior direita dentro do SafeArea (sem sobrepor cards ao rolar)
+          // 3. Barra flutuante inferior direita dentro do SafeArea
           Positioned(
             right: 16,
             bottom: 8,
@@ -660,9 +870,9 @@ class _HomeScreenState extends State<HomeScreen> {
                       vertical: 2,
                     ),
                     decoration: BoxDecoration(
-                      color: const Color(0xD914131B),
+                      color: PS5HydraTheme.obsidianGlass.withOpacity(0.90),
                       borderRadius: BorderRadius.circular(24),
-                      border: Border.all(color: Colors.white.withOpacity(0.14)),
+                      border: Border.all(color: PS5HydraTheme.borderSubtle),
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -680,7 +890,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                   fontFamily: 'ReadexPro',
                                   fontSize: 11.5,
                                   fontWeight: FontWeight.w600,
-                                  color: HydraTokens.textPrimary,
+                                  color: PS5HydraTheme.textPrimary,
                                 ),
                               ),
                             ],
@@ -702,7 +912,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                   fontFamily: 'ReadexPro',
                                   fontSize: 11.5,
                                   fontWeight: FontWeight.w600,
-                                  color: HydraTokens.textPrimary,
+                                  color: PS5HydraTheme.textPrimary,
                                 ),
                               ),
                             ],
@@ -726,7 +936,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                   fontFamily: 'ReadexPro',
                                   fontSize: 11.5,
                                   fontWeight: FontWeight.w600,
-                                  color: HydraTokens.textPrimary,
+                                  color: PS5HydraTheme.textPrimary,
                                 ),
                               ),
                             ],
@@ -742,863 +952,6 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       ),
     );
-  }
-
-  // ==========================================================================
-  // MODO EM PÉ (PORTRAIT)
-  // ==========================================================================
-  Widget _buildGameHubPortraitHome(
-    BuildContext context, {
-    required List<EmulationGame> shelfGames,
-    required int safeIndex,
-    required List<EmulationGame> recentGames,
-    required List<EmulationGame> favoriteGames,
-    required List<EmulationGame> filteredCatalog,
-  }) {
-    final heroGame = shelfGames.isNotEmpty ? shelfGames[safeIndex] : null;
-    final topInset = MediaQuery.paddingOf(context).top;
-
-    return Scaffold(
-      backgroundColor: HydraTokens.bgPureBlack,
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          Positioned(
-            top: 0,
-            left: 0,
-            right: 0,
-            height: topInset + 250,
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                if (heroGame != null)
-                  Opacity(
-                    opacity: 0.28,
-                    child: LoopCoverImage(
-                      url: heroGame.resolvedHeroBannerUrl,
-                      fit: BoxFit.cover,
-                      preset: LoopCoverImagePreset.hero,
-                    ),
-                  ),
-                const DecoratedBox(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topCenter,
-                      end: Alignment.bottomCenter,
-                      stops: [0.0, 0.55, 1.0],
-                      colors: [
-                        Color(0x55000000),
-                        Color(0xCC000000),
-                        HydraTokens.bgPureBlack,
-                      ],
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          SafeArea(
-            top: false,
-            child: CustomScrollView(
-              slivers: [
-                // 1. Top Search Pill + Botão Lateral (>= 48dp)
-                SliverToBoxAdapter(
-                  child: Padding(
-                    padding: EdgeInsets.fromLTRB(18, topInset + 12, 18, 10),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    _DownloadStatusesScope(
-                      listenable: widget.downloadStatusesListenable,
-                      fallback: widget.downloadStatuses,
-                      builder: (context, statuses) {
-                        final hasDownloading = statuses.values.any(
-                          (s) => s.state == RomActionState.downloading,
-                        );
-                        final hasBadges =
-                            widget.isLoadingCatalog || hasDownloading;
-                        return Column(
-                          children: [
-                            const Center(
-                              child: Text(
-                                'LOOPGAMER',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontFamily: 'PressStart2P',
-                                  fontSize: 15,
-                                  letterSpacing: 1.8,
-                                  color: HydraTokens.primaryAurora,
-                                ),
-                              ),
-                            ),
-                            if (hasBadges) ...[
-                              const SizedBox(height: 8),
-                              Center(
-                                child: Wrap(
-                                  alignment: WrapAlignment.center,
-                                  spacing: 8,
-                                  runSpacing: 6,
-                                  crossAxisAlignment:
-                                      WrapCrossAlignment.center,
-                                  children: [
-                                    if (widget.isLoadingCatalog)
-                                      const _CatalogSyncBadge(),
-                                    if (hasDownloading)
-                                      Semantics(
-                                        button: true,
-                                        label:
-                                            'Downloads ativos em segundo plano. Abrir Biblioteca.',
-                                        child: InkWell(
-                                          borderRadius:
-                                              BorderRadius.circular(14),
-                                          onTap: widget.onOpenLibraryTab,
-                                          child: Container(
-                                            constraints: const BoxConstraints(
-                                              minHeight: 48,
-                                            ),
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 12,
-                                              vertical: 8,
-                                            ),
-                                            decoration: BoxDecoration(
-                                              color:
-                                                  HydraTokens.surfaceElevated1,
-                                              borderRadius:
-                                                  BorderRadius.circular(14),
-                                              border: Border.all(
-                                                color:
-                                                    HydraTokens.borderSubtle10,
-                                              ),
-                                            ),
-                                            child: const Row(
-                                              mainAxisSize: MainAxisSize.min,
-                                              children: [
-                                                SizedBox(
-                                                  width: 12,
-                                                  height: 12,
-                                                  child:
-                                                      CircularProgressIndicator(
-                                                    strokeWidth: 2,
-                                                    color: HydraTokens
-                                                        .primaryAurora,
-                                                  ),
-                                                ),
-                                                SizedBox(width: 6),
-                                                Flexible(
-                                                  child: Text(
-                                                    'Baixando em 2º plano',
-                                                    maxLines: 1,
-                                                    overflow:
-                                                        TextOverflow.ellipsis,
-                                                    style: TextStyle(
-                                                      fontFamily: 'ReadexPro',
-                                                      fontSize: 11,
-                                                      fontWeight:
-                                                          FontWeight.w600,
-                                                      color: HydraTokens
-                                                          .primaryAurora,
-                                                    ),
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                  ],
-                                ),
-                              ),
-                            ],
-                          ],
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 10),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Semantics(
-                            button: true,
-                            label: 'Encontre seu jogo na aba ROMs',
-                            child: InkWell(
-                              borderRadius: BorderRadius.circular(24),
-                              onTap: widget.onOpenSearchTab,
-                              child: Container(
-                                height: 48,
-                                padding:
-                                    const EdgeInsets.symmetric(horizontal: 16),
-                                decoration: BoxDecoration(
-                                  color: HydraTokens.bgNearBlack,
-                                  borderRadius: BorderRadius.circular(24),
-                                  border: Border.all(
-                                    color: HydraTokens.borderSubtle8,
-                                  ),
-                                ),
-                                child: Row(
-                                  children: [
-                                    PhosphorIcon(
-                                      PhosphorIcons.magnifyingGlass(
-                                        PhosphorIconsStyle.regular,
-                                      ),
-                                      size: 18,
-                                      color: HydraTokens.textSecondary,
-                                    ),
-                                    const SizedBox(width: 10),
-                                    const Expanded(
-                                      child: Text(
-                                        'Encontre seu jogo...',
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          fontFamily: 'Rubik',
-                                          fontSize: 13.5,
-                                          color: HydraTokens.textSecondary,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Semantics(
-                          button: true,
-                          label: 'Abrir Biblioteca',
-                          excludeSemantics: true,
-                          child: Tooltip(
-                            message: 'Abrir Biblioteca',
-                            child: InkWell(
-                              borderRadius: BorderRadius.circular(14),
-                              onTap: widget.onOpenLibraryTab,
-                              child: Container(
-                                width: 48,
-                                height: 48,
-                                decoration: BoxDecoration(
-                                  color: HydraTokens.bgNearBlack,
-                                  borderRadius: BorderRadius.circular(14),
-                                  border: Border.all(
-                                    color: HydraTokens.borderSubtle8,
-                                  ),
-                                ),
-                                child: Center(
-                                  child: PhosphorIcon(
-                                    PhosphorIcons.devices(
-                                      PhosphorIconsStyle.regular,
-                                    ),
-                                    size: 20,
-                                    color: HydraTokens.textPrimary,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                    if (widget.catalogError != null) ...[
-                      const SizedBox(height: 12),
-                      LoopEmptyState.error(
-                        compact: true,
-                        title: 'Falha ao atualizar catálogo online',
-                        subtitle: widget.catalogError,
-                        actionLabel: widget.onRetryCatalog != null
-                            ? 'Tentar novamente'
-                            : null,
-                        onAction: widget.onRetryCatalog,
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ),
-
-            // 2. Hero Card Principal Portrait (alta definição)
-            if (heroGame != null)
-              SliverToBoxAdapter(
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(18, 6, 18, 10),
-                  child: GestureDetector(
-                    onTap: () => _openDetails(heroGame),
-                    child: Container(
-                      height: 238,
-                      decoration: BoxDecoration(
-                        color: HydraTokens.bgNearBlack,
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(color: HydraTokens.borderSubtle10),
-                        boxShadow: const [
-                          BoxShadow(
-                            color: Color(0x99000000),
-                            blurRadius: 20,
-                            offset: Offset(0, 10),
-                          ),
-                        ],
-                      ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(19),
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            LoopCoverImage(
-                              url: heroGame.resolvedHeroBannerUrl,
-                              fit: BoxFit.cover,
-                              preset: LoopCoverImagePreset.hero,
-                            ),
-                            Container(
-                              decoration: const BoxDecoration(
-                                gradient: LinearGradient(
-                                  begin: Alignment.topCenter,
-                                  end: Alignment.bottomCenter,
-                                  stops: [0.0, 0.38, 0.72, 1.0],
-                                  colors: [
-                                    Color(0x220A090E),
-                                    Color(0x550A090E),
-                                    Color(0xCC0D0C13),
-                                    Color(0xFA121118),
-                                  ],
-                                ),
-                              ),
-                            ),
-                            Positioned(
-                              left: 16,
-                              right: 12,
-                              bottom: 14,
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Row(
-                                    mainAxisAlignment:
-                                        MainAxisAlignment.spaceBetween,
-                                    children: [
-                                      Flexible(
-                                        child: Container(
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 10,
-                                            vertical: 5,
-                                          ),
-                                          decoration: BoxDecoration(
-                                            color:
-                                                Colors.black.withOpacity(0.65),
-                                            borderRadius:
-                                                BorderRadius.circular(16),
-                                            border: Border.all(
-                                              color:
-                                                  Colors.white.withOpacity(0.14),
-                                            ),
-                                          ),
-                                          child: Row(
-                                            mainAxisSize: MainAxisSize.min,
-                                            children: [
-                                              PhosphorIcon(
-                                                PhosphorIcons.fire(
-                                                  PhosphorIconsStyle.fill,
-                                                ),
-                                                size: 13,
-                                                color: Colors.white,
-                                              ),
-                                              const SizedBox(width: 5),
-                                              Flexible(
-                                                child: Text(
-                                                  'HOT TOP ${safeIndex + 1} • ${heroGame.platformName}',
-                                                  maxLines: 1,
-                                                  overflow:
-                                                      TextOverflow.ellipsis,
-                                                  style: const TextStyle(
-                                                    fontFamily: 'ReadexPro',
-                                                    fontSize: 10.5,
-                                                    fontWeight: FontWeight.w700,
-                                                    color: Colors.white,
-                                                  ),
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      Semantics(
-                                        button: true,
-                                        label: 'Trocar jogo em destaque',
-                                        child: Tooltip(
-                                          message: 'Próximo destaque',
-                                          child: IconButton(
-                                            constraints: const BoxConstraints(
-                                              minWidth: 48,
-                                              minHeight: 48,
-                                            ),
-                                            onPressed: () {
-                                              final next = (safeIndex + 1) %
-                                                  shelfGames.length;
-                                              setState(() =>
-                                                  _selectedFeaturedIndex =
-                                                      next);
-                                            },
-                                            icon: Container(
-                                              padding: const EdgeInsets.all(7),
-                                              decoration: BoxDecoration(
-                                                color: Colors.black
-                                                    .withOpacity(0.60),
-                                                shape: BoxShape.circle,
-                                                border: Border.all(
-                                                  color: Colors.white
-                                                      .withOpacity(0.18),
-                                                ),
-                                              ),
-                                              child: PhosphorIcon(
-                                                PhosphorIcons.arrowsClockwise(
-                                                  PhosphorIconsStyle.bold,
-                                                ),
-                                                size: 15,
-                                                color: HydraTokens.textPrimary,
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                  const SizedBox(height: 8),
-                                  Row(
-                                    crossAxisAlignment: CrossAxisAlignment.end,
-                                    children: [
-                                      Expanded(
-                                        child: Column(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            Text(
-                                              heroGame.name,
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: const TextStyle(
-                                                fontFamily: 'ReadexPro',
-                                                fontSize: 18.5,
-                                                fontWeight: FontWeight.w700,
-                                                color: HydraTokens.textPrimary,
-                                              ),
-                                            ),
-                                            const SizedBox(height: 3),
-                                            Text(
-                                              heroGame.summary,
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: const TextStyle(
-                                                fontFamily: 'Rubik',
-                                                fontSize: 12,
-                                                color:
-                                                    HydraTokens.textSecondary,
-                                              ),
-                                            ),
-                                            const SizedBox(height: 8),
-                                            _DownloadStatusesScope(
-                                              listenable: widget
-                                                  .downloadStatusesListenable,
-                                              fallback: widget.downloadStatuses,
-                                              builder: (context, statuses) {
-                                                final heroStatus = statuses[
-                                                        heroGame.igdbId] ??
-                                                    const RomDownloadStatus();
-                                                return Container(
-                                                  padding: const EdgeInsets
-                                                      .symmetric(
-                                                    horizontal: 9,
-                                                    vertical: 3.5,
-                                                  ),
-                                                  decoration: BoxDecoration(
-                                                    color: Colors.black
-                                                        .withOpacity(0.68),
-                                                    borderRadius:
-                                                        BorderRadius.circular(
-                                                      12,
-                                                    ),
-                                                    border: Border.all(
-                                                      color: Colors.white
-                                                          .withOpacity(0.14),
-                                                    ),
-                                                  ),
-                                                  child: Row(
-                                                    mainAxisSize:
-                                                        MainAxisSize.min,
-                                                    children: [
-                                                      PhosphorIcon(
-                                                        PhosphorIcons.star(
-                                                          PhosphorIconsStyle
-                                                              .fill,
-                                                        ),
-                                                        size: 11,
-                                                        color: Colors.white,
-                                                      ),
-                                                      const SizedBox(width: 4),
-                                                      Flexible(
-                                                        child: Text(
-                                                          heroStatus.state ==
-                                                                  RomActionState
-                                                                      .readyToPlay
-                                                              ? 'Instalado'
-                                                              : heroStatus.state ==
-                                                                      RomActionState
-                                                                          .downloading
-                                                                  ? 'Baixando ${LoopProgressIndicator.formatPercent(heroStatus.progress)}'
-                                                                  : 'Featured',
-                                                          maxLines: 1,
-                                                          overflow: TextOverflow
-                                                              .ellipsis,
-                                                          style:
-                                                              const TextStyle(
-                                                            fontFamily:
-                                                                'ReadexPro',
-                                                            fontSize: 10.5,
-                                                            fontWeight:
-                                                                FontWeight.w700,
-                                                            color: Colors.white,
-                                                          ),
-                                                        ),
-                                                      ),
-                                                    ],
-                                                  ),
-                                                );
-                                              },
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                      const SizedBox(width: 12),
-                                      Column(
-                                        crossAxisAlignment:
-                                            CrossAxisAlignment.end,
-                                        children: [
-                                          Text(
-                                            ((heroGame.rating ?? 91) / 10.0)
-                                                .clamp(8.5, 9.9)
-                                                .toStringAsFixed(1),
-                                            style: const TextStyle(
-                                              fontFamily: 'ReadexPro',
-                                              fontSize: 22,
-                                              fontWeight: FontWeight.w700,
-                                              color: HydraTokens.textPrimary,
-                                            ),
-                                          ),
-                                          const Text(
-                                            'Player Rating',
-                                            style: TextStyle(
-                                              fontFamily: 'Rubik',
-                                              fontSize: 10,
-                                              color: HydraTokens.textSecondary,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ],
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-
-            // 2b. Seção dedicada: Continuar jogando (Portrait)
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(18, 12, 18, 4),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    _SectionHeaderRow(
-                      icon: PhosphorIcons.clockCounterClockwise(
-                        PhosphorIconsStyle.bold,
-                      ),
-                      title: 'Continuar jogando',
-                      trailing: recentGames.isNotEmpty
-                          ? '${recentGames.length} títulos'
-                          : null,
-                    ),
-                    const SizedBox(height: 10),
-                    if (recentGames.isNotEmpty)
-                      SizedBox(
-                        height: 110,
-                        child: ListView.separated(
-                          scrollDirection: Axis.horizontal,
-                          itemCount: recentGames.length,
-                          separatorBuilder: (_, __) =>
-                              const SizedBox(width: 12),
-                          itemBuilder: (context, idx) {
-                            final game = recentGames[idx];
-                            final playtimeSec = widget.userMeta
-                                .playtimeOf(game.igdbId)
-                                .totalSeconds;
-                            return LoopRecentGameCard(
-                              game: game,
-                              playtimeSeconds: playtimeSec,
-                              isLandscape: false,
-                              cover: LoopCoverImage(
-                                url: game.resolvedGridCoverUrl,
-                                fit: BoxFit.cover,
-                                preset: LoopCoverImagePreset.thumbnail,
-                              ),
-                              onTap: () => _openDetails(game),
-                            );
-                          },
-                        ),
-                      )
-                    else
-                      LoopEmptyState(
-                        compact: true,
-                        icon: PhosphorIcons.clockCounterClockwise(
-                          PhosphorIconsStyle.bold,
-                        ),
-                        title: 'Nenhum jogo em andamento',
-                        subtitle:
-                            'Quando você iniciar uma partida, ela aparecerá aqui.',
-                        actionLabel: widget.onOpenSearchTab != null
-                            ? 'Explorar catálogo'
-                            : null,
-                        onAction: widget.onOpenSearchTab,
-                      ),
-                  ],
-                ),
-              ),
-            ),
-
-            // 2c. Seção dedicada: Favoritos (Portrait)
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(18, 14, 18, 4),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    _SectionHeaderRow(
-                      icon: PhosphorIcons.star(PhosphorIconsStyle.fill),
-                      iconColor: HydraTokens.primaryAurora,
-                      title: 'Favoritos',
-                      trailing: favoriteGames.isNotEmpty
-                          ? '${favoriteGames.length} jogos'
-                          : null,
-                    ),
-                    const SizedBox(height: 10),
-                    if (favoriteGames.isNotEmpty)
-                      SizedBox(
-                        height: 110,
-                        child: ListView.separated(
-                          scrollDirection: Axis.horizontal,
-                          itemCount: favoriteGames.length,
-                          separatorBuilder: (_, __) =>
-                              const SizedBox(width: 12),
-                          itemBuilder: (context, idx) {
-                            final game = favoriteGames[idx];
-                            return _HomeFavoriteCard(
-                              game: game,
-                              isLandscape: false,
-                              onTap: () => _openDetails(game),
-                            );
-                          },
-                        ),
-                      )
-                    else
-                      LoopEmptyState(
-                        compact: true,
-                        icon: PhosphorIcons.star(PhosphorIconsStyle.bold),
-                        title: 'Sem favoritos ainda',
-                        subtitle:
-                            'Marque seus jogos preferidos na Biblioteca para fixá-los aqui.',
-                        actionLabel: widget.onOpenLibraryTab != null
-                            ? 'Ir para Biblioteca'
-                            : null,
-                        onAction: widget.onOpenLibraryTab,
-                      ),
-                  ],
-                ),
-              ),
-            ),
-
-            // 3. Seção "Destaques da Coleção"
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.only(top: 14, bottom: 6),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 18),
-                      child: Row(
-                        children: [
-                          const Expanded(
-                            child: Text(
-                              'Destaques da Coleção',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontFamily: 'ReadexPro',
-                                fontSize: 16,
-                                fontWeight: FontWeight.w700,
-                                color: HydraTokens.textPrimary,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            '${shelfGames.length} títulos',
-                            style: const TextStyle(
-                              fontFamily: 'Rubik',
-                              fontSize: 12,
-                              color: HydraTokens.textSecondary,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    _DownloadStatusesScope(
-                      listenable: widget.downloadStatusesListenable,
-                      fallback: widget.downloadStatuses,
-                      builder: (context, statuses) => SizedBox(
-                        height: 188,
-                        child: ListView.separated(
-                          scrollDirection: Axis.horizontal,
-                          padding: const EdgeInsets.symmetric(horizontal: 18),
-                          itemCount: shelfGames.length,
-                          separatorBuilder: (_, __) =>
-                              const SizedBox(width: 12),
-                          itemBuilder: (context, idx) {
-                            final game = shelfGames[idx];
-                            final status = statuses[game.igdbId] ??
-                                const RomDownloadStatus();
-                            return _GameHubPortraitPosterItem(
-                              game: game,
-                              status: status,
-                              isSelected: idx == safeIndex,
-                              onTap: () {
-                                setState(() => _selectedFeaturedIndex = idx);
-                                _openDetails(game);
-                              },
-                            );
-                          },
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            // 4. Filtro Rápido de Plataformas ("Catálogo por Console") usando LoopPlatformChip
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(18, 10, 18, 10),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        const Expanded(
-                          child: Text(
-                            'Catálogo por Console',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontFamily: 'ReadexPro',
-                              fontSize: 16,
-                              fontWeight: FontWeight.w700,
-                              color: HydraTokens.textPrimary,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Text(
-                          '${filteredCatalog.length} jogos',
-                          style: const TextStyle(
-                            fontFamily: 'Rubik',
-                            fontSize: 12,
-                            color: HydraTokens.textSecondary,
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    SingleChildScrollView(
-                      scrollDirection: Axis.horizontal,
-                      child: Row(
-                        children: kRommPlatforms.map((plat) {
-                          final active = _selectedPlatformSlug == plat.slug;
-                          return Padding(
-                            padding: const EdgeInsets.only(right: 8),
-                            child: LoopPlatformChip(
-                              label: plat.shortName,
-                              selected: active,
-                              accentColor: plat.accentColor,
-                              onTap: () => setState(
-                                () => _selectedPlatformSlug = plat.slug,
-                              ),
-                            ),
-                          );
-                        }).toList(),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            // 5. Grade Responsiva (ou estado vazio se filtro sem jogos)
-            if (filteredCatalog.isEmpty)
-              SliverToBoxAdapter(
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(18, 8, 18, 28),
-                  child: LoopEmptyState(
-                    compact: true,
-                    title: 'Nenhum jogo nesta plataforma',
-                    subtitle:
-                        'Limpe o filtro para ver todo o catálogo ou busque outras ROMs.',
-                    actionLabel: 'Mostrar todos',
-                    onAction: () =>
-                        setState(() => _selectedPlatformSlug = 'todos'),
-                  ),
-                ),
-              )
-            else
-              _DownloadStatusesScope(
-                listenable: widget.downloadStatusesListenable,
-                fallback: widget.downloadStatuses,
-                builder: (context, statuses) => SliverPadding(
-                  padding: const EdgeInsets.fromLTRB(18, 2, 18, 28),
-                  sliver: SliverGrid(
-                    gridDelegate:
-                        const SliverGridDelegateWithMaxCrossAxisExtent(
-                      maxCrossAxisExtent: 185,
-                      mainAxisSpacing: 14,
-                      crossAxisSpacing: 14,
-                      childAspectRatio: 0.66,
-                    ),
-                    delegate: SliverChildBuilderDelegate(
-                      (context, index) {
-                        final game = filteredCatalog[index];
-                        final status = statuses[game.igdbId] ??
-                            const RomDownloadStatus();
-                        return RommCoverGridCard(
-                          game: game,
-                          status: status,
-                          onTap: () => _openDetails(game),
-                          onActionTap: () => _executeGameAction(game, status),
-                        );
-                      },
-                      childCount: filteredCatalog.length,
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ],
-    ),
-  );
   }
 }
 
@@ -1717,16 +1070,17 @@ class _SectionHeaderRow extends StatelessWidget {
   }
 }
 
+/// Card vertical 3:4 estilo PS5 para Favoritos em horizontal
 class _HomeFavoriteCard extends StatefulWidget {
   const _HomeFavoriteCard({
     required this.game,
     required this.onTap,
-    this.isLandscape = false,
+    this.coverUrl,
   });
 
   final EmulationGame game;
   final VoidCallback onTap;
-  final bool isLandscape;
+  final String? coverUrl;
 
   @override
   State<_HomeFavoriteCard> createState() => _HomeFavoriteCardState();
@@ -1734,108 +1088,110 @@ class _HomeFavoriteCard extends StatefulWidget {
 
 class _HomeFavoriteCardState extends State<_HomeFavoriteCard> {
   bool _focused = false;
+  bool _hovered = false;
 
   @override
   Widget build(BuildContext context) {
-    final bgColor = widget.isLandscape
-        ? HydraTokens.bgPureBlack.withOpacity(0.58)
-        : HydraTokens.bgNearBlack;
+    final active = _focused || _hovered;
+    final resolvedCover = widget.coverUrl ??
+        widget.game.gridCoverUrl ??
+        widget.game.resolvedGridCoverUrl;
 
     return Semantics(
       button: true,
       label: '${widget.game.name}, favorito, ${widget.game.platformName}',
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(minHeight: 48),
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 160),
-          width: widget.isLandscape ? 182 : 174,
-          decoration: BoxDecoration(
-            color: bgColor,
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(
-              color: _focused
-                  ? HydraTokens.primaryAurora
-                  : HydraTokens.borderSubtle10,
-              width: _focused ? 2.0 : 1.0,
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() => _hovered = false),
+        child: AnimatedScale(
+          scale: active ? 1.05 : 1.0,
+          duration: PS5HydraTheme.animFast,
+          curve: Curves.easeOut,
+          child: AnimatedContainer(
+            duration: PS5HydraTheme.animMedium,
+            curve: Curves.easeOut,
+            width: 138,
+            decoration: BoxDecoration(
+              color: PS5HydraTheme.obsidianGlass,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: active
+                    ? PS5HydraTheme.auroraSpringMint
+                    : PS5HydraTheme.borderSubtle,
+                width: active ? 1.8 : 1.0,
+              ),
+              boxShadow: active ? PS5HydraTheme.glowFocus : null,
             ),
-            boxShadow: _focused
-                ? HydraTokens.neonBoxGlow(
-                    opacity: 0.22,
-                    blur: 12,
-                    color: HydraTokens.primaryAurora,
-                  )
-                : null,
-          ),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(11),
-            child: Material(
-              color: Colors.transparent,
-              child: InkWell(
-                onFocusChange: (hasFocus) {
-                  if (_focused != hasFocus) {
-                    setState(() => _focused = hasFocus);
-                  }
-                },
-                onTap: widget.onTap,
-                child: Row(
-                  children: [
-                    SizedBox(
-                      width: widget.isLandscape ? 72 : 68,
-                      height: double.infinity,
-                      child: LoopCoverImage(
-                        url: widget.game.resolvedGridCoverUrl,
-                        fit: BoxFit.cover,
-                        preset: LoopCoverImagePreset.thumbnail,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(13),
+              child: Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  onFocusChange: (hasFocus) {
+                    if (_focused != hasFocus) {
+                      setState(() => _focused = hasFocus);
+                    }
+                  },
+                  onTap: widget.onTap,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      ProceduralCover(
+                        title: widget.game.name,
+                        platformName: widget.game.platformName,
+                        imageUrl: resolvedCover,
+                        borderRadius: 0,
+                        compact: true,
+                        showBottomLabel: false,
                       ),
-                    ),
-                    Expanded(
-                      child: Padding(
-                        padding: const EdgeInsets.all(8),
+                      const DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            stops: [0.30, 0.70, 1.0],
+                            colors: [
+                              Colors.transparent,
+                              Color(0xB8000000),
+                              Color(0xF5000000),
+                            ],
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        left: 10,
+                        right: 10,
+                        bottom: 10,
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisAlignment: MainAxisAlignment.center,
+                          mainAxisSize: MainAxisSize.min,
                           children: [
-                            Text(
-                              widget.game.name,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
+                            AnimatedGameLogo(
+                              game: widget.game,
+                              height: 24,
+                              maxWidthFraction: 1.0,
+                              enableStagger: false,
+                              maxLines: 1,
+                              fallbackStyle: const TextStyle(
                                 fontFamily: 'ReadexPro',
-                                fontSize: 11.5,
+                                fontSize: 12,
                                 fontWeight: FontWeight.w700,
-                                color: HydraTokens.textPrimary,
+                                color: PS5HydraTheme.textPrimary,
                               ),
                             ),
-                            const SizedBox(height: 6),
-                            Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                PhosphorIcon(
-                                  PhosphorIcons.star(PhosphorIconsStyle.fill),
-                                  size: 11,
-                                  color: HydraTokens.primaryAurora,
-                                ),
-                                const SizedBox(width: 4),
-                                Flexible(
-                                  child: Text(
-                                    widget.game.platformName,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                      fontFamily: 'JetBrainsMono',
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.w700,
-                                      color: HydraTokens.textSecondary,
-                                    ),
-                                  ),
-                                ),
-                              ],
+                            const SizedBox(height: 4),
+                            Text(
+                              widget.game.platformName,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: PS5HydraTheme.metaMonoStyle
+                                  .copyWith(fontSize: 10),
                             ),
                           ],
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -1878,13 +1234,14 @@ class _ShortcutBarAction extends StatelessWidget {
 }
 
 /// Card Widescreen Principal do Carrossel Landscape
-class _GameHubLandscapeHeroCard extends StatelessWidget {
+class _GameHubLandscapeHeroCard extends StatefulWidget {
   const _GameHubLandscapeHeroCard({
     required this.game,
     required this.status,
     required this.isFocused,
     required this.onTap,
     required this.onActionTap,
+    this.bannerUrl,
   });
 
   final EmulationGame game;
@@ -1892,200 +1249,212 @@ class _GameHubLandscapeHeroCard extends StatelessWidget {
   final bool isFocused;
   final VoidCallback onTap;
   final VoidCallback onActionTap;
+  final String? bannerUrl;
+
+  @override
+  State<_GameHubLandscapeHeroCard> createState() =>
+      _GameHubLandscapeHeroCardState();
+}
+
+class _GameHubLandscapeHeroCardState extends State<_GameHubLandscapeHeroCard> {
+  bool _hovered = false;
 
   @override
   Widget build(BuildContext context) {
-    final width = isFocused ? 276.0 : 196.0;
-    final height = isFocused ? 158.0 : 114.0;
-    final isDownloading = status.state == RomActionState.downloading;
-    final isReady =
-        status.state == RomActionState.readyToPlay && status.localPath != null;
-    final isPaused = status.state == RomActionState.paused;
-    final isExternal = game.directRomUrl.startsWith('external://');
+    final active = widget.isFocused || _hovered;
+    final width = widget.isFocused ? 272.0 : 196.0;
+    final height = widget.isFocused ? 156.0 : 114.0;
+    final isDownloading = widget.status.state == RomActionState.downloading;
+    final isReady = widget.status.state == RomActionState.readyToPlay &&
+        widget.status.localPath != null;
+    final isPaused = widget.status.state == RomActionState.paused;
+    final isExternal = widget.game.directRomUrl.startsWith('external://');
 
     final actionLabel = isReady
         ? 'Jogar Agora'
         : isDownloading
-            ? 'Cancelar (${LoopProgressIndicator.formatPercent(status.progress)})'
+            ? 'Cancelar (${LoopProgressIndicator.formatPercent(widget.status.progress)})'
             : isExternal
                 ? 'Ver Detalhes'
                 : isPaused
                     ? 'Continuar'
                     : 'Baixar Agora';
 
-    return GestureDetector(
-      onTap: onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 220),
-        curve: Curves.easeOutCubic,
-        width: width,
-        height: height,
-        decoration: BoxDecoration(
-          color: HydraTokens.bgNearBlack,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-            color: isFocused
-                ? HydraTokens.primaryAurora.withOpacity(0.90)
-                : Colors.white.withOpacity(0.14),
-            width: isFocused ? 2.0 : 1.0,
-          ),
-          boxShadow: isFocused
-              ? HydraTokens.neonBoxGlow(
-                  opacity: 0.20,
-                  blur: 16,
-                  color: HydraTokens.primaryAurora,
-                )
-              : [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(0.45),
-                    blurRadius: 10,
-                    offset: const Offset(0, 8),
-                  ),
-                ],
-        ),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(12.5),
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              LoopCoverImage(
-                url: game.resolvedHeroBannerUrl,
-                fit: BoxFit.cover,
-                preset: LoopCoverImagePreset.hero,
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: AnimatedScale(
+          scale: active ? 1.05 : 1.0,
+          duration: PS5HydraTheme.animFast,
+          curve: Curves.easeOut,
+          child: AnimatedContainer(
+            duration: PS5HydraTheme.animMedium,
+            curve: Curves.easeOut,
+            width: width,
+            height: height,
+            decoration: BoxDecoration(
+              color: PS5HydraTheme.obsidianGlass,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: active
+                    ? PS5HydraTheme.auroraSpringMint
+                    : PS5HydraTheme.borderSubtle,
+                width: active ? 2.0 : 1.0,
               ),
-              Container(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    stops: const [0.0, 0.35, 1.0],
-                    colors: [
-                      Colors.transparent,
-                      Colors.black.withOpacity(0.35),
-                      Colors.black.withOpacity(0.88),
-                    ],
+              boxShadow: active ? PS5HydraTheme.glowFocus : null,
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12.5),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  ProceduralCover(
+                    title: widget.game.name,
+                    platformName: widget.game.platformName,
+                    imageUrl:
+                        widget.bannerUrl ?? widget.game.resolvedHeroBannerUrl,
+                    borderRadius: 0,
+                    compact: true,
+                    showBottomLabel: false,
                   ),
-                ),
-              ),
-              Positioned(
-                top: 8,
-                right: 8,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 7,
-                    vertical: 2.5,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.72),
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  child: Text(
-                    game.platformName,
-                    style: const TextStyle(
-                      fontFamily: 'ReadexPro',
-                      fontSize: 9.5,
-                      fontWeight: FontWeight.w700,
-                      color: Colors.white,
+                  Container(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        stops: const [0.0, 0.35, 1.0],
+                        colors: [
+                          Colors.transparent,
+                          Colors.black.withOpacity(0.35),
+                          Colors.black.withOpacity(0.90),
+                        ],
+                      ),
                     ),
                   ),
-                ),
-              ),
-              if (isFocused)
-                Positioned(
-                  left: 14,
-                  right: 14,
-                  bottom: 6,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        game.name.toUpperCase(),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontFamily: 'ReadexPro',
-                          fontSize: 14,
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: 0.4,
-                          color: Colors.white,
-                        ),
+                  Positioned(
+                    top: 8,
+                    right: 8,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 7,
+                        vertical: 2.5,
                       ),
-                      const SizedBox(height: 2),
-                      Semantics(
-                        button: true,
-                        label: '$actionLabel ${game.name}',
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(
-                            minWidth: 48,
-                            minHeight: 48,
+                      decoration: BoxDecoration(
+                        color: PS5HydraTheme.obsidianGlass.withOpacity(0.88),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: PS5HydraTheme.borderSubtle),
+                      ),
+                      child: Text(
+                        widget.game.platformName,
+                        style: PS5HydraTheme.metaMonoStyle
+                            .copyWith(fontSize: 9.5),
+                      ),
+                    ),
+                  ),
+                  if (widget.isFocused)
+                    Positioned(
+                      left: 14,
+                      right: 14,
+                      bottom: 6,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          AnimatedGameLogo(
+                            game: widget.game,
+                            height: 28,
+                            maxWidthFraction: 1.0,
+                            enableStagger: false,
+                            maxLines: 1,
+                            fallbackStyle: const TextStyle(
+                              fontFamily: 'ReadexPro',
+                              fontSize: 14,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: 0.4,
+                              color: PS5HydraTheme.textPrimary,
+                            ),
                           ),
-                          child: InkWell(
-                            borderRadius: BorderRadius.circular(10),
-                            onTap: onActionTap,
-                            child: Align(
-                              alignment: Alignment.centerLeft,
-                              widthFactor: 1.0,
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  const _ControllerKeyBadge(label: 'A'),
-                                  const SizedBox(width: 7),
-                                  Text(
-                                    actionLabel,
-                                    style: const TextStyle(
-                                      fontFamily: 'ReadexPro',
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w700,
-                                      color: Colors.white,
-                                    ),
+                          const SizedBox(height: 2),
+                          Semantics(
+                            button: true,
+                            label: '$actionLabel ${widget.game.name}',
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(
+                                minWidth: 48,
+                                minHeight: 48,
+                              ),
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(10),
+                                onTap: widget.onActionTap,
+                                child: Align(
+                                  alignment: Alignment.centerLeft,
+                                  widthFactor: 1.0,
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const _ControllerKeyBadge(label: 'A'),
+                                      const SizedBox(width: 7),
+                                      Text(
+                                        actionLabel,
+                                        style: const TextStyle(
+                                          fontFamily: 'ReadexPro',
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w700,
+                                          color: PS5HydraTheme.auroraSpringMint,
+                                        ),
+                                      ),
+                                    ],
                                   ),
-                                ],
+                                ),
                               ),
                             ),
                           ),
-                        ),
+                        ],
                       ),
-                    ],
-                  ),
-                )
-              else
-                Positioned(
-                  left: 10,
-                  right: 10,
-                  bottom: 8,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        game.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontFamily: 'ReadexPro',
-                          fontSize: 12,
-                          fontWeight: FontWeight.w700,
-                          color: Colors.white,
-                        ),
+                    )
+                  else
+                    Positioned(
+                      left: 10,
+                      right: 10,
+                      bottom: 8,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          AnimatedGameLogo(
+                            game: widget.game,
+                            height: 22,
+                            maxWidthFraction: 1.0,
+                            enableStagger: false,
+                            maxLines: 1,
+                            fallbackStyle: const TextStyle(
+                              fontFamily: 'ReadexPro',
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              color: PS5HydraTheme.textPrimary,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            isDownloading
+                                ? 'Baixando ${LoopProgressIndicator.formatPercent(widget.status.progress)}'
+                                : '${widget.game.developer} • ${widget.game.formattedSize}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontFamily: 'Rubik',
+                              fontSize: 10,
+                              color: PS5HydraTheme.textSecondary,
+                            ),
+                          ),
+                        ],
                       ),
-                      const SizedBox(height: 2),
-                      Text(
-                        isDownloading
-                            ? 'Baixando ${LoopProgressIndicator.formatPercent(status.progress)}'
-                            : '${game.developer} • ${game.formattedSize}',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontFamily: 'Rubik',
-                          fontSize: 10,
-                          color: HydraTokens.textSecondary,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-            ],
+                    ),
+                ],
+              ),
+            ),
           ),
         ),
       ),
@@ -2093,112 +1462,158 @@ class _GameHubLandscapeHeroCard extends StatelessWidget {
   }
 }
 
-/// Card Widescreen da Segunda Fileira em Landscape
-class _GameHubLandscapeSecondaryCard extends StatelessWidget {
+/// Card Vertical 3:4 da seção "Catálogo por Console" em Landscape
+class _GameHubLandscapeSecondaryCard extends StatefulWidget {
   const _GameHubLandscapeSecondaryCard({
     required this.game,
     required this.status,
     required this.onTap,
+    this.coverUrl,
   });
 
   final EmulationGame game;
   final RomDownloadStatus status;
   final VoidCallback onTap;
+  final String? coverUrl;
+
+  @override
+  State<_GameHubLandscapeSecondaryCard> createState() =>
+      _GameHubLandscapeSecondaryCardState();
+}
+
+class _GameHubLandscapeSecondaryCardState
+    extends State<_GameHubLandscapeSecondaryCard> {
+  bool _hovered = false;
+  bool _focused = false;
 
   @override
   Widget build(BuildContext context) {
-    final isReady = status.state == RomActionState.readyToPlay;
-    final isDownloading = status.state == RomActionState.downloading;
+    final isReady = widget.status.state == RomActionState.readyToPlay;
+    final isDownloading = widget.status.state == RomActionState.downloading;
+    final active = _hovered || _focused;
 
     return Semantics(
       button: true,
-      label: 'Ver detalhes de ${game.name}, ${game.platformName}',
-      child: GestureDetector(
-        onTap: onTap,
-        child: Container(
-          width: 204,
-          decoration: BoxDecoration(
-            color: HydraTokens.bgNearBlack,
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: isReady
-                  ? Colors.white.withOpacity(0.55)
-                  : Colors.white.withOpacity(0.10),
-            ),
-          ),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(13),
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                LoopCoverImage(
-                  url: game.resolvedHeroBannerUrl,
-                  fit: BoxFit.cover,
-                  preset: LoopCoverImagePreset.card,
+      label: 'Ver detalhes de ${widget.game.name}, ${widget.game.platformName}',
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() => _hovered = false),
+        child: GestureDetector(
+          onTap: widget.onTap,
+          child: AnimatedScale(
+            scale: active ? 1.05 : 1.0,
+            duration: PS5HydraTheme.animFast,
+            curve: Curves.easeOut,
+            child: AnimatedContainer(
+              duration: PS5HydraTheme.animMedium,
+              width: 136,
+              decoration: BoxDecoration(
+                color: PS5HydraTheme.obsidianGlass,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: active
+                      ? PS5HydraTheme.auroraSpringMint
+                      : PS5HydraTheme.borderSubtle,
+                  width: active ? 1.8 : 1.0,
                 ),
-                Container(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topCenter,
-                      end: Alignment.bottomCenter,
-                      colors: [
-                        Colors.transparent,
-                        Colors.black.withOpacity(0.84),
-                      ],
-                    ),
-                  ),
-                ),
-                Positioned(
-                  top: 8,
-                  right: 8,
-                  child: Container(
-                    constraints: const BoxConstraints(maxWidth: 176),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 3,
-                    ),
-                    decoration: BoxDecoration(
-                      color: isReady
-                          ? HydraTokens.accentSuccess.withOpacity(0.88)
-                          : const Color(0xCC6D28D9),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: Text(
-                      isReady
-                          ? 'Instalado'
-                          : isDownloading
-                              ? LoopProgressIndicator.formatPercent(
-                                  status.progress,
-                                )
-                              : game.platformName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontFamily: 'ReadexPro',
-                        fontSize: 9.5,
-                        fontWeight: FontWeight.w700,
-                        color: Colors.white,
+                boxShadow: active ? PS5HydraTheme.glowFocus : null,
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(13),
+                child: Focus(
+                  onFocusChange: (hasFocus) {
+                    if (_focused != hasFocus) {
+                      setState(() => _focused = hasFocus);
+                    }
+                  },
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      ProceduralCover(
+                        title: widget.game.name,
+                        platformName: widget.game.platformName,
+                        imageUrl: widget.coverUrl ??
+                            widget.game.gridCoverUrl ??
+                            widget.game.resolvedGridCoverUrl,
+                        borderRadius: 0,
+                        compact: true,
+                        showBottomLabel: false,
                       ),
-                    ),
+                      const DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            stops: [0.30, 0.72, 1.0],
+                            colors: [
+                              Colors.transparent,
+                              Color(0xB8000000),
+                              Color(0xF5000000),
+                            ],
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        top: 8,
+                        right: 8,
+                        child: Container(
+                          constraints: const BoxConstraints(maxWidth: 112),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: PS5HydraTheme.obsidianGlass.withOpacity(0.88),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color: isReady
+                                  ? PS5HydraTheme.auroraSpringMint
+                                  : PS5HydraTheme.borderSubtle,
+                            ),
+                          ),
+                          child: Text(
+                            isReady
+                                ? 'Instalado'
+                                : isDownloading
+                                    ? LoopProgressIndicator.formatPercent(
+                                        widget.status.progress,
+                                      )
+                                    : widget.game.platformName,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontFamily: 'JetBrainsMono',
+                              fontSize: 9,
+                              fontWeight: FontWeight.w700,
+                              color: isReady
+                                  ? PS5HydraTheme.auroraSpringMint
+                                  : PS5HydraTheme.textPrimary,
+                            ),
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        left: 10,
+                        right: 10,
+                        bottom: 10,
+                        child: AnimatedGameLogo(
+                          game: widget.game,
+                          height: 24,
+                          maxWidthFraction: 1.0,
+                          enableStagger: false,
+                          maxLines: 1,
+                          fallbackStyle: const TextStyle(
+                            fontFamily: 'ReadexPro',
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            color: PS5HydraTheme.textPrimary,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                Positioned(
-                  left: 10,
-                  right: 10,
-                  bottom: 8,
-                  child: Text(
-                    game.name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontFamily: 'ReadexPro',
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
-                      color: Colors.white,
-                    ),
-                  ),
-                ),
-              ],
+              ),
             ),
           ),
         ),
@@ -2207,123 +1622,8 @@ class _GameHubLandscapeSecondaryCard extends StatelessWidget {
   }
 }
 
-/// Pôster Vertical da fileira "Destaques da Coleção" no Modo Portrait
-class _GameHubPortraitPosterItem extends StatelessWidget {
-  const _GameHubPortraitPosterItem({
-    required this.game,
-    required this.status,
-    required this.isSelected,
-    required this.onTap,
-  });
-
-  final EmulationGame game;
-  final RomDownloadStatus status;
-  final bool isSelected;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    final isReady = status.state == RomActionState.readyToPlay;
-    final isDownloading = status.state == RomActionState.downloading;
-
-    return Semantics(
-      button: true,
-      selected: isSelected,
-      label: '${game.name}, ${game.platformName}',
-      child: GestureDetector(
-        onTap: onTap,
-        child: SizedBox(
-          width: 116,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: HydraTokens.surfaceCatalog,
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(
-                      color: isSelected
-                          ? HydraTokens.primaryAurora.withOpacity(0.88)
-                          : Colors.white.withOpacity(0.10),
-                      width: isSelected ? 1.8 : 1.0,
-                    ),
-                    boxShadow: isSelected
-                        ? HydraTokens.neonBoxGlow(
-                            opacity: 0.16,
-                            blur: 10,
-                            color: HydraTokens.primaryAurora,
-                          )
-                        : null,
-                  ),
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(13),
-                    child: Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        LoopCoverImage(
-                          url: game.resolvedGridCoverUrl,
-                          fit: BoxFit.cover,
-                          preset: LoopCoverImagePreset.card,
-                        ),
-                        if (isDownloading)
-                          Positioned(
-                            left: 0,
-                            right: 0,
-                            bottom: 0,
-                            child: LoopProgressIndicator(
-                              progress: status.progress,
-                              showLabelRow: false,
-                              minHeight: 4,
-                              borderRadius: 0,
-                            ),
-                          ),
-                        if (isReady)
-                          Positioned(
-                            top: 6,
-                            right: 6,
-                            child: Container(
-                              padding: const EdgeInsets.all(4),
-                              decoration: BoxDecoration(
-                                color: Colors.black.withOpacity(0.75),
-                                shape: BoxShape.circle,
-                              ),
-                              child: PhosphorIcon(
-                                PhosphorIcons.checkCircle(
-                                  PhosphorIconsStyle.fill,
-                                ),
-                                size: 13,
-                                color: HydraTokens.accentSuccess,
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 7),
-              Text(
-                game.name,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  fontFamily: 'Rubik',
-                  fontSize: 12,
-                  fontWeight: FontWeight.w500,
-                  color: HydraTokens.textPrimary,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// Card de Capa Vertical Responsivo para Grades (Início e Catálogo)
-class RommCoverGridCard extends StatelessWidget {
+/// Card de Poster Vertical 3:4 minimalista estilo PS5 para Grades
+class RommCoverGridCard extends StatefulWidget {
   const RommCoverGridCard({
     super.key,
     required this.game,
@@ -2340,25 +1640,37 @@ class RommCoverGridCard extends StatelessWidget {
   final VoidCallback? onLongPress;
 
   @override
+  State<RommCoverGridCard> createState() => _RommCoverGridCardState();
+}
+
+class _RommCoverGridCardState extends State<RommCoverGridCard> {
+  bool _hovered = false;
+
+  @override
   Widget build(BuildContext context) {
+    final game = widget.game;
+    final status = widget.status;
     final isDownloaded =
         status.state == RomActionState.readyToPlay && status.localPath != null;
     final isDownloading = status.state == RomActionState.downloading;
     final isPaused = status.state == RomActionState.paused;
     final isExternal = game.directRomUrl.startsWith('external://');
+    final cachedCover = GameAssetService.instance
+        .getCachedAssets(game.name, platformSlug: game.platformSlug)
+        ?.coverImageUrl;
 
     final String actionTooltip;
     final PhosphorIconData actionIcon;
     final Color actionColor;
 
-    if (onActionTap == null) {
+    if (widget.onActionTap == null) {
       actionTooltip = 'Ver detalhes';
       actionIcon = PhosphorIcons.info(PhosphorIconsStyle.bold);
-      actionColor = HydraTokens.textSecondary;
+      actionColor = PS5HydraTheme.textSecondary;
     } else if (isDownloaded) {
       actionTooltip = 'Jogar Agora';
       actionIcon = PhosphorIcons.playCircle(PhosphorIconsStyle.fill);
-      actionColor = HydraTokens.textPrimary;
+      actionColor = PS5HydraTheme.auroraSpringMint;
     } else if (isDownloading) {
       actionTooltip = 'Cancelar download';
       actionIcon = PhosphorIcons.xCircle(PhosphorIconsStyle.fill);
@@ -2366,178 +1678,202 @@ class RommCoverGridCard extends StatelessWidget {
     } else if (isExternal) {
       actionTooltip = 'Ver detalhes';
       actionIcon = PhosphorIcons.info(PhosphorIconsStyle.bold);
-      actionColor = HydraTokens.textSecondary;
+      actionColor = PS5HydraTheme.textSecondary;
     } else if (isPaused) {
       actionTooltip = 'Continuar download';
       actionIcon = PhosphorIcons.play(PhosphorIconsStyle.fill);
-      actionColor = HydraTokens.primaryAurora;
+      actionColor = PS5HydraTheme.auroraSpringMint;
     } else {
       actionTooltip = 'Baixar ROM';
       actionIcon = PhosphorIcons.downloadSimple(PhosphorIconsStyle.bold);
-      actionColor = HydraTokens.textSecondary;
+      actionColor = PS5HydraTheme.textPrimary;
     }
 
-    return HydraTexturedCard(
-      backgroundColor: HydraTokens.bgNearBlack,
-      borderRadius: 14,
-      highlightedBorder: isDownloaded,
-      onTap: onTap,
-      onLongPress: onLongPress,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Expanded(
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                LoopCoverImage(
-                  url: game.resolvedGridCoverUrl,
-                  fit: BoxFit.cover,
-                  preset: LoopCoverImagePreset.card,
-                ),
-                if (isDownloaded)
-                  Positioned(
-                    top: 8,
-                    right: 8,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 7,
-                        vertical: 3,
-                      ),
-                      decoration: BoxDecoration(
-                        color: HydraTokens.bgPureBlack.withOpacity(0.88),
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(
-                          color: Colors.white.withOpacity(0.35),
-                        ),
-                      ),
-                      child: const Text(
-                        'INSTALADO',
-                        style: TextStyle(
-                          fontFamily: 'JetBrainsMono',
-                          fontSize: 8.5,
-                          fontWeight: FontWeight.w700,
-                          color: Colors.white,
-                        ),
-                      ),
-                    ),
-                  ),
-                if (isDownloading)
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    bottom: 0,
-                    child: Container(
-                      padding: const EdgeInsets.all(8),
-                      color: Colors.black.withOpacity(0.82),
-                      child: LoopProgressIndicator(
-                        progress: status.progress,
-                        label: 'Baixando...',
-                        minHeight: 4,
-                        borderRadius: 4,
-                      ),
-                    ),
-                  ),
-              ],
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: AnimatedScale(
+        scale: _hovered ? 1.04 : 1.0,
+        duration: PS5HydraTheme.animFast,
+        curve: Curves.easeOut,
+        child: Container(
+          decoration: BoxDecoration(
+            color: PS5HydraTheme.obsidianGlass,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: (isDownloaded || _hovered)
+                  ? PS5HydraTheme.auroraSpringMint
+                  : PS5HydraTheme.borderSubtle,
+              width: (isDownloaded || _hovered) ? 1.8 : 1.0,
             ),
+            boxShadow: _hovered ? PS5HydraTheme.glowFocus : null,
           ),
-          Container(
-            padding: const EdgeInsets.fromLTRB(10, 6, 2, 6),
-            decoration: const BoxDecoration(
-              color: HydraTokens.bgNearBlack,
-              border: Border(
-                top: BorderSide(color: HydraTokens.borderSubtle8),
-              ),
-            ),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        game.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontFamily: 'ReadexPro',
-                          fontSize: 12.5,
-                          fontWeight: FontWeight.w600,
-                          color: HydraTokens.textPrimary,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(12.5),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: widget.onTap,
+                onLongPress: widget.onLongPress,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    ProceduralCover(
+                      title: game.name,
+                      platformName: game.platformName,
+                      imageUrl: cachedCover ??
+                          game.gridCoverUrl ??
+                          game.resolvedGridCoverUrl,
+                      borderRadius: 0,
+                      compact: true,
+                      showBottomLabel: false,
+                    ),
+                    const DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          stops: [0.35, 0.72, 1.0],
+                          colors: [
+                            Colors.transparent,
+                            Color(0x9E000000),
+                            Color(0xF5000000),
+                          ],
                         ),
                       ),
-                      const SizedBox(height: 5),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Align(
-                              alignment: Alignment.centerLeft,
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 6,
-                                  vertical: 2,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: Colors.white.withOpacity(0.08),
-                                  borderRadius: BorderRadius.circular(4),
-                                ),
-                                child: Text(
-                                  game.platformName,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    fontFamily: 'JetBrainsMono',
-                                    fontSize: 9,
-                                    fontWeight: FontWeight.w700,
-                                    color: HydraTokens.textPrimary,
+                    ),
+                    if (isDownloaded)
+                      Positioned(
+                        top: 8,
+                        right: 8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 7,
+                            vertical: 2.5,
+                          ),
+                          decoration: BoxDecoration(
+                            color: PS5HydraTheme.auroraSpringMint,
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: const Text(
+                            'INSTALADO',
+                            style: TextStyle(
+                              fontFamily: 'JetBrainsMono',
+                              fontSize: 8.5,
+                              fontWeight: FontWeight.w700,
+                              color: PS5HydraTheme.textOnAurora,
+                            ),
+                          ),
+                        ),
+                      )
+                    else
+                      Positioned(
+                        top: 8,
+                        left: 8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: PS5HydraTheme.pitchBlack.withOpacity(0.75),
+                            borderRadius: BorderRadius.circular(5),
+                            border: Border.all(
+                              color: Colors.white.withOpacity(0.14),
+                            ),
+                          ),
+                          child: Text(
+                            game.platformName,
+                            style: PS5HydraTheme.metaMonoStyle.copyWith(
+                              fontSize: 9,
+                              color: PS5HydraTheme.textPrimary,
+                            ),
+                          ),
+                        ),
+                      ),
+                    if (isDownloading)
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: 0,
+                        child: Container(
+                          padding: const EdgeInsets.all(8),
+                          color: Colors.black.withOpacity(0.86),
+                          child: LoopProgressIndicator(
+                            progress: status.progress,
+                            label: 'Baixando...',
+                            minHeight: 4,
+                            borderRadius: 4,
+                          ),
+                        ),
+                      )
+                    else
+                      Positioned(
+                        left: 10,
+                        right: 6,
+                        bottom: 8,
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  AnimatedGameLogo(
+                                    game: game,
+                                    height: 22,
+                                    maxWidthFraction: 1.0,
+                                    enableStagger: false,
+                                    maxLines: 1,
+                                    fallbackStyle: const TextStyle(
+                                      fontFamily: 'ReadexPro',
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w700,
+                                      color: PS5HydraTheme.textPrimary,
+                                    ),
                                   ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    game.formattedSize,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: PS5HydraTheme.metaMonoStyle.copyWith(
+                                      fontSize: 9.5,
+                                      color: PS5HydraTheme.textSecondary,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            Semantics(
+                              button: true,
+                              label: '$actionTooltip: ${game.name}',
+                              child: IconButton(
+                                tooltip: actionTooltip,
+                                visualDensity: VisualDensity.compact,
+                                constraints: const BoxConstraints(
+                                  minWidth: 36,
+                                  minHeight: 36,
+                                ),
+                                padding: EdgeInsets.zero,
+                                onPressed: widget.onActionTap ?? widget.onTap,
+                                icon: PhosphorIcon(
+                                  actionIcon,
+                                  color: actionColor,
+                                  size: 18,
                                 ),
                               ),
                             ),
-                          ),
-                          const SizedBox(width: 6),
-                          Text(
-                            isDownloading
-                                ? LoopProgressIndicator.formatPercent(
-                                    status.progress,
-                                  )
-                                : game.formattedSize,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontFamily: 'Rubik',
-                              fontSize: 10.5,
-                              color: HydraTokens.textSecondary,
-                            ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
-                    ],
-                  ),
+                  ],
                 ),
-                Semantics(
-                  button: true,
-                  label: '$actionTooltip: ${game.name}',
-                  child: IconButton(
-                    tooltip: actionTooltip,
-                    constraints: const BoxConstraints(
-                      minWidth: 48,
-                      minHeight: 48,
-                    ),
-                    padding: EdgeInsets.zero,
-                    onPressed: onActionTap ?? onTap,
-                    icon: PhosphorIcon(
-                      actionIcon,
-                      color: actionColor,
-                      size: 18,
-                    ),
-                  ),
-                ),
-              ],
+              ),
             ),
           ),
-        ],
+        ),
       ),
     );
   }

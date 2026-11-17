@@ -563,40 +563,86 @@ class EmulatorService {
   static const String _dolphinSysUrl =
       'https://buildbot.libretro.com/assets/system/Dolphin.zip';
 
-  Future<void> _ensureDolphinSys(Directory systemDir) async {
-    final tmpZip = File('${systemDir.path}/dolphin_sys.zip.part');
+  static const String _ppssppSysUrl =
+      'https://buildbot.libretro.com/assets/system/PPSSPP.zip';
+
+  /// BIOS do PC Engine CD (Super CD-ROM² System v3.0) exigida pelo core
+  /// Beetle PCE Fast para imagens de CD (.chd/.cue/.iso). Jogos HuCard (.pce)
+  /// não precisam de BIOS. MD5 oficial: 38179df8f4ac870017db21ebcbf53114.
+  static const String _pceCdBiosUrl =
+      'https://raw.githubusercontent.com/archtaurus/RetroPieBIOS/master/BIOS/syscard3.pce';
+
+  static const int _pceCdBiosMinBytes = 256 * 1024 - 4096;
+
+  static const String _ppssppAssetsMissingMessage =
+      'Não foi possível preparar os arquivos de sistema do PPSSPP. '
+      'Sem eles (fontes, shaders e compat.ini) os jogos de PSP não inicializam. '
+      'Verifique sua conexão e tente novamente.';
+
+  static const String _dolphinSysMissingMessage =
+      'Não foi possível preparar os arquivos de sistema do Dolphin (Wii / GameCube). '
+      'Sem eles o jogo fecha sozinho na inicialização. Verifique sua conexão e tente novamente.';
+
+  /// Confere se os assets oficiais do Dolphin já estão instalados.
+  ///
+  /// O marcador `Sys/codehandler.bin` é um arquivo real do pacote oficial
+  /// `Dolphin.zip` do buildbot do Libretro.
+  static Future<bool> _hasDolphinSys(Directory systemDir) async {
+    final marker = File('${systemDir.path}/dolphin-emu/Sys/codehandler.bin');
     try {
-      final marker = File('${systemDir.path}/dolphin-emu/Sys/codehandler.bin');
-      if (await marker.exists() && await marker.length() > 100) {
-        return;
-      }
-      await _dio
-          .download(
-            _dolphinSysUrl,
-            tmpZip.path,
-            options: Options(
-              receiveTimeout: const Duration(seconds: 40),
-              sendTimeout: const Duration(seconds: 12),
-            ),
-          )
-          .timeout(const Duration(seconds: 45));
-      if (!await tmpZip.exists() || await tmpZip.length() < 100 * 1024) {
-        return;
-      }
-      final tmpPath = tmpZip.path;
-      final sysPath = systemDir.path;
-      await _runExtractDolphinAssetsInIsolate(tmpPath, sysPath);
+      return await marker.exists() && await marker.length() > 100;
     } catch (e) {
-      debugPrint('[EmulatorService] Falha ao baixar/extrair Dolphin Sys: $e');
-    } finally {
-      try {
-        if (await tmpZip.exists()) {
-          await tmpZip.delete();
-        }
-      } catch (e) {
-        debugPrint('[EmulatorService] Falha ao limpar zip do Dolphin Sys: $e');
-      }
+      debugPrint('[EmulatorService] Falha ao verificar Dolphin Sys: $e');
+      return false;
     }
+  }
+
+  /// Baixa e extrai os assets do Dolphin, com uma nova tentativa em caso de
+  /// falha. Lança [StateError] quando os arquivos continuam ausentes, para que
+  /// a tela do jogo mostre o motivo em vez de fechar silenciosamente.
+  Future<void> _ensureDolphinSys(Directory systemDir) async {
+    if (await _hasDolphinSys(systemDir)) return;
+
+    final tmpZip = File('${systemDir.path}/dolphin_sys.zip.part');
+    Object? lastError;
+    for (var attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await _dio
+            .download(
+              _dolphinSysUrl,
+              tmpZip.path,
+              options: Options(
+                receiveTimeout: const Duration(seconds: 60),
+                sendTimeout: const Duration(seconds: 15),
+              ),
+            )
+            .timeout(const Duration(seconds: 180));
+        if (!await tmpZip.exists() || await tmpZip.length() < 100 * 1024) {
+          throw StateError('pacote Dolphin Sys incompleto ou pequeno demais');
+        }
+        await _runExtractDolphinAssetsInIsolate(tmpZip.path, systemDir.path);
+      } catch (e) {
+        lastError = e;
+        debugPrint(
+          '[EmulatorService] Falha ao preparar Dolphin Sys (tentativa $attempt/2): $e',
+        );
+      } finally {
+        try {
+          if (await tmpZip.exists()) {
+            await tmpZip.delete();
+          }
+        } catch (e) {
+          debugPrint('[EmulatorService] Falha ao limpar zip do Dolphin Sys: $e');
+        }
+      }
+      if (await _hasDolphinSys(systemDir)) return;
+    }
+
+    throw StateError(
+      lastError == null
+          ? _dolphinSysMissingMessage
+          : '$_dolphinSysMissingMessage ($lastError)',
+    );
   }
 
   static Future<void> _runExtractDolphinAssetsInIsolate(
@@ -634,6 +680,161 @@ class EmulatorService {
         continue;
       }
       outFile.writeAsBytesSync(entry.content as List<int>, flush: true);
+    }
+  }
+
+  /// Confere se os assets oficiais do PPSSPP já estão instalados.
+  ///
+  /// O marcador `PPSSPP/flash0/font/jpn0.pgf` é um arquivo real do pacote
+  /// oficial `PPSSPP.zip` do buildbot do Libretro.
+  static Future<bool> _hasPpssppAssets(Directory systemDir) async {
+    final marker = File('${systemDir.path}/PPSSPP/flash0/font/jpn0.pgf');
+    try {
+      return await marker.exists() && await marker.length() > 1000;
+    } catch (e) {
+      debugPrint('[EmulatorService] Falha ao verificar assets PPSSPP: $e');
+      return false;
+    }
+  }
+
+  /// Baixa e extrai os assets do PPSSPP (fontes, shaders, compat.ini, lang),
+  /// sem os quais o core `ppsspp_libretro_android.so` não inicializa jogos.
+  /// Lança [StateError] quando os arquivos continuam ausentes, para que a
+  /// tela do jogo mostre o motivo em vez de fechar silenciosamente.
+  Future<void> _ensurePpssppAssets(Directory systemDir) async {
+    if (await _hasPpssppAssets(systemDir)) return;
+
+    final tmpZip = File('${systemDir.path}/ppsspp_sys.zip.part');
+    Object? lastError;
+    for (var attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await _dio
+            .download(
+              _ppssppSysUrl,
+              tmpZip.path,
+              options: Options(
+                receiveTimeout: const Duration(seconds: 60),
+                sendTimeout: const Duration(seconds: 15),
+              ),
+            )
+            .timeout(const Duration(seconds: 180));
+        if (!await tmpZip.exists() || await tmpZip.length() < 1024 * 1024) {
+          throw StateError('pacote PPSSPP Sys incompleto ou pequeno demais');
+        }
+        await _runExtractPpssppAssetsInIsolate(tmpZip.path, systemDir.path);
+      } catch (e) {
+        lastError = e;
+        debugPrint(
+          '[EmulatorService] Falha ao preparar assets PPSSPP (tentativa $attempt/2): $e',
+        );
+      } finally {
+        try {
+          if (await tmpZip.exists()) {
+            await tmpZip.delete();
+          }
+        } catch (e) {
+          debugPrint('[EmulatorService] Falha ao limpar zip do PPSSPP: $e');
+        }
+      }
+      if (await _hasPpssppAssets(systemDir)) return;
+    }
+
+    throw StateError(
+      lastError == null
+          ? _ppssppAssetsMissingMessage
+          : '$_ppssppAssetsMissingMessage ($lastError)',
+    );
+  }
+
+  static Future<void> _runExtractPpssppAssetsInIsolate(
+    String zipPath,
+    String systemDirPath,
+  ) {
+    return Isolate.run(() => _extractPpssppAssetsSync(zipPath, systemDirPath));
+  }
+
+  /// Extrai `PPSSPP.zip` (raiz `PPSSPP/...`) dentro de `systemDir`, mantendo
+  /// os caminhos relativos — o resultado final é `systemDir/PPSSPP/...`,
+  /// que é exatamente onde o core libretro PPSSPP procura os assets.
+  static void _extractPpssppAssetsSync(String zipPath, String systemDirPath) {
+    final bytes = File(zipPath).readAsBytesSync();
+    final archive = ZipDecoder().decodeBytes(bytes);
+    final rootDir = Directory(systemDirPath);
+    if (!rootDir.existsSync()) {
+      rootDir.createSync(recursive: true);
+    }
+    final canonicalRoot = rootDir.resolveSymbolicLinksSync();
+    final prefix = canonicalRoot.endsWith(Platform.pathSeparator)
+        ? canonicalRoot
+        : '$canonicalRoot${Platform.pathSeparator}';
+
+    var extracted = 0;
+    for (final entry in archive) {
+      if (!entry.isFile) continue;
+      final normalized = entry.name.replaceAll('\\', '/');
+      if (normalized.contains('..') || normalized.startsWith('/')) continue;
+      final relPath = normalized.startsWith('PPSSPP/')
+          ? normalized
+          : 'PPSSPP/$normalized';
+      final outFile = File('${rootDir.path}/$relPath');
+      outFile.parent.createSync(recursive: true);
+      final parentCanonical = outFile.parent.resolveSymbolicLinksSync();
+      if (parentCanonical != canonicalRoot &&
+          !parentCanonical.startsWith(prefix)) {
+        continue;
+      }
+      outFile.writeAsBytesSync(entry.content as List<int>, flush: true);
+      extracted++;
+    }
+    if (extracted == 0) {
+      throw StateError('Pacote PPSSPP Sys não continha arquivos válidos.');
+    }
+  }
+
+  /// Garante `syscard3.pce` para jogos de PC Engine CD. Falhas de download
+  /// não bloqueiam o boot (o core exibe seu próprio erro de BIOS
+  /// ausente) — apenas registra no log.
+  Future<void> _ensurePceCdBios(Directory systemDir, String romPath) async {
+    final lower = romPath.toLowerCase();
+    final isCdImage = lower.endsWith('.chd') ||
+        lower.endsWith('.cue') ||
+        lower.endsWith('.ccd') ||
+        lower.endsWith('.toc') ||
+        lower.endsWith('.m3u') ||
+        lower.endsWith('.iso') ||
+        lower.endsWith('.img') ||
+        lower.endsWith('.bin');
+    if (!isCdImage) return;
+
+    try {
+      final biosFile = File('${systemDir.path}/syscard3.pce');
+      if (await biosFile.exists() &&
+          await biosFile.length() >= _pceCdBiosMinBytes) {
+        return;
+      }
+      final tmpFile = File('${biosFile.path}.part');
+      await _dio
+          .download(
+            _pceCdBiosUrl,
+            tmpFile.path,
+            options: Options(
+              receiveTimeout: const Duration(seconds: 20),
+              sendTimeout: const Duration(seconds: 10),
+            ),
+          )
+          .timeout(const Duration(seconds: 60));
+      if (await tmpFile.exists() &&
+          await tmpFile.length() >= _pceCdBiosMinBytes) {
+        await tmpFile.rename(biosFile.path);
+      } else {
+        try {
+          if (await tmpFile.exists()) await tmpFile.delete();
+        } catch (_) {}
+      }
+    } catch (e) {
+      debugPrint(
+        '[EmulatorService] Falha ao preparar syscard3.pce (BIOS PC Engine CD): $e',
+      );
     }
   }
 
@@ -943,6 +1144,9 @@ class EmulatorService {
     void Function(double coreProgress)? onCoreDownloadProgress,
   }) async {
     final serializedCoreOptions = serializeCoreOptions(coreOptions);
+    debugPrint(
+      '[Session] platform=$platformSlug core=$coreSoName rom=$romPath',
+    );
     final systemDir = await getApplicationSupportDirectory();
     final savesDir = await _savesDirectory();
     final lowerPlatform = platformSlug.toLowerCase();
@@ -974,6 +1178,17 @@ class EmulatorService {
         lowerPlatform == 'gamecube' ||
         lowerPlatform == 'wii') {
       await _ensureDolphinSys(systemDir);
+    }
+
+    // Para PC Engine CD (Beetle PCE Fast), garante a BIOS syscard3.pce
+    if (lowerPlatform == 'pce') {
+      await _ensurePceCdBios(systemDir, romPath);
+    }
+
+    // Para PSP (PPSSPP), instala os assets oficiais do sistema (fontes,
+    // shaders, compat.ini) — sem eles o core não inicializa nenhum jogo.
+    if (lowerPlatform == 'psp') {
+      await _ensurePpssppAssets(systemDir);
     }
 
     // Garante inicialização do PPSSPP com backend alinhado ao modo escolhido

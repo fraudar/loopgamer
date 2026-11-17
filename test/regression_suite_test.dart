@@ -20,6 +20,8 @@ import 'package:loopgamer/services/library_storage_service.dart';
 import 'package:loopgamer/services/rom_download_service.dart';
 import 'package:loopgamer/services/settings_storage_service.dart';
 import 'package:loopgamer/theme/hydra_tokens.dart';
+import 'package:loopgamer/widgets/animated_game_logo.dart';
+import 'package:loopgamer/widgets/procedural_cover.dart';
 
 typedef _AdapterHandler = Future<ResponseBody> Function(
   RequestOptions options,
@@ -545,6 +547,7 @@ void main() {
       _setupTempSupportDir();
 
       int requestCount = 0;
+      final firstRequestStarted = Completer<void>();
       final firstRequestPaused = Completer<void>();
       final allowSecondFinish = Completer<void>();
       final firstStreamController = StreamController<Uint8List>();
@@ -553,6 +556,9 @@ void main() {
       dio.httpClientAdapter = _AsyncFakeHttpAdapter((options, cancelFuture) async {
         requestCount++;
         if (requestCount == 1) {
+          if (!firstRequestStarted.isCompleted) {
+            firstRequestStarted.complete();
+          }
           unawaited(
             cancelFuture?.then((_) {
               if (!firstRequestPaused.isCompleted) {
@@ -605,7 +611,11 @@ void main() {
       );
 
       final firstFuture = service.startBackgroundDownload(game: game);
-      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      // Espera a primeira requisição HTTP realmente iniciar antes de pausar —
+      // sem isso a pausa pode cair na janela de startup e o teste fica
+      // dependente de timing.
+      await firstRequestStarted.future;
 
       // Pause and IMMEDIATELY resume before op1 finishes unwinding
       service.pauseDownload(game.igdbId);
@@ -774,7 +784,7 @@ void main() {
     testWidgets('HomeScreen renders loading, error+retry and empty states cleanly', (
       WidgetTester tester,
     ) async {
-      tester.view.physicalSize = const Size(412, 915);
+      tester.view.physicalSize = const Size(915, 412);
       tester.view.devicePixelRatio = 1.0;
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
@@ -1045,75 +1055,76 @@ void main() {
       },
     );
 
-    testWidgets('LibraryScreen portrait renders compact single-row cards', (
-      WidgetTester tester,
-    ) async {
-      tester.view.physicalSize = const Size(412, 915);
-      tester.view.devicePixelRatio = 1.0;
-      addTearDown(tester.view.resetPhysicalSize);
-      addTearDown(tester.view.resetDevicePixelRatio);
+    testWidgets(
+      'LibraryScreen landscape renders 3:4 vertical carousel cards and launches ready game',
+      (WidgetTester tester) async {
+        tester.view.physicalSize = const Size(915, 412);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
 
-      final readyGame = _makeTestGame(
-        id: 101,
-        name: 'Chrono Adventure',
-        localRomPath: '/tmp/chrono.gba',
-      );
-      final downloadingGame = _makeTestGame(
-        id: 102,
-        name: 'Tactics Advance',
-      );
+        final readyGame = _makeTestGame(
+          id: 101,
+          name: 'Chrono Adventure',
+          localRomPath: '/tmp/chrono.gba',
+        );
+        final downloadingGame = _makeTestGame(
+          id: 102,
+          name: 'Tactics Advance',
+        );
 
-      EmulationGame? launchedGame;
-      String? launchedPath;
-      const meta = UserLibraryMeta(
-        favorites: {101},
-        playtime: {
-          101: PlaytimeRecord(totalSeconds: 42 * 60, sessions: 1),
-        },
-      );
+        EmulationGame? launchedGame;
+        String? launchedPath;
+        const meta = UserLibraryMeta(
+          favorites: {101},
+          playtime: {
+            101: PlaytimeRecord(totalSeconds: 42 * 60, sessions: 1),
+          },
+        );
 
-      await tester.pumpWidget(
-        MaterialApp(
-          theme: HydraTokens.buildAppTheme(),
-          home: LibraryScreen(
-            downloadedGames: [readyGame],
-            downloadingGames: [downloadingGame],
-            downloadStatuses: const {
-              102: RomDownloadStatus(
-                state: RomActionState.downloading,
-                progress: 0.45,
-                speedLabel: '2.4 MB/s',
-              ),
-            },
-            userMeta: meta,
-            onImportNewRomPressed: () {},
-            onLaunchGame: (g, p) {
-              launchedGame = g;
-              launchedPath = p;
-            },
-            onRemoveGame: (_) async {},
-            onCancelDownload: (_) {},
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: HydraTokens.buildAppTheme(),
+            home: LibraryScreen(
+              downloadedGames: [readyGame],
+              downloadingGames: [downloadingGame],
+              downloadStatuses: const {
+                102: RomDownloadStatus(
+                  state: RomActionState.downloading,
+                  progress: 0.45,
+                  speedLabel: '2.4 MB/s',
+                ),
+              },
+              userMeta: meta,
+              onImportNewRomPressed: () {},
+              onLaunchGame: (g, p) {
+                launchedGame = g;
+                launchedPath = p;
+              },
+              onRemoveGame: (_) async {},
+              onCancelDownload: (_) {},
+            ),
           ),
-        ),
-      );
+        );
+        await tester.pump(const Duration(milliseconds: 350));
 
-      expect(find.text('Chrono Adventure'), findsOneWidget);
-      expect(find.text('Tactics Advance'), findsOneWidget);
-      expect(find.text('Jogar'), findsOneWidget);
-      expect(find.text('Cancelar'), findsOneWidget);
+        expect(find.text('Chrono Adventure'), findsAtLeastNWidgets(1));
+        expect(find.text('Tactics Advance'), findsAtLeastNWidgets(1));
+        expect(find.byType(ProceduralCover), findsAtLeastNWidgets(2));
+        expect(find.byType(AnimatedGameLogo), findsAtLeastNWidgets(1));
+        expect(find.text('Cancelar'), findsOneWidget);
 
-      final cardFinder = find.ancestor(
-        of: find.text('Chrono Adventure'),
-        matching: find.byType(HydraTexturedCard),
-      );
-      expect(cardFinder, findsOneWidget);
-      expect(tester.getSize(cardFinder).height, lessThanOrEqualTo(112.0));
+        // Seleciona o card do jogo pronto e clica em Jogar
+        await tester.tap(find.text('Chrono Adventure').first);
+        await tester.pump(const Duration(milliseconds: 350));
+        expect(find.text('Jogar'), findsOneWidget);
 
-      await tester.tap(find.text('Jogar'));
-      await tester.pump();
-      expect(launchedGame?.igdbId, 101);
-      expect(launchedPath, '/tmp/chrono.gba');
-    });
+        await tester.tap(find.text('Jogar'));
+        await tester.pump();
+        expect(launchedGame?.igdbId, 101);
+        expect(launchedPath, '/tmp/chrono.gba');
+      },
+    );
 
     testWidgets(
       'LoopGamerApp landscape floating top bar reflects native Wi-Fi status',

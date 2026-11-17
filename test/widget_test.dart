@@ -2,12 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:loopgamer/main.dart';
 import 'package:loopgamer/screens/home_screen.dart';
+import 'package:loopgamer/widgets/animated_game_logo.dart';
 
 void main() {
-  testWidgets('LoopGamer GameHub Portrait & Landscape smoke test', (
+  testWidgets('LoopGamer GameHub Horizontal Console-First smoke test', (
     WidgetTester tester,
   ) async {
-    // 1. Testa Modo Deitado (Landscape - 915x412)
+    // Modo Horizontal Exclusivo (Landscape Console-First - 915x412)
     tester.view.physicalSize = const Size(915, 412);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
@@ -16,7 +17,8 @@ void main() {
     await tester.pumpWidget(const LoopGamerApp());
     expect(find.text('LOOPGAMER'), findsOneWidget);
     expect(find.text('Destaques da Coleção'), findsOneWidget);
-    expect(find.text('Continuar jogando'), findsOneWidget);
+    expect(find.byType(AnimatedGameLogo), findsAtLeastNWidgets(1));
+    expect(find.byType(AnimatedPositioned), findsAtLeastNWidgets(1));
 
     final homeVerticalScrollable = find
         .descendant(
@@ -26,6 +28,14 @@ void main() {
           ),
         )
         .first;
+    await tester.scrollUntilVisible(
+      find.text('Continuar jogando'),
+      180,
+      scrollable: homeVerticalScrollable,
+    );
+    expect(find.text('Continuar jogando'), findsOneWidget);
+    expect(find.text('Nenhum jogo em andamento'), findsOneWidget);
+
     await tester.scrollUntilVisible(
       find.text('Catálogo por Console'),
       200,
@@ -54,15 +64,14 @@ void main() {
     await tester.pump();
     expect(find.text('Configurações'), findsOneWidget);
 
-    // 2. Gira para Modo em Pé (Portrait - 412x915)
-    tester.view.physicalSize = const Size(412, 915);
-    await tester.pump();
-
     await tester.tap(find.text('Início'));
     await tester.pump();
-    expect(find.text('Encontre seu jogo...'), findsOneWidget);
-    expect(find.text('Player Rating'), findsOneWidget);
-    final portraitTitle = tester.widget<Text>(find.text('LOOPGAMER'));
-    expect(portraitTitle.style?.fontFamily, 'PressStart2P');
+    await tester.scrollUntilVisible(
+      find.text('LOOPGAMER'),
+      -200,
+      scrollable: homeVerticalScrollable,
+    );
+    final title = tester.widget<Text>(find.text('LOOPGAMER'));
+    expect(title.style?.fontFamily, 'PressStart2P');
   });
 }
