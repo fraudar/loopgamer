@@ -16,8 +16,13 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <mutex>
+#include <cctype>
+#include <cstdio>
 #include <string>
+#include <strings.h>
 #include <sys/stat.h>
+#include <sys/system_properties.h>
+#include <unistd.h>
 #include <vector>
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_android.h>
@@ -286,6 +291,50 @@ void apply_freedreno_env() {
   }
 }
 
+#if defined(LOOPGAMER_HAS_ADRENOTOOLS)
+bool contains_ci(const std::string& haystack, const char* needle) {
+  std::string lower(haystack);
+  std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return lower.find(needle) != std::string::npos;
+}
+
+// O pacote AdrenoTools declara o fornecedor em meta.json: Turnip é "Mesa".
+// Pacotes sem meta.json (gerado pelo app) caem para o nome da biblioteca.
+bool custom_driver_is_mesa(const std::string& dir, const std::string& lib) {
+  if (contains_ci(lib, "turnip") || contains_ci(lib, "freedreno")) return true;
+  FILE* f = fopen((dir + "meta.json").c_str(), "r");
+  if (!f) return false;
+  char json[4096];
+  const size_t n = fread(json, 1, sizeof(json) - 1, f);
+  fclose(f);
+  json[n] = '\0';
+  const char* v = strstr(json, "\"vendor\"");
+  v = v ? strchr(v + 8, ':') : nullptr;
+  v = v ? strchr(v, '"') : nullptr;
+  return v && strncasecmp(v + 1, "mesa\"", 5) == 0;
+}
+
+// Prioridade KGSL dos draw contexts do Turnip (técnica do hakuX). O Turnip deixa
+// a prioridade padrão do kernel (8: terceiro ringbuffer), abaixo da composição
+// GPU do SurfaceFlinger; quando o compositor preempta um passo sysmem em voo no
+// Adreno 6xx a GPU trava (VK_ERROR_DEVICE_LOST). Prioridade 7 coloca nossos
+// contextos no ringbuffer do compositor, sem preempção mútua, e ainda deixa o
+// compositor rodar primeiro. `debug.loopgamer.kgslprio`: 1..15, ou 0 para
+// manter a escolha do driver.
+int kgsl_context_priority(const std::string& dir, const std::string& lib) {
+  if (access("/dev/kgsl-3d0", F_OK) != 0) return -1;
+  if (!custom_driver_is_mesa(dir, lib)) return -1;
+  char prop[PROP_VALUE_MAX] = {0};
+  int prio = 7;
+  if (__system_property_get("debug.loopgamer.kgslprio", prop) > 0) {
+    prio = atoi(prop);
+  }
+  return (prio >= 1 && prio <= 15) ? prio : -1;
+}
+#endif
+
 void close_loader_lib() {
   if (g_fn.lib) {
     dlclose(g_fn.lib);
@@ -323,10 +372,17 @@ bool load_loader() {
         redirectDir.clear();
       }
     }
-    VK_LOGI("Tentando carregar driver Vulkan custom via adrenotools: %s%s (redirect=%s preset=%s)",
+    const int kgslPrio =
+        kgsl_context_priority(g_customDriverDir, g_customDriverName);
+    adrenotools_set_kgsl_context_priority(kgslPrio);
+    if (kgslPrio > 0) {
+      flags |= ADRENOTOOLS_DRIVER_KGSL_CONTEXT_PRIORITY;
+    }
+    VK_LOGI("Tentando carregar driver Vulkan custom via adrenotools: %s%s (redirect=%s preset=%s kgslPrio=%d)",
             g_customDriverDir.c_str(), g_customDriverName.c_str(),
             redirectDir.empty() ? "none" : redirectDir.c_str(),
-            g_freedrenoPreset.empty() ? "default" : g_freedrenoPreset.c_str());
+            g_freedrenoPreset.empty() ? "default" : g_freedrenoPreset.c_str(),
+            kgslPrio);
     g_fn.lib = adrenotools_open_libvulkan(
         RTLD_NOW,
         flags,

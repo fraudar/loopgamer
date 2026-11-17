@@ -412,6 +412,12 @@ void main() {
         ..writeAsBytesSync(fakeElf);
       expect(pspCore.existsSync(), isTrue);
 
+      // O boot de PSP exige os assets oficiais do PPSSPP em system/PPSSPP —
+      // semeia o marcador para o teste não depender de rede.
+      File('${root.path}/PPSSPP/flash0/font/jpn0.pgf')
+        ..parent.createSync(recursive: true)
+        ..writeAsBytesSync(Uint8List(2048));
+
       const settings = AppSettings();
       expect(settings.libretroCoreOptions['ppsspp_fast_memory'], 'enabled');
       expect(
