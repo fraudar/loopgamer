@@ -3,9 +3,7 @@ import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:phosphor_flutter/phosphor_flutter.dart';
 import '../models/emulation_game.dart';
-import '../theme/hydra_tokens.dart';
 
 /// Presets de resolução para decodificação em memória de [LoopCoverImage].
 enum LoopCoverImagePreset {
@@ -448,22 +446,27 @@ class _LoopCoverImageState extends State<LoopCoverImage> {
     return Container(
       width: widget.width,
       height: widget.height,
-      decoration: BoxDecoration(
-        color: HydraTokens.surfaceElevated1,
+      decoration: const BoxDecoration(
+        color: Color(0xFF121216),
         gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
           colors: [
-            Colors.white.withOpacity(0.08),
-            Colors.black.withOpacity(0.65),
+            Color(0xFF18181D),
+            Color(0xFF0B0B0D),
           ],
         ),
       ),
       child: Center(
-        child: PhosphorIcon(
-          PhosphorIcons.gameController(PhosphorIconsStyle.bold),
-          size: 22,
-          color: Colors.white.withOpacity(0.35),
+        child: Container(
+          width: 24,
+          height: 32,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(
+              color: Colors.white.withOpacity(0.10),
+            ),
+          ),
         ),
       ),
     );

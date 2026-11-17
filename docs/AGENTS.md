@@ -6,7 +6,7 @@ Emulador libretro Android em Flutter. Antes de alterar código, leia [BACKEND.md
 
 ```bash
 flutter analyze     # deve sair "No issues found!" (regras estritas em analysis_options.yaml)
-flutter test        # executa toda a suíte (32 testes: widget, core fixes e regressões)
+flutter test        # executa toda a suíte (88 testes: widget, core fixes, regressões e detecção de plataforma)
 ./build-apk.sh      # gera loopgamer-release.apk (arm64-v8a + R8 minify/shrink, toolchain portátil)
 ```
 
@@ -45,7 +45,7 @@ Flutter (`lib/main.dart`, screens, `LoopCommonWidgets`, `HydraTokens`) → servi
 
 ## Estado atual / pendências
 
-- Código Flutter, serviços, testes (`32` passando em `flutter test`), C++ (clang++ / NDK 27) e APK release (`loopgamer-release.apk`, `arm64-v8a` com R8) compilam e passam sem warnings no `flutter analyze`.
+- Código Flutter, serviços, testes (`88` passando em `flutter test`), C++ (clang++ / NDK 27) e APK release (`loopgamer-release.apk`, `arm64-v8a` com R8) compilam e passam sem warnings no `flutter analyze`.
 - **Pendente validação em device físico ARM64**: runtime Vulkan (especialmente `create_device` do PPSSPP, drivers custom Turnip/AdrenoTools e recuperação de `VK_ERROR_SURFACE_LOST_KHR` / `VK_ERROR_DEVICE_LOST`) e teste em aparelho do `EmulationForegroundService` em Android 14+.
 - **Frame dup 60Hz no Vulkan**: frames `nullptr` consomem/sinalizam `signalSem` via `consume_signal_semaphore()` sem duplicar blit/present no swapchain.
 - **`ppsspp_*` core options**: `AppSettings.libretroCoreOptions` serializa `k=v;k=v` (validado contra `=`, `;`, `\n`, `\r` em `EmulatorService.serializeCoreOptions`), protegidos por `g_state_mutex` + `g_returnedVarStrings` em `libretro_jni.cpp` com fallbacks internos em `get_core_variable()`.

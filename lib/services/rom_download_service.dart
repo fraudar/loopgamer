@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 import 'package:archive/archive_io.dart';
@@ -10,6 +11,7 @@ import 'package:path_provider/path_provider.dart';
 import '../models/emulation_game.dart';
 import 'emulator_service.dart';
 import 'library_storage_service.dart';
+import 'rom_platform_detector.dart';
 
 enum RomActionState {
   notDownloaded,
@@ -141,6 +143,13 @@ class _NonRetryableDownloadException implements Exception {
   String toString() => message;
 }
 
+/// Sinaliza que o download paralelo não é viável para este arquivo/servidor e
+/// que o fluxo deve continuar pelo download de stream único (que possui retry
+/// e retome próprios).
+class _ParallelUnavailableException implements Exception {
+  const _ParallelUnavailableException();
+}
+
 class _QueuedDownloadEntry {
   _QueuedDownloadEntry({
     required this.game,
@@ -183,6 +192,22 @@ class RomDownloadService {
   static const Duration defaultReceiveTimeout = Duration(seconds: 90);
   static const int maxRetryAttempts = 6;
   static const int maxConcurrentDownloads = 2;
+
+  /// Limiares do download multi-conexão (HTTP Range em paralelo).
+  ///
+  /// Abaixo de [minParallelTotalBytes] o ganho não compensa o custo extra de
+  /// conexões; cada conexão recebe no mínimo [minParallelChunkBytes].
+  /// Mutáveis apenas para os testes ajustarem o limiar sem gerar arquivos
+  /// gigantes em memória.
+  @visibleForTesting
+  static int maxParallelChunks = 4;
+
+  @visibleForTesting
+  static int minParallelChunkBytes = 8 * 1024 * 1024;
+
+  @visibleForTesting
+  static int minParallelTotalBytes = 32 * 1024 * 1024;
+
   static const List<int> _retryBackoffSeconds = [2, 4, 8, 15, 25];
 
   final bool _ownsDio;
@@ -593,7 +618,12 @@ class RomDownloadService {
             filePaths.add(entity.path);
           }
         }
+        debugPrint(
+          '[Resolve#$igdbId] candidatos=${filePaths.length}: '
+          '${filePaths.map((p) => p.replaceAll('${dir.path}/', '')).take(20).join(" | ")}',
+        );
         final picked = pickPreferredExtractedRom(filePaths);
+        debugPrint('[Resolve#$igdbId] escolhido=$picked');
         if (picked != null) {
           final pickedFile = File(picked);
           final pickedLen = await pickedFile.length();
@@ -2289,6 +2319,472 @@ class RomDownloadService {
     await _delayWithCancel(delay, cancelToken);
   }
 
+  /// Sonda o servidor com `Range: bytes=0-0` e devolve o tamanho total do
+  /// arquivo quando o servidor aceita Range. Retorna `null` quando o download
+  /// paralelo não é viável (servidor ignora Range, erro ou timeout).
+  Future<int?> _probeRangeTotalBytes(
+    String url,
+    CancelToken cancelToken,
+  ) async {
+    final probeCancel = CancelToken();
+    final Response<ResponseBody> response;
+    try {
+      response = await _dio.get<ResponseBody>(
+        url,
+        cancelToken: probeCancel,
+        options: Options(
+          responseType: ResponseType.stream,
+          headers: const {'Range': 'bytes=0-0'},
+          receiveTimeout: const Duration(seconds: 20),
+          validateStatus: (s) => s != null && s >= 200 && s < 300,
+        ),
+      );
+    } on DioException catch (e) {
+      if (e.type == DioExceptionType.cancel && cancelToken.isCancelled) {
+        throw DioException.requestCancelled(
+          requestOptions: RequestOptions(path: url),
+          reason: cancelToken.cancelError?.error,
+        );
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+
+    if (cancelToken.isCancelled) {
+      throw DioException.requestCancelled(
+        requestOptions: RequestOptions(path: url),
+        reason: cancelToken.cancelError?.error,
+      );
+    }
+
+    if ((response.statusCode ?? 0) != 206) {
+      // Servidor devolveu 200: ignorou o Range e enviaria o arquivo inteiro.
+      // Aborta a resposta para não segurar a conexão aberta.
+      try {
+        probeCancel.cancel();
+      } catch (_) {
+        // Cancelar uma requisição já concluída é apenas higiene de conexão.
+      }
+      return null;
+    }
+
+    final contentRange = response.headers.value('content-range') ?? '';
+    final match = RegExp(r'bytes\s+\d+-\d+\/(\d+)').firstMatch(contentRange);
+    final total = match == null ? 0 : int.tryParse(match.group(1)!) ?? 0;
+    try {
+      // Corpo de `bytes=0-0` tem 1 byte; drenar libera a conexão sem cancelar.
+      await response.data?.stream.drain<void>();
+    } catch (_) {
+      // O corpo da sonda não afeta o tamanho já extraído dos cabeçalhos.
+    }
+    return total > 0 ? total : null;
+  }
+
+  /// Baixa [url] para [partFile] usando várias conexões HTTP Range em paralelo.
+  ///
+  /// Retorna `true` quando o arquivo foi concluído integralmente. Retorna
+  /// `false` quando o servidor não aceita Range, o arquivo é pequeno demais ou
+  /// alguma falha interna ocorreu — nesses casos o `.part` é recortado apenas ao
+  /// prefixo contíguo já escrito, para que o download de stream único assuma de
+  /// onde parou. Cancelamentos do usuário são propagados.
+  Future<bool> _tryDownloadWithParallelChunks({
+    required String url,
+    required File partFile,
+    required EmulationGame game,
+    required CancelToken cancelToken,
+    required bool Function() isCurrentOperation,
+    required void Function(RomDownloadStatus status) notify,
+    required int minExpectedBytes,
+  }) async {
+    void ensureNotCancelled() {
+      if (cancelToken.isCancelled || !isCurrentOperation()) {
+        throw DioException.requestCancelled(
+          requestOptions: RequestOptions(path: url),
+          reason: cancelToken.cancelError?.error,
+        );
+      }
+    }
+
+    ensureNotCancelled();
+
+    // O tamanho já conhecido do catálogo evita uma sonda extra: se o arquivo é
+    // pequeno demais, nem vale tentar abrir conexões paralelas.
+    final knownSize = game.estimatedSizeBytes;
+    if (knownSize > 0 && knownSize < minParallelTotalBytes) {
+      return false;
+    }
+
+    final totalBytes = await _probeRangeTotalBytes(url, cancelToken);
+    if (totalBytes == null ||
+        totalBytes < minParallelTotalBytes ||
+        totalBytes < minExpectedBytes) {
+      return false;
+    }
+
+    var chunkCount = (totalBytes / minParallelChunkBytes).ceil();
+    if (chunkCount < 2) chunkCount = 2;
+    if (chunkCount > maxParallelChunks) chunkCount = maxParallelChunks;
+
+    final bounds = List<(int, int)>.generate(
+      chunkCount,
+      (i) => (
+        (totalBytes * i) ~/ chunkCount,
+        (totalBytes * (i + 1)) ~/ chunkCount,
+      ),
+    );
+
+    final metaFile = File('${partFile.path}.pmeta');
+    var chunkDone = List<int>.filled(chunkCount, 0);
+    var restoredFromMeta = false;
+
+    if (await metaFile.exists()) {
+      try {
+        final decoded = jsonDecode(await metaFile.readAsString());
+        final partLength =
+            await partFile.exists() ? await partFile.length() : -1;
+        if (decoded is Map<String, dynamic> &&
+            decoded['url'] == url &&
+            decoded['total'] == totalBytes &&
+            decoded['chunks'] is List &&
+            (decoded['chunks'] as List).length == chunkCount &&
+            partLength >= totalBytes) {
+          final restored = List<int>.from(
+            (decoded['chunks'] as List).map((e) => (e as num?)?.toInt() ?? 0),
+          );
+          var valid = true;
+          for (var i = 0; i < chunkCount && valid; i++) {
+            final size = bounds[i].$2 - bounds[i].$1;
+            if (restored[i] < 0 || restored[i] > size) valid = false;
+          }
+          if (valid) {
+            chunkDone = restored;
+            restoredFromMeta = true;
+          }
+        }
+      } catch (e) {
+        debugPrint(
+          '[RomDownloadService] Metadados de download paralelo ignorados: $e',
+        );
+      }
+    }
+
+    if (!restoredFromMeta) {
+      final existingLength =
+          await partFile.exists() ? await partFile.length() : 0;
+      if (existingLength > totalBytes) {
+        // Tamanho não bate com o servidor: o .part não é confiável.
+        try {
+          if (await partFile.exists()) await partFile.delete();
+        } catch (e) {
+          debugPrint('[RomDownloadService] Falha ao limpar .part: $e');
+        }
+      } else {
+        // Bytes escritos sequencialmente pelo stream único pertencem ao início
+        // da partição e podem ser aproveitados como retome do paralelo.
+        for (var i = 0; i < chunkCount; i++) {
+          final start = bounds[i].$1;
+          final end = bounds[i].$2;
+          if (existingLength >= end) {
+            chunkDone[i] = end - start;
+          } else if (existingLength > start) {
+            chunkDone[i] = existingLength - start;
+          }
+        }
+      }
+    }
+
+    void writeMeta() {
+      try {
+        metaFile.writeAsStringSync(
+          jsonEncode({'url': url, 'total': totalBytes, 'chunks': chunkDone}),
+        );
+      } catch (e) {
+        debugPrint(
+          '[RomDownloadService] Falha ao gravar metadados do download paralelo: $e',
+        );
+      }
+    }
+
+    // Gravado antes de pré-alocar o arquivo: se o app morrer entre as duas
+    // operações, o próximo início exige `.part` já no tamanho total antes de
+    // confiar nos metadados, evitando aceitar bytes zerados como concluídos.
+    writeMeta();
+
+    final raf = partFile.openSync(mode: FileMode.append);
+    final chunkCancel = CancelToken();
+    var abort = false;
+    Object? failure;
+    var lastUiUpdate = DateTime.now();
+    var lastMetaWrite = DateTime.now();
+    final speedSamples = <(DateTime, int)>[];
+
+    int totalDone() {
+      var sum = 0;
+      for (final value in chunkDone) {
+        sum += value;
+      }
+      return sum;
+    }
+
+    void reportProgress() {
+      final now = DateTime.now();
+      if (now.difference(lastUiUpdate).inMilliseconds < 250) return;
+      lastUiUpdate = now;
+      final done = totalDone();
+      speedSamples.add((now, done));
+      speedSamples.removeWhere(
+        (sample) => now.difference(sample.$1).inMilliseconds > 1500,
+      );
+      var bytesPerSec = 0.0;
+      if (speedSamples.length > 1) {
+        final oldest = speedSamples.first;
+        final windowMs = now.difference(oldest.$1).inMilliseconds.clamp(100, 2000);
+        bytesPerSec = ((done - oldest.$2) * 1000.0) / windowMs;
+      }
+      notify(
+        RomDownloadStatus(
+          state: RomActionState.downloading,
+          progress:
+              totalBytes > 0 ? (done / totalBytes).clamp(0.01, 0.99) : 0.5,
+          downloadedBytes: done,
+          totalBytes: totalBytes,
+          speedLabel: _formatSpeed(bytesPerSec),
+        ),
+      );
+      if (now.difference(lastMetaWrite).inMilliseconds >= 2000) {
+        lastMetaWrite = now;
+        writeMeta();
+      }
+    }
+
+    // Repasse do cancelamento do usuário para o token usado nas conexões
+    // paralelas, garantindo que uma requisição em voo seja abortada na hora.
+    unawaited(
+      cancelToken.whenCancel.then((_) {
+        if (!chunkCancel.isCancelled) chunkCancel.cancel();
+      }),
+    );
+
+    var completed = false;
+    var fellBack = false;
+    try {
+      try {
+        raf.truncateSync(totalBytes);
+      } catch (e) {
+        fellBack = true;
+        debugPrint(
+          '[RomDownloadService] Falha ao pré-alocar .part de ${game.name} ($e); usando stream único.',
+        );
+        return false;
+      }
+
+      Future<void> runChunk(int index) async {
+        final start = bounds[index].$1;
+        final end = bounds[index].$2;
+        var attempt = 1;
+        try {
+          while (true) {
+            if (abort) return;
+            ensureNotCancelled();
+            final from = start + chunkDone[index];
+            if (from >= end) {
+              reportProgress();
+              return;
+            }
+
+            try {
+              final response = await _dio.get<ResponseBody>(
+                url,
+                cancelToken: chunkCancel,
+                options: Options(
+                  responseType: ResponseType.stream,
+                  headers: {'Range': 'bytes=$from-${end - 1}'},
+                  receiveTimeout: defaultReceiveTimeout,
+                  validateStatus: (s) => s != null && s >= 200 && s < 300,
+                ),
+              );
+              if (response.statusCode != 206) {
+                throw const _ParallelUnavailableException();
+              }
+              final stream = response.data?.stream;
+              if (stream == null) {
+                throw const _ParallelUnavailableException();
+              }
+
+              var writeOffset = from;
+              var received = 0;
+              final expected = end - from;
+              await for (final data in stream) {
+                if (abort) return;
+                ensureNotCancelled();
+                if (data.isEmpty) continue;
+                // Escrita síncrona em offset: como o Dart é single-thread, não
+                // há entrelaçamento entre os chunks que compartilham o arquivo.
+                raf.setPositionSync(writeOffset);
+                raf.writeFromSync(data);
+                writeOffset += data.length;
+                received += data.length;
+                chunkDone[index] = (from - start) + received;
+                reportProgress();
+              }
+              if (received < expected) {
+                throw StateError(
+                  'Chunk $index do download paralelo terminou cedo '
+                  '($received de $expected bytes).',
+                );
+              }
+              chunkDone[index] = expected;
+              reportProgress();
+              return;
+            } on _ParallelUnavailableException {
+              rethrow;
+            } catch (e) {
+              if (cancelToken.isCancelled || !isCurrentOperation()) rethrow;
+              if (abort) return;
+              if (attempt >= maxRetryAttempts) rethrow;
+              attempt++;
+              debugPrint(
+                '[RomDownloadService] Chunk $index do download paralelo de '
+                '${game.name}: tentativa $attempt/$maxRetryAttempts falhou ($e).',
+              );
+              final delaySeconds = _retryBackoffSeconds[(attempt - 1)
+                  .clamp(0, _retryBackoffSeconds.length - 1)];
+              await _delayWithCancel(Duration(seconds: delaySeconds), chunkCancel);
+            }
+          }
+        } catch (e) {
+          failure ??= e;
+          abort = true;
+          if (!chunkCancel.isCancelled) chunkCancel.cancel();
+        }
+      }
+
+      await Future.wait<void>([
+        for (var i = 0; i < chunkCount; i++) runChunk(i),
+      ]);
+
+      if (failure != null) throw failure!;
+      if (totalDone() < totalBytes) {
+        throw const _ParallelUnavailableException();
+      }
+      completed = true;
+      return true;
+    } on _ParallelUnavailableException {
+      fellBack = true;
+      return false;
+    } on DioException catch (e) {
+      if (cancelToken.isCancelled || !isCurrentOperation()) rethrow;
+      fellBack = true;
+      debugPrint(
+        '[RomDownloadService] Download paralelo de ${game.name} interrompido (${e.type}); usando stream único.',
+      );
+      return false;
+    } catch (e) {
+      fellBack = true;
+      debugPrint(
+        '[RomDownloadService] Download paralelo de ${game.name} falhou ($e); usando stream único.',
+      );
+      return false;
+    } finally {
+      if (completed) {
+        try {
+          if (metaFile.existsSync()) metaFile.deleteSync();
+        } catch (e) {
+          debugPrint('[RomDownloadService] Falha ao remover metadados: $e');
+        }
+      } else if (fellBack) {
+        // Descarta apenas o que não é prefixo contíguo válido, preservando o
+        // retome do stream único.
+        try {
+          raf.truncateSync(chunkDone[0]);
+        } catch (e) {
+          debugPrint('[RomDownloadService] Falha ao recortar .part: $e');
+        }
+        try {
+          if (metaFile.existsSync()) metaFile.deleteSync();
+        } catch (e) {
+          debugPrint('[RomDownloadService] Falha ao remover metadados: $e');
+        }
+      }
+      try {
+        raf.closeSync();
+      } catch (e) {
+        debugPrint('[RomDownloadService] Falha ao fechar .part: $e');
+      }
+    }
+  }
+
+  /// Plataformas cujo conteúdo traz marcadores de disco confiáveis.
+  ///
+  /// Só elas entram na validação: cartuchos e formatos comprimidos (`.zip`,
+  /// `.chd`, `.cso`...) não têm magic próprio e retornariam falsos positivos.
+  static const Set<String> _discPlatformsWithContentMarkers = {
+    'ps1',
+    'ps2',
+    'ps3',
+    'psp',
+    'gamecube',
+    'wii',
+    'dreamcast',
+    'saturn',
+  };
+
+  /// Rejeita a ROM quando os bytes provam que ela é de outro console.
+  ///
+  /// Sem isso um resultado mal etiquetado do Archive.org (ex.: um `.iso` de
+  /// PlayStation dentro de um item de "PC Engine", ou um ISO de PSP classificado
+  /// como PS1 pelo tamanho) chega ao player e falha no core errado.
+  /// Formatos sem marcadores ou quando o conteúdo bate, simplesmente segue.
+  Future<void> _assertRomPlatformMatchesContent({
+    required String resolvedPath,
+    required EmulationGame game,
+  }) async {
+    final expected = game.platformSlug.toLowerCase();
+    if (_isArcadePlatform(expected)) return;
+
+    String? detected;
+    try {
+      detected = await RomPlatformDetector.sniffContent(resolvedPath);
+    } catch (e) {
+      debugPrint(
+        '[RomDownloadService] Falha ao ler marcadores de ${game.name}: $e',
+      );
+      return;
+    }
+    if (detected == null || detected == expected) return;
+    if (!_discPlatformsWithContentMarkers.contains(detected)) return;
+
+    // GameCube e Wii são imagens do mesmo ecossistema Dolphin; não é erro.
+    const dolphinFamily = {'wii', 'gamecube'};
+    if (dolphinFamily.contains(expected) && dolphinFamily.contains(detected)) {
+      return;
+    }
+
+    final spec = kRommPlatforms.cast<RommPlatformSpec?>().firstWhere(
+      (p) => p!.slug == detected,
+      orElse: () => null,
+    );
+    final detectedName = spec?.fullName ?? detected.toUpperCase();
+
+    try {
+      final mismatchFile = File(resolvedPath);
+      if (await mismatchFile.exists()) {
+        await mismatchFile.delete();
+      }
+    } catch (e) {
+      debugPrint(
+        '[RomDownloadService] Falha ao remover ROM com plataforma errada: $e',
+      );
+    }
+
+    throw _NonRetryableDownloadException(
+      'O arquivo baixado é de outro console: o catálogo pedia '
+      '${game.platformName}, mas o conteúdo real é de $detectedName. '
+      'Nada foi salvo — tente outra versão do jogo.',
+    );
+  }
+
   /// Executa o download real com HTTP Range, retry exponencial e verificação de CRC32.
   Future<({String path, int totalBytes, bool? crcVerified, String? warningMessage})?>
       _executeResilientDownload({
@@ -2356,10 +2852,39 @@ class RomDownloadService {
       final partFilePath = '$finalDestinationPath.part';
       final partFile = File(partFilePath);
 
+      // Acelera o download abrindo várias conexões Range em paralelo. Falhou ou
+      // não aplicável? Segue o fluxo de stream único de sempre, que continua do
+      // byte em que o .paralelo parou.
+      var parallelCompleted = false;
+      try {
+        parallelCompleted = await _tryDownloadWithParallelChunks(
+          url: url,
+          partFile: partFile,
+          game: game,
+          cancelToken: cancelToken,
+          isCurrentOperation: isCurrentOperation,
+          notify: notify,
+          minExpectedBytes: minExpectedBytes,
+        );
+      } on _ParallelUnavailableException {
+        parallelCompleted = false;
+      } on DioException catch (e) {
+        if (cancelToken.isCancelled || !isCurrentOperation()) rethrow;
+        parallelCompleted = false;
+        debugPrint(
+          '[RomDownloadService] Download paralelo abortado (${e.type}); seguindo em stream único.',
+        );
+      } catch (e) {
+        parallelCompleted = false;
+        debugPrint(
+          '[RomDownloadService] Download paralelo indisponível ($e); seguindo em stream único.',
+        );
+      }
+
       int attempt = 1;
       bool rangeResetDone = false;
 
-      while (true) {
+      while (!parallelCompleted) {
         if (cancelToken.isCancelled || !isCurrentOperation()) {
           throw DioException.requestCancelled(
             requestOptions: RequestOptions(path: url),
@@ -2708,6 +3233,11 @@ class RomDownloadService {
         resolvedPath = extracted;
       }
 
+      await _assertRomPlatformMatchesContent(
+        resolvedPath: resolvedPath,
+        game: game,
+      );
+
       if (checkCrc && crcVerified != true) {
         final actualCrc =
             await LibraryStorageService.computeFileCrc32Hex(resolvedPath);
@@ -2950,6 +3480,11 @@ class RomDownloadService {
       final picked = pickPreferredExtractedRom(
         extractedPaths,
         platformSlug: platformSlug,
+      );
+      debugPrint(
+        '[Extract] zip=$zipPath candidatos=${extractedPaths.length} '
+        'escolhido=$picked maiores=${extractedPaths.length} '
+        'nomes=${extractedPaths.map((p) => p.split("/").last).take(15).join(", ")}',
       );
       if (picked != null &&
           largestDataBytes >= minBytesForPlatform(platformSlug)) {
@@ -3417,61 +3952,50 @@ class RomDownloadService {
         platformSlug: platformSlug,
       );
 
-  /// Infere o slug da plataforma pela extensão do arquivo de ROM/ISO.
-  static String inferPlatformSlugFromExtension(
-    String fileNameOrPath, {
-    String fallbackSlug = 'ps2',
-  }) {
+  /// Extensões extras aceitas na importação direta de arquivo externo.
+  ///
+  /// [allowedExtensionsForPlatform] é focada em downloads (escolhe o melhor
+  /// arquivo dentro de um `.zip`) e não cobre formatos comuns de ISO local
+  /// como `.cue`, `.bin`, `.img`, `.gdi` e `.cdi`.
+  static const Map<String, List<String>> _extraImportExtensions = {
+    'ps1': ['.cue', '.bin', '.img'],
+    'psx': ['.cue', '.bin', '.img'],
+    'ps2': ['.cue', '.bin', '.img'],
+    'psp': ['.cue', '.bin', '.img'],
+    'ps3': ['.img'],
+    'saturn': ['.cue', '.bin', '.iso', '.img'],
+    'dreamcast': ['.gdi', '.cdi', '.iso', '.img'],
+    'gamecube': ['.img'],
+    'wii': ['.img'],
+    '3ds': ['.cia'],
+    'pce': ['.chd', '.cue', '.bin', '.iso', '.img'],
+  };
+
+  /// Lista completa de extensões compatíveis com [platformSlug] ao importar
+  /// um arquivo externo (lista base + extras).
+  static List<String> importExtensionsForPlatform(String platformSlug) {
+    final lower = platformSlug.toLowerCase();
+    final base = allowedExtensionsForPlatform(lower);
+    final extra = _extraImportExtensions[lower] ?? const <String>[];
+    return <String>{...base, ...extra}.toList(growable: false);
+  }
+
+  /// Verifica se a extensão de [fileNameOrPath] faz sentido para
+  /// [platformSlug], evitando vincular um `.gba` como PS2 (ou o inverso).
+  ///
+  /// Arquivos sem extensão reconhecida não são bloqueados.
+  static bool isImportExtensionCompatible(
+    String platformSlug,
+    String fileNameOrPath,
+  ) {
     final lower = fileNameOrPath.trim().toLowerCase();
-    if (lower.endsWith('.rvz') ||
-        lower.endsWith('.gcz') ||
-        lower.endsWith('.gcm')) {
-      return 'gamecube';
-    }
-    if (lower.endsWith('.wbfs') || lower.endsWith('.wad')) {
-      return 'wii';
-    }
-    if (lower.endsWith('.3ds') ||
-        lower.endsWith('.cci') ||
-        lower.endsWith('.cxi') ||
-        lower.endsWith('.cia')) {
-      return '3ds';
-    }
-    if (lower.endsWith('.nsp') ||
-        lower.endsWith('.xci') ||
-        lower.endsWith('.nsz') ||
-        lower.endsWith('.xcz') ||
-        lower.endsWith('.nro') ||
-        lower.endsWith('.nca')) {
-      return 'switch';
-    }
-    if (lower.endsWith('.cso') || lower.endsWith('.pbp')) {
-      return 'psp';
-    }
-    if (lower.endsWith('.pkg')) {
-      return 'ps3';
-    }
-    if (lower.endsWith('.nds')) return 'nds';
-    if (lower.endsWith('.gba')) return 'gba';
-    if (lower.endsWith('.gbc')) return 'gbc';
-    if (lower.endsWith('.gb')) return 'gb';
-    if (lower.endsWith('.sfc') || lower.endsWith('.smc')) return 'snes';
-    if (lower.endsWith('.nes')) return 'nes';
-    if (lower.endsWith('.z64') ||
-        lower.endsWith('.n64') ||
-        lower.endsWith('.v64')) {
-      return 'n64';
-    }
-    if (lower.endsWith('.md') ||
-        lower.endsWith('.gen') ||
-        lower.endsWith('.smd')) {
-      return 'md';
-    }
-    if (lower.endsWith('.gg')) return 'gamegear';
-    if (lower.endsWith('.sms')) return 'mastersystem';
-    if (lower.endsWith('.pce')) return 'pce';
-    if (lower.endsWith('.cdi') || lower.endsWith('.gdi')) return 'dreamcast';
-    return fallbackSlug;
+    var nameStart = lower.lastIndexOf('/');
+    final backslash = lower.lastIndexOf(r'\');
+    if (backslash > nameStart) nameStart = backslash;
+    final name = nameStart >= 0 ? lower.substring(nameStart + 1) : lower;
+    final dotIdx = name.lastIndexOf('.');
+    if (dotIdx <= 0) return true;
+    return importExtensionsForPlatform(platformSlug).contains(name.substring(dotIdx));
   }
 
   /// Vincula diretamente um arquivo ROM/ISO externo a partir de [sourcePath] sem

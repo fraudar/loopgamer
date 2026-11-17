@@ -1,15 +1,20 @@
 import 'dart:async';
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:phosphor_flutter/phosphor_flutter.dart';
 
 import '../models/emulation_game.dart';
 import '../models/user_library_meta.dart';
-import '../services/cover_cache_service.dart';
+import '../services/game_asset_service.dart';
 import '../services/rom_download_service.dart';
 import '../theme/hydra_tokens.dart';
+import '../theme/ps5_hydra_theme.dart';
+import '../widgets/animated_fade_slide.dart';
+import '../widgets/animated_game_logo.dart';
 import '../widgets/loop_common_widgets.dart';
+import '../widgets/procedural_cover.dart';
 
 class LibraryScreen extends StatefulWidget {
   const LibraryScreen({
@@ -48,8 +53,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
     debugLabel: 'LibraryScreenFocus',
   );
   final ScrollController _landscapeScrollController = ScrollController();
-  final ScrollController _portraitScrollController = ScrollController();
 
+  final Map<int, GameAssets> _resolvedAssets = {};
   int _selectedIndex = 0;
   String _activeFilter = 'todos';
   bool _hasFocus = false;
@@ -59,6 +64,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   @override
   void initState() {
     super.initState();
+    _prefetchAssetsFor(_allLibraryItems);
     if (widget.isActive) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted && widget.isActive) {
@@ -71,6 +77,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   @override
   void didUpdateWidget(covariant LibraryScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
+    _prefetchAssetsFor(_allLibraryItems);
     if (!oldWidget.isActive && widget.isActive) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted && widget.isActive) {
@@ -88,8 +95,29 @@ class _LibraryScreenState extends State<LibraryScreen> {
   void dispose() {
     _screenFocusNode.dispose();
     _landscapeScrollController.dispose();
-    _portraitScrollController.dispose();
     super.dispose();
+  }
+
+  void _prefetchAssetsFor(List<EmulationGame> games) {
+    for (final game in games.take(12)) {
+      if (_resolvedAssets.containsKey(game.igdbId)) continue;
+      final cached = GameAssetService.instance.getCachedAssets(
+        game.name,
+        platformSlug: game.platformSlug,
+      );
+      if (cached != null) {
+        _resolvedAssets[game.igdbId] = cached;
+        continue;
+      }
+      unawaited(
+        GameAssetService.instance.fetchAssetsForGame(game).then((assets) {
+          if (mounted &&
+              (assets.hasBackground || assets.hasCover || assets.hasLogo)) {
+            setState(() => _resolvedAssets[game.igdbId] = assets);
+          }
+        }),
+      );
+    }
   }
 
   List<EmulationGame> get _allLibraryItems {
@@ -129,23 +157,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   void _selectIndex(
     int nextIndex, {
-    required bool isLandscape,
     bool viaGamepad = false,
   }) {
     setState(() {
       _selectedIndex = nextIndex;
       _gamepadNavActive = viaGamepad;
     });
-    _scrollToSelected(nextIndex, isLandscape: isLandscape);
+    _scrollToSelected(nextIndex);
   }
 
-  void _scrollToSelected(int idx, {required bool isLandscape}) {
-    final controller = isLandscape
-        ? _landscapeScrollController
-        : _portraitScrollController;
+  void _scrollToSelected(int idx) {
+    final controller = _landscapeScrollController;
     if (!controller.hasClients) return;
 
-    final itemExtent = isLandscape ? _landscapeCardExtent : 110.0;
+    final itemExtent = _landscapeCardExtent;
     final viewport = controller.position.viewportDimension;
     final targetStart = idx * itemExtent;
     final targetEnd = targetStart + itemExtent;
@@ -166,8 +191,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
       unawaited(
         controller.animateTo(
           clamped,
-          duration: const Duration(milliseconds: 180),
-          curve: Curves.easeOutCubic,
+          duration: PS5HydraTheme.animMedium,
+          curve: Curves.easeOut,
         ),
       );
     }
@@ -386,17 +411,19 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     const SizedBox(height: 14),
                     Row(
                       children: [
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(8),
-                          child: SizedBox(
-                            width: 46,
-                            height: 64,
-                            child: LoopCoverImage(
-                              url: game.resolvedGridCoverUrl,
-                              fit: BoxFit.cover,
-                              cacheWidth: 128,
-                              cacheHeight: 184,
-                            ),
+                        SizedBox(
+                          width: 46,
+                          height: 64,
+                          child: ProceduralCover(
+                            title: game.name,
+                            platformName: game.platformName,
+                            imageUrl: _resolvedAssets[game.igdbId]
+                                    ?.coverImageUrl ??
+                                game.gridCoverUrl ??
+                                game.resolvedGridCoverUrl,
+                            borderRadius: 8,
+                            compact: true,
+                            showBottomLabel: false,
                           ),
                         ),
                         const SizedBox(width: 14),
@@ -624,7 +651,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
   }
 
-  Widget _buildEmptyLibraryState({required bool isLandscape}) {
+  Widget _buildEmptyLibraryState() {
     final hasAnyGames = _allLibraryItems.isNotEmpty;
     if (hasAnyGames) {
       return LoopEmptyState(
@@ -637,10 +664,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
           _activeFilter = 'todos';
           _selectedIndex = 0;
         }),
-        compact: isLandscape,
-        backgroundColor: isLandscape
-            ? HydraTokens.bgNearBlack.withOpacity(0.92)
-            : HydraTokens.bgNearBlack,
+        compact: true,
+        backgroundColor: PS5HydraTheme.obsidianGlass.withOpacity(0.92),
       );
     }
 
@@ -649,17 +674,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
       children: [
         LoopEmptyState(
           title: 'Nenhum jogo instalado ainda',
-          subtitle: isLandscape
-              ? 'Baixe jogos no catálogo ou importe uma ISO/ROM externa direto aqui.'
-              : 'Escolha títulos no Catálogo de ROMs ou importe uma ISO/ROM externa direto aqui.',
+          subtitle:
+              'Baixe jogos no catálogo ou importe uma ISO/ROM externa direto aqui.',
           actionLabel: 'Importar ISO / ROM',
           actionIcon: PhosphorIcons.folderPlus(PhosphorIconsStyle.bold),
           onAction:
               widget.onImportExternalIsoPressed ?? widget.onImportNewRomPressed,
-          compact: isLandscape,
-          backgroundColor: isLandscape
-              ? HydraTokens.bgNearBlack.withOpacity(0.92)
-              : HydraTokens.bgNearBlack,
+          compact: true,
+          backgroundColor: PS5HydraTheme.obsidianGlass.withOpacity(0.92),
         ),
         const SizedBox(height: 10),
         Semantics(
@@ -667,10 +689,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
           label: 'Explorar catálogo de ROMs',
           child: OutlinedButton.icon(
             style: OutlinedButton.styleFrom(
-              foregroundColor: HydraTokens.textPrimary,
-              backgroundColor: HydraTokens.bgNearBlack,
+              foregroundColor: PS5HydraTheme.textPrimary,
+              backgroundColor: PS5HydraTheme.obsidianGlass,
               minimumSize: const Size(48, 48),
-              side: const BorderSide(color: HydraTokens.borderSubtle10),
+              side: const BorderSide(color: PS5HydraTheme.borderSubtle),
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(10),
               ),
@@ -696,13 +718,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final isLandscape = HydraTokens.isWideLayout(context);
     final items = _filteredItems;
     final safeIdx = items.isEmpty ? 0 : _selectedIndex.clamp(0, items.length - 1);
 
-    final content = isLandscape
-        ? _buildLandscapeLibrary(context, items, safeIdx)
-        : _buildPortraitLibrary(context, items, safeIdx);
+    final content = _buildLandscapeLibrary(context, items, safeIdx);
 
     return Focus(
       focusNode: _screenFocusNode,
@@ -728,11 +747,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
           event: event,
           itemCount: items.length,
           currentIndex: safeIdx,
-          axis: isLandscape ? Axis.horizontal : Axis.vertical,
+          axis: Axis.horizontal,
           isActive: widget.isActive,
           onIndexChanged: (next) => _selectIndex(
             next,
-            isLandscape: isLandscape,
             viaGamepad: true,
           ),
           onActivate: (idx) {
@@ -753,7 +771,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   // ==========================================================================
-  // MODO DEITADO (LANDSCAPE) — GAMEHUB LIBRARY COM SAFEAREA E FOCO DE CONTROLE
+  // MODO HORIZONTAL EXCLUSIVO (CONSOLE-FIRST PS5 LIBRARY)
   // ==========================================================================
   Widget _buildLandscapeLibrary(
     BuildContext context,
@@ -768,26 +786,48 @@ class _LibraryScreenState extends State<LibraryScreen> {
         selectedStatus?.localPath ?? selectedGame?.localRomPath;
     final selectedDownloading =
         selectedStatus?.state == RomActionState.downloading;
+    final selectedAssets =
+        selectedGame != null ? _resolvedAssets[selectedGame.igdbId] : null;
+    final selectedBannerUrl = selectedGame == null
+        ? null
+        : (selectedAssets?.backgroundImageUrl ??
+            selectedGame.heroBannerUrl ??
+            selectedGame.resolvedHeroBannerUrl);
 
     return Scaffold(
-      backgroundColor: HydraTokens.bgPureBlack,
+      backgroundColor: PS5HydraTheme.pitchBlack,
       body: Stack(
         fit: StackFit.expand,
         children: [
           if (selectedGame != null)
             AnimatedSwitcher(
-              duration: const Duration(milliseconds: 300),
+              duration: PS5HydraTheme.animStandard,
+              switchInCurve: Curves.easeOut,
               child: SizedBox.expand(
                 key: ValueKey<int>(selectedGame.igdbId),
-                child: LoopCoverImage(
-                  url: selectedGame.resolvedHeroBannerUrl,
-                  fit: BoxFit.cover,
-                  cacheWidth: 960,
-                  cacheHeight: 540,
-                ),
+                child: selectedBannerUrl != null &&
+                        selectedBannerUrl.isNotEmpty
+                    ? CachedNetworkImage(
+                        imageUrl: selectedBannerUrl,
+                        cacheManager: SessionMemoryCacheManager.instance,
+                        fit: BoxFit.cover,
+                        errorWidget: (_, __, ___) => ProceduralCover(
+                          title: selectedGame.name,
+                          platformName: selectedGame.platformName,
+                          borderRadius: 0,
+                          showBottomLabel: false,
+                        ),
+                      )
+                    : ProceduralCover(
+                        title: selectedGame.name,
+                        platformName: selectedGame.platformName,
+                        borderRadius: 0,
+                        showBottomLabel: false,
+                      ),
               ),
             ),
 
+          // Gradiente full-bleed transparente -> #000000 para legibilidade
           Container(
             decoration: BoxDecoration(
               gradient: LinearGradient(
@@ -795,10 +835,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 end: Alignment.bottomCenter,
                 stops: const [0.0, 0.35, 0.78, 1.0],
                 colors: [
-                  HydraTokens.bgPureBlack.withOpacity(0.68),
-                  HydraTokens.bgPureBlack.withOpacity(0.54),
-                  HydraTokens.bgPureBlack.withOpacity(0.86),
-                  HydraTokens.bgPureBlack.withOpacity(0.97),
+                  Colors.transparent,
+                  PS5HydraTheme.pitchBlack.withOpacity(0.50),
+                  PS5HydraTheme.pitchBlack.withOpacity(0.90),
+                  PS5HydraTheme.pitchBlack,
                 ],
               ),
             ),
@@ -806,7 +846,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
           SafeArea(
             top: false,
-            child: items.isEmpty
+            child: _allLibraryItems.isEmpty
                 ? Center(
                     child: SingleChildScrollView(
                       padding: EdgeInsets.fromLTRB(
@@ -815,7 +855,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         24,
                         24,
                       ),
-                      child: _buildEmptyLibraryState(isLandscape: true),
+                      child: _buildEmptyLibraryState(),
                     ),
                   )
                 : Padding(
@@ -830,27 +870,96 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       children: [
                         Row(
                           children: [
-                            Text(
-                              '${items.length} ${items.length == 1 ? 'jogo na biblioteca' : 'jogos na biblioteca'}',
-                              style: const TextStyle(
-                                fontFamily: 'ReadexPro',
-                                fontSize: 12.5,
-                                fontWeight: FontWeight.w600,
-                                color: HydraTokens.textSecondary,
+                            Expanded(
+                              child: SingleChildScrollView(
+                                scrollDirection: Axis.horizontal,
+                                child: Row(
+                                  children: [
+                                    Text(
+                                      '${items.length} ${items.length == 1 ? 'jogo' : 'jogos'}',
+                                      style: PS5HydraTheme.metaMonoStyle.copyWith(
+                                        fontSize: 12,
+                                        color: PS5HydraTheme.textSecondary,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    LoopPlatformChip(
+                                      label: 'Todos',
+                                      count: _allLibraryItems.length,
+                                      selected: _activeFilter == 'todos',
+                                      compact: true,
+                                      onTap: () => setState(() {
+                                        _activeFilter = 'todos';
+                                        _selectedIndex = 0;
+                                      }),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    LoopPlatformChip(
+                                      label: 'Favoritos',
+                                      count: widget.userMeta.favorites.length,
+                                      selected: _activeFilter == 'favoritos',
+                                      compact: true,
+                                      onTap: () => setState(() {
+                                        _activeFilter = 'favoritos';
+                                        _selectedIndex = 0;
+                                      }),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    LoopPlatformChip(
+                                      label: 'Recentes',
+                                      selected: _activeFilter == 'recentes',
+                                      compact: true,
+                                      onTap: () => setState(() {
+                                        _activeFilter = 'recentes';
+                                        _selectedIndex = 0;
+                                      }),
+                                    ),
+                                    for (final col
+                                        in widget.userMeta.collections.keys) ...[
+                                      const SizedBox(width: 8),
+                                      LoopPlatformChip(
+                                        label: col,
+                                        count: widget
+                                                .userMeta.collections[col]?.length ??
+                                            0,
+                                        selected: _activeFilter == col,
+                                        compact: true,
+                                        onTap: () => setState(() {
+                                          _activeFilter = col;
+                                          _selectedIndex = 0;
+                                        }),
+                                      ),
+                                    ],
+                                    const SizedBox(width: 8),
+                                    _NewCollectionChipButton(
+                                      onTap: () => unawaited(
+                                        _showCreateCollectionDialog(),
+                                      ),
+                                    ),
+                                  ],
+                                ),
                               ),
                             ),
-                            const Spacer(),
+                            const SizedBox(width: 12),
                             Semantics(
                               button: true,
                               label: 'Importar ISO ou ROM externa',
-                              child: FilledButton.icon(
-                                style: FilledButton.styleFrom(
-                                  backgroundColor: HydraTokens.primaryAurora,
-                                  foregroundColor: HydraTokens.bgPureBlack,
+                              child: OutlinedButton.icon(
+                                style: OutlinedButton.styleFrom(
+                                  backgroundColor: PS5HydraTheme.obsidianGlass,
+                                  foregroundColor: PS5HydraTheme.textPrimary,
+                                  side: const BorderSide(
+                                    color: PS5HydraTheme.borderSubtle,
+                                  ),
                                   minimumSize: const Size(48, 48),
                                   padding: const EdgeInsets.symmetric(
                                     horizontal: 14,
                                     vertical: 10,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(
+                                      PS5HydraTheme.radiusChip,
+                                    ),
                                   ),
                                 ),
                                 onPressed: widget.onImportExternalIsoPressed ??
@@ -875,228 +984,94 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         ),
                         const SizedBox(height: 8),
                         Expanded(
-                          child: LayoutBuilder(
-                            builder: (context, constraints) {
-                              final listHeight =
-                                  constraints.maxHeight.clamp(120.0, 214.0);
-                              final selectedHeight =
-                                  (listHeight - 4).clamp(116.0, 210.0);
-                              final selectedWidth =
-                                  selectedHeight * (148.0 / 210.0);
-                              final normalHeight =
-                                  (selectedHeight * 0.885).clamp(102.0, 186.0);
-                              final normalWidth =
-                                  normalHeight * (132.0 / 186.0);
-                              _landscapeCardExtent = normalWidth + 14.0;
+                          child: items.isEmpty
+                              ? Center(
+                                  child: SingleChildScrollView(
+                                    child: _buildEmptyLibraryState(),
+                                  ),
+                                )
+                              : LayoutBuilder(
+                                  builder: (context, constraints) {
+                                    final listHeight =
+                                        constraints.maxHeight.clamp(120.0, 214.0);
+                                    final selectedHeight =
+                                        (listHeight - 8).clamp(112.0, 206.0);
+                                    final selectedWidth =
+                                        selectedHeight * 0.72;
+                                    final normalHeight =
+                                        (selectedHeight * 0.90).clamp(
+                                      100.0,
+                                      186.0,
+                                    );
+                                    final normalWidth = normalHeight * 0.72;
+                                    _landscapeCardExtent = normalWidth + 14.0;
 
-                              return Center(
-                                child: SizedBox(
-                                  height: listHeight,
-                                  child: ListView.separated(
-                                    controller: _landscapeScrollController,
-                                    scrollDirection: Axis.horizontal,
-                                    itemCount: items.length,
-                                    separatorBuilder: (_, __) =>
-                                        const SizedBox(width: 14),
-                                    itemBuilder: (context, idx) {
-                                      final game = items[idx];
-                                      final isSelected = idx == safeIdx;
-                                      final status =
-                                          widget.downloadStatuses[game.igdbId];
-                                      final isDl = status?.state ==
-                                          RomActionState.downloading;
-                                      final romPath =
-                                          status?.localPath ?? game.localRomPath;
+                                    return Center(
+                                      child: SizedBox(
+                                        height: listHeight,
+                                        child: ListView.separated(
+                                          controller:
+                                              _landscapeScrollController,
+                                          scrollDirection: Axis.horizontal,
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 4,
+                                            vertical: 4,
+                                          ),
+                                          itemCount: items.length,
+                                          separatorBuilder: (_, __) =>
+                                              const SizedBox(width: 14),
+                                          itemBuilder: (context, idx) {
+                                            final game = items[idx];
+                                            final isSelected = idx == safeIdx;
+                                            final status = widget
+                                                .downloadStatuses[game.igdbId];
+                                            final isDl = status?.state ==
+                                                RomActionState.downloading;
+                                            final romPath = status?.localPath ??
+                                                game.localRomPath;
 
-                                      final highlightColor = _hasFocus
-                                          ? HydraTokens.primaryAurora
-                                          : HydraTokens.primaryAurora
-                                              .withOpacity(0.85);
-
-                                      return Center(
-                                        child: Semantics(
-                                          button: true,
-                                          selected: isSelected,
-                                          label:
-                                              '${game.name}, ${game.platformName}',
-                                          hint:
-                                              'Toque para selecionar ou jogar',
-                                          child: GestureDetector(
-                                            onTap: () {
-                                              if (isSelected &&
-                                                  !isDl &&
-                                                  romPath != null) {
-                                                widget.onLaunchGame(
-                                                  game,
-                                                  romPath,
-                                                );
-                                              } else {
-                                                _selectIndex(
-                                                  idx,
-                                                  isLandscape: true,
-                                                );
-                                              }
-                                            },
-                                            onLongPress: () {
-                                              _selectIndex(
-                                                idx,
-                                                isLandscape: true,
-                                              );
-                                              unawaited(
-                                                _showLongPressOptions(game),
-                                              );
-                                            },
-                                            child: AnimatedContainer(
-                                              duration: const Duration(
-                                                milliseconds: 200,
-                                              ),
-                                              curve: Curves.easeOutCubic,
+                                            return _LibraryHorizontalGameCard(
+                                              game: game,
+                                              itemIndex: idx,
+                                              isSelected: isSelected,
                                               width: isSelected
                                                   ? selectedWidth
                                                   : normalWidth,
                                               height: isSelected
                                                   ? selectedHeight
                                                   : normalHeight,
-                                              decoration: BoxDecoration(
-                                                color:
-                                                    HydraTokens.surfaceCatalog,
-                                                borderRadius:
-                                                    BorderRadius.circular(16),
-                                                border: Border.all(
-                                                  color: isSelected
-                                                      ? highlightColor
-                                                      : Colors.white
-                                                          .withOpacity(0.12),
-                                                  width: isSelected ? 2.4 : 1.0,
-                                                ),
-                                                boxShadow: isSelected &&
-                                                        _hasFocus
-                                                    ? HydraTokens.neonBoxGlow(
-                                                        opacity: 0.28,
-                                                        blur: 18,
-                                                        color: HydraTokens
-                                                            .primaryAurora,
-                                                      )
-                                                    : [
-                                                        BoxShadow(
-                                                          color: Colors.black
-                                                              .withOpacity(
-                                                            isSelected
-                                                                ? 0.72
-                                                                : 0.42,
-                                                          ),
-                                                          blurRadius: isSelected
-                                                              ? 22
-                                                              : 12,
-                                                          offset: const Offset(
-                                                            0,
-                                                            8,
-                                                          ),
-                                                        ),
-                                                      ],
-                                              ),
-                                              child: ClipRRect(
-                                                borderRadius:
-                                                    BorderRadius.circular(14),
-                                                child: Stack(
-                                                  fit: StackFit.expand,
-                                                  children: [
-                                                    LoopCoverImage(
-                                                      url: game
-                                                          .resolvedGridCoverUrl,
-                                                      fit: BoxFit.cover,
-                                                      cacheWidth: 320,
-                                                      cacheHeight: 460,
-                                                    ),
-                                                    if (isDl)
-                                                      Container(
-                                                        color: Colors.black
-                                                            .withOpacity(0.68),
-                                                        padding:
-                                                            const EdgeInsets.all(
-                                                          12,
-                                                        ),
-                                                        child: Column(
-                                                          mainAxisAlignment:
-                                                              MainAxisAlignment
-                                                                  .center,
-                                                          children: [
-                                                            SizedBox(
-                                                              width: 42,
-                                                              height: 42,
-                                                              child:
-                                                                  CircularProgressIndicator(
-                                                                value: status
-                                                                    ?.progress,
-                                                                strokeWidth:
-                                                                    3.5,
-                                                                color: HydraTokens
-                                                                    .primaryAurora,
-                                                                backgroundColor:
-                                                                    Colors
-                                                                        .white24,
-                                                              ),
-                                                            ),
-                                                            const SizedBox(
-                                                              height: 10,
-                                                            ),
-                                                            Text(
-                                                              LoopProgressIndicator
-                                                                  .formatPercent(
-                                                                status?.progress ??
-                                                                    0,
-                                                              ),
-                                                              style:
-                                                                  const TextStyle(
-                                                                fontFamily:
-                                                                    'JetBrainsMono',
-                                                                fontSize: 13,
-                                                                fontWeight:
-                                                                    FontWeight
-                                                                        .w700,
-                                                                color: HydraTokens
-                                                                    .textPrimary,
-                                                              ),
-                                                            ),
-                                                            if (status
-                                                                    ?.speedLabel !=
-                                                                null) ...[
-                                                              const SizedBox(
-                                                                height: 2,
-                                                              ),
-                                                              Text(
-                                                                status!
-                                                                    .speedLabel!,
-                                                                maxLines: 1,
-                                                                overflow:
-                                                                    TextOverflow
-                                                                        .ellipsis,
-                                                                style:
-                                                                    const TextStyle(
-                                                                  fontFamily:
-                                                                      'Rubik',
-                                                                  fontSize: 10,
-                                                                  color: HydraTokens
-                                                                      .textSecondary,
-                                                                ),
-                                                              ),
-                                                            ],
-                                                          ],
-                                                        ),
-                                                      ),
-                                                  ],
-                                                ),
-                                              ),
-                                            ),
-                                          ),
+                                              coverUrl: _resolvedAssets[
+                                                          game.igdbId]
+                                                      ?.coverImageUrl ??
+                                                  game.gridCoverUrl ??
+                                                  game.resolvedGridCoverUrl,
+                                              status: status,
+                                              isDownloading: isDl,
+                                              onTap: () {
+                                                if (isSelected &&
+                                                    !isDl &&
+                                                    romPath != null) {
+                                                  widget.onLaunchGame(
+                                                    game,
+                                                    romPath,
+                                                  );
+                                                } else {
+                                                  _selectIndex(idx);
+                                                }
+                                              },
+                                              onLongPress: () {
+                                                _selectIndex(idx);
+                                                unawaited(
+                                                  _showLongPressOptions(game),
+                                                );
+                                              },
+                                            );
+                                          },
                                         ),
-                                      );
-                                    },
-                                  ),
+                                      ),
+                                    );
+                                  },
                                 ),
-                              );
-                            },
-                          ),
                         ),
                         const SizedBox(height: 10),
                         if (selectedGame != null)
@@ -1116,6 +1091,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     );
   }
 
+
   Widget _buildLandscapeBottomBar(
     BuildContext context, {
     required EmulationGame selectedGame,
@@ -1132,62 +1108,78 @@ class _LibraryScreenState extends State<LibraryScreen> {
           child: Row(
             children: [
               Flexible(
-                child: Text(
-                  selectedGame.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontFamily: 'ReadexPro',
-                    fontSize: 18,
-                    fontWeight: FontWeight.w700,
-                    color: HydraTokens.textPrimary,
+                child: AnimatedHeroFadeSlideSwitcher(
+                  child: KeyedSubtree(
+                    key: ValueKey<int>(selectedGame.igdbId),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: AnimatedGameLogo(
+                            game: selectedGame,
+                            height: 36,
+                            maxWidthFraction: 1.0,
+                            enableStagger: false,
+                            maxLines: 1,
+                            fallbackStyle: const TextStyle(
+                              fontFamily: 'ReadexPro',
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                              color: PS5HydraTheme.textPrimary,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 5,
+                          ),
+                          decoration: PS5HydraTheme.surfaceGlass(
+                            radius: 8,
+                            alpha: 0.92,
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              PhosphorIcon(
+                                selectedDownloading
+                                    ? PhosphorIcons.downloadSimple(
+                                        PhosphorIconsStyle.bold,
+                                      )
+                                    : PhosphorIcons.clock(
+                                        PhosphorIconsStyle.regular,
+                                      ),
+                                size: 13,
+                                color: PS5HydraTheme.textPrimary,
+                              ),
+                              const SizedBox(width: 5),
+                              Text(
+                                selectedDownloading
+                                    ? 'Baixando ${LoopProgressIndicator.formatPercent(selectedStatus?.progress ?? 0)} (${selectedStatus?.speedLabel ?? "2º plano"})'
+                                    : formatPlaytime(
+                                        widget.userMeta
+                                            .playtimeOf(selectedGame.igdbId)
+                                            .totalSeconds,
+                                      ),
+                                style: TextStyle(
+                                  fontFamily: 'JetBrainsMono',
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  color: selectedDownloading
+                                      ? PS5HydraTheme.auroraSpringMint
+                                      : PS5HydraTheme.textPrimary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
-              const SizedBox(width: 10),
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 5,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.10),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    PhosphorIcon(
-                      selectedDownloading
-                          ? PhosphorIcons.downloadSimple(
-                              PhosphorIconsStyle.bold,
-                            )
-                          : PhosphorIcons.clock(PhosphorIconsStyle.regular),
-                      size: 13,
-                      color: HydraTokens.textPrimary,
-                    ),
-                    const SizedBox(width: 5),
-                    Text(
-                      selectedDownloading
-                          ? 'Baixando ${LoopProgressIndicator.formatPercent(selectedStatus?.progress ?? 0)} (${selectedStatus?.speedLabel ?? "2º plano"})'
-                          : formatPlaytime(
-                              widget.userMeta
-                                  .playtimeOf(selectedGame.igdbId)
-                                  .totalSeconds,
-                            ),
-                      style: TextStyle(
-                        fontFamily: 'JetBrainsMono',
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                        color: selectedDownloading
-                            ? HydraTokens.primaryAurora
-                            : HydraTokens.textPrimary,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 4),
+              const SizedBox(width: 6),
               Semantics(
                 button: true,
                 toggled: isFavorite,
@@ -1205,7 +1197,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       minHeight: 48,
                     ),
                     style: IconButton.styleFrom(
-                      backgroundColor: Colors.white.withOpacity(0.10),
+                      backgroundColor: PS5HydraTheme.obsidianGlass,
+                      side: BorderSide(
+                        color: isFavorite
+                            ? PS5HydraTheme.auroraSpringMint
+                            : PS5HydraTheme.borderSubtle,
+                      ),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(10),
                       ),
@@ -1216,8 +1213,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                           : PhosphorIcons.star(PhosphorIconsStyle.regular),
                       size: 18,
                       color: isFavorite
-                          ? HydraTokens.primaryAurora
-                          : HydraTokens.textSecondary,
+                          ? PS5HydraTheme.auroraSpringMint
+                          : PS5HydraTheme.textSecondary,
                     ),
                   ),
                 ),
@@ -1236,7 +1233,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       minHeight: 48,
                     ),
                     style: IconButton.styleFrom(
-                      backgroundColor: Colors.white.withOpacity(0.10),
+                      backgroundColor: PS5HydraTheme.obsidianGlass,
+                      side: const BorderSide(
+                        color: PS5HydraTheme.borderSubtle,
+                      ),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(10),
                       ),
@@ -1244,7 +1244,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     icon: PhosphorIcon(
                       PhosphorIcons.dotsThreeVertical(PhosphorIconsStyle.bold),
                       size: 18,
-                      color: HydraTokens.textPrimary,
+                      color: PS5HydraTheme.textPrimary,
                     ),
                   ),
                 ),
@@ -1261,594 +1261,280 @@ class _LibraryScreenState extends State<LibraryScreen> {
               label: 'Remover ${selectedGame.name} da biblioteca',
               child: Tooltip(
                 message: 'Remover da biblioteca (X)',
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(
-                    minWidth: 48,
-                    minHeight: 48,
-                  ),
-                  child: Material(
-                    color: Colors.black.withOpacity(0.55),
-                    shape: StadiumBorder(
-                      side: BorderSide(
-                        color: Colors.white.withOpacity(0.14),
+                child: OutlinedButton(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: PS5HydraTheme.textSecondary,
+                    backgroundColor: PS5HydraTheme.obsidianGlass,
+                    minimumSize: const Size(48, 48),
+                    padding: const EdgeInsets.symmetric(horizontal: 14),
+                    side: const BorderSide(color: PS5HydraTheme.borderSubtle),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(
+                        PS5HydraTheme.radiusChip,
                       ),
                     ),
-                    child: InkWell(
-                      customBorder: const StadiumBorder(),
-                      onTap: () =>
-                          unawaited(_confirmAndRemoveGame(selectedGame)),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 10,
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 6,
-                                vertical: 1.5,
-                              ),
-                              decoration: BoxDecoration(
-                                color: HydraTokens.accentDanger,
-                                borderRadius: BorderRadius.circular(10),
-                              ),
-                              child: const Text(
-                                'X',
-                                style: TextStyle(
-                                  fontFamily: 'ReadexPro',
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.w700,
-                                  color: HydraTokens.textPrimary,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 6),
-                            const Text(
-                              'Remover',
-                              style: TextStyle(
-                                fontFamily: 'ReadexPro',
-                                fontSize: 12,
-                                fontWeight: FontWeight.w600,
-                                color: HydraTokens.textSecondary,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
+                  ),
+                  onPressed: () =>
+                      unawaited(_confirmAndRemoveGame(selectedGame)),
+                  child: const Text(
+                    'Remover',
+                    style: TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
                 ),
               ),
             ),
             const SizedBox(width: 10),
-            Semantics(
-              button: true,
-              enabled: !selectedDownloading && selectedRomPath != null,
-              label: selectedDownloading
-                  ? 'Baixando ${selectedGame.name}'
-                  : 'Jogar ${selectedGame.name}',
-              child: Tooltip(
-                message: selectedDownloading ? 'Download em andamento' : 'Jogar (A)',
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(
-                    minWidth: 48,
-                    minHeight: 48,
-                  ),
-                  child: Material(
-                    color: Colors.black.withOpacity(0.68),
-                    shape: StadiumBorder(
-                      side: BorderSide(
-                        color: Colors.white.withOpacity(0.24),
+            if (selectedDownloading)
+              Semantics(
+                button: true,
+                label: 'Cancelar download de ${selectedGame.name}',
+                child: OutlinedButton(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: HydraTokens.accentDanger,
+                    backgroundColor: PS5HydraTheme.obsidianGlass,
+                    minimumSize: const Size(84, 48),
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    side: BorderSide(
+                      color: HydraTokens.accentDanger.withOpacity(0.55),
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(
+                        PS5HydraTheme.radiusChip,
                       ),
                     ),
-                    child: InkWell(
-                      customBorder: const StadiumBorder(),
-                      onTap: (!selectedDownloading && selectedRomPath != null)
-                          ? () => widget.onLaunchGame(
-                                selectedGame,
-                                selectedRomPath,
-                              )
-                          : null,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 10,
+                  ),
+                  onPressed: () => widget.onCancelDownload(selectedGame),
+                  child: const Text(
+                    'Cancelar',
+                    style: TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              )
+            else
+              Semantics(
+                button: true,
+                enabled: selectedRomPath != null,
+                label: 'Jogar ${selectedGame.name}',
+                child: Tooltip(
+                  message: 'Jogar (A)',
+                  child: FilledButton.icon(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: PS5HydraTheme.auroraSpringMint,
+                      foregroundColor: PS5HydraTheme.textOnAurora,
+                      minimumSize: const Size(92, 48),
+                      padding: const EdgeInsets.symmetric(horizontal: 18),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(
+                          PS5HydraTheme.radiusChip,
                         ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 6.5,
-                                vertical: 1.5,
-                              ),
-                              decoration: BoxDecoration(
-                                color: HydraTokens.primaryAurora,
-                                borderRadius: BorderRadius.circular(10),
-                              ),
-                              child: const Text(
-                                'A',
-                                style: TextStyle(
-                                  fontFamily: 'ReadexPro',
-                                  fontSize: 10.5,
-                                  fontWeight: FontWeight.w700,
-                                  color: HydraTokens.bgPureBlack,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 7),
-                            Text(
-                              selectedDownloading ? 'Baixando...' : 'Jogar',
-                              style: const TextStyle(
-                                fontFamily: 'ReadexPro',
-                                fontSize: 12.5,
-                                fontWeight: FontWeight.w700,
-                                color: HydraTokens.textPrimary,
-                              ),
-                            ),
-                          ],
-                        ),
+                      ),
+                    ),
+                    onPressed: selectedRomPath != null
+                        ? () => widget.onLaunchGame(
+                              selectedGame,
+                              selectedRomPath,
+                            )
+                        : null,
+                    icon: PhosphorIcon(
+                      PhosphorIcons.play(PhosphorIconsStyle.fill),
+                      size: 16,
+                    ),
+                    label: const Text(
+                      'Jogar',
+                      style: TextStyle(
+                        fontFamily: 'ReadexPro',
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
                       ),
                     ),
                   ),
                 ),
               ),
-            ),
           ],
         ),
       ],
     );
   }
+}
 
-  // ==========================================================================
-  // MODO EM PÉ (PORTRAIT) — CHIPS 48DP, BOTÃO DE OPÇÕES E PROGRESSO COMPARTILHADO
-  // ==========================================================================
-  Widget _buildPortraitLibrary(
-    BuildContext context,
-    List<EmulationGame> items,
-    int safeIdx,
-  ) {
-    final topInset = MediaQuery.paddingOf(context).top;
-    return Scaffold(
-      backgroundColor: HydraTokens.bgPureBlack,
-      body: SafeArea(
-        top: false,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Container(
-              decoration: const BoxDecoration(
-                gradient: HydraTokens.heroBackgroundGradient,
-                border: Border(
-                  bottom: BorderSide(color: HydraTokens.borderSubtle8),
+class _LibraryHorizontalGameCard extends StatefulWidget {
+  const _LibraryHorizontalGameCard({
+    required this.game,
+    required this.itemIndex,
+    required this.isSelected,
+    required this.width,
+    required this.height,
+    required this.coverUrl,
+    required this.status,
+    required this.isDownloading,
+    required this.onTap,
+    required this.onLongPress,
+  });
+
+  final EmulationGame game;
+  final int itemIndex;
+  final bool isSelected;
+  final double width;
+  final double height;
+  final String? coverUrl;
+  final RomDownloadStatus? status;
+  final bool isDownloading;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+
+  @override
+  State<_LibraryHorizontalGameCard> createState() =>
+      _LibraryHorizontalGameCardState();
+}
+
+class _LibraryHorizontalGameCardState
+    extends State<_LibraryHorizontalGameCard> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final active = widget.isSelected || _hovered;
+    return Center(
+      child: Semantics(
+        button: true,
+        selected: widget.isSelected,
+        label: '${widget.game.name}, ${widget.game.platformName}',
+        hint: 'Toque para selecionar ou jogar',
+        child: MouseRegion(
+          onEnter: (_) => setState(() => _hovered = true),
+          onExit: (_) => setState(() => _hovered = false),
+          child: GestureDetector(
+            onTap: widget.onTap,
+            onLongPress: widget.onLongPress,
+            child: AnimatedScale(
+              scale: active ? 1.05 : 1.0,
+              duration: PS5HydraTheme.animFast,
+              curve: Curves.easeOut,
+              child: AnimatedContainer(
+                duration: PS5HydraTheme.animMedium,
+                curve: Curves.easeOut,
+                width: widget.width,
+                height: widget.height,
+                decoration: BoxDecoration(
+                  color: PS5HydraTheme.obsidianGlass,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                    color: active
+                        ? PS5HydraTheme.auroraSpringMint
+                        : PS5HydraTheme.borderSubtle,
+                    width: active ? 2.0 : 1.0,
+                  ),
+                  boxShadow: active ? PS5HydraTheme.glowFocus : null,
                 ),
-              ),
-              padding: EdgeInsets.fromLTRB(20, topInset + 14, 20, 14),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Minha Biblioteca',
-                    style: TextStyle(
-                      fontFamily: 'ReadexPro',
-                      fontSize: 20,
-                      fontWeight: FontWeight.w700,
-                      color: HydraTokens.textPrimary,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    items.isEmpty
-                        ? 'Seus jogos, downloads e ISOs importadas aparecem aqui'
-                        : '${items.length} ${items.length == 1 ? 'jogo' : 'jogos'} • Segure para opções',
-                    style: const TextStyle(
-                      fontFamily: 'Rubik',
-                      fontSize: 12,
-                      color: HydraTokens.textSecondary,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12.5),
+                  child: Stack(
+                    fit: StackFit.expand,
                     children: [
-                      Semantics(
-                        button: true,
-                        label: 'Importar ISO ou ROM externa',
-                        child: FilledButton.icon(
-                          style: FilledButton.styleFrom(
-                            backgroundColor: HydraTokens.primaryAurora,
-                            foregroundColor: HydraTokens.bgPureBlack,
-                            minimumSize: const Size(48, 48),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                          ),
-                          onPressed: widget.onImportExternalIsoPressed ??
-                              widget.onImportNewRomPressed,
-                          icon: PhosphorIcon(
-                            PhosphorIcons.folderPlus(PhosphorIconsStyle.bold),
-                            size: 16,
-                          ),
-                          label: const Text(
-                            'Importar ISO / ROM',
-                            style: TextStyle(
-                              fontFamily: 'ReadexPro',
-                              fontSize: 12,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                      ),
-                      Semantics(
-                        button: true,
-                        label: 'Explorar catálogo de ROMs',
-                        child: OutlinedButton(
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: HydraTokens.textPrimary,
-                            backgroundColor: HydraTokens.bgNearBlack,
-                            minimumSize: const Size(48, 48),
-                            side: const BorderSide(
-                              color: HydraTokens.borderSubtle10,
-                            ),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                          ),
-                          onPressed: widget.onImportNewRomPressed,
-                          child: const Text(
-                            'Explorar Catálogo',
-                            style: TextStyle(
-                              fontFamily: 'ReadexPro',
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: Row(
-                  children: [
-                    LoopPlatformChip(
-                      label: 'Todos',
-                      count: _allLibraryItems.length,
-                      selected: _activeFilter == 'todos',
-                      compact: true,
-                      onTap: () => setState(() {
-                        _activeFilter = 'todos';
-                        _selectedIndex = 0;
-                      }),
-                    ),
-                    const SizedBox(width: 8),
-                    LoopPlatformChip(
-                      label: '★ Favoritos',
-                      count: widget.userMeta.favorites.length,
-                      selected: _activeFilter == 'favoritos',
-                      accentColor: HydraTokens.primaryAurora,
-                      compact: true,
-                      onTap: () => setState(() {
-                        _activeFilter = 'favoritos';
-                        _selectedIndex = 0;
-                      }),
-                    ),
-                    const SizedBox(width: 8),
-                    LoopPlatformChip(
-                      label: 'Recentes',
-                      selected: _activeFilter == 'recentes',
-                      compact: true,
-                      onTap: () => setState(() {
-                        _activeFilter = 'recentes';
-                        _selectedIndex = 0;
-                      }),
-                    ),
-                    for (final col in widget.userMeta.collections.keys) ...[
-                      const SizedBox(width: 8),
-                      LoopPlatformChip(
-                        label: col,
-                        count: widget.userMeta.collections[col]?.length ?? 0,
-                        selected: _activeFilter == col,
+                      ProceduralCover(
+                        title: widget.game.name,
+                        platformName: widget.game.platformName,
+                        imageUrl: widget.coverUrl,
+                        borderRadius: 0,
                         compact: true,
-                        onTap: () => setState(() {
-                          _activeFilter = col;
-                          _selectedIndex = 0;
-                        }),
+                        showBottomLabel: false,
                       ),
-                    ],
-                    const SizedBox(width: 8),
-                    _NewCollectionChipButton(
-                      onTap: () => unawaited(_showCreateCollectionDialog()),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            Expanded(
-              child: items.isEmpty
-                  ? Center(
-                      child: SingleChildScrollView(
-                        padding: const EdgeInsets.all(24),
-                        child: _buildEmptyLibraryState(isLandscape: false),
-                      ),
-                    )
-                  : ListView.separated(
-                      controller: _portraitScrollController,
-                      padding: const EdgeInsets.fromLTRB(18, 10, 18, 24),
-                      itemCount: items.length,
-                      separatorBuilder: (_, __) => const SizedBox(height: 10),
-                      itemBuilder: (context, index) {
-                        final game = items[index];
-                        final status = widget.downloadStatuses[game.igdbId];
-                        final isDownloading =
-                            status?.state == RomActionState.downloading;
-                        final progress = status?.progress ?? 0.0;
-                        final romPath = status?.localPath ?? game.localRomPath;
-                        final isSelected = index == safeIdx;
-                        final isFav = widget.userMeta.isFavorite(game.igdbId);
-                        final playtime =
-                            widget.userMeta.playtimeOf(game.igdbId);
-
-                        return HydraTexturedCard(
-                          backgroundColor: HydraTokens.bgNearBlack,
-                          borderRadius: 12,
-                          highlightedBorder:
-                              isSelected && (_gamepadNavActive || _hasFocus),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 8,
-                          ),
-                          onTap: (!isDownloading && romPath != null)
-                              ? () {
-                                  _selectIndex(index, isLandscape: false);
-                                  widget.onLaunchGame(game, romPath);
-                                }
-                              : () => _selectIndex(index, isLandscape: false),
-                          onLongPress: () {
-                            _selectIndex(index, isLandscape: false);
-                            unawaited(_showLongPressOptions(game));
-                          },
-                          child: Row(
-                            children: [
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(8),
-                                child: SizedBox(
-                                  width: 56,
-                                  height: 76,
-                                  child: Stack(
-                                    fit: StackFit.expand,
-                                    children: [
-                                      LoopCoverImage(
-                                        url: game.resolvedGridCoverUrl,
-                                        fit: BoxFit.cover,
-                                        cacheWidth: 128,
-                                        cacheHeight: 176,
-                                      ),
-                                      if (isFav && !isDownloading)
-                                        Positioned(
-                                          top: 4,
-                                          right: 4,
-                                          child: Container(
-                                            padding: const EdgeInsets.all(3),
-                                            decoration: BoxDecoration(
-                                              color:
-                                                  Colors.black.withOpacity(0.72),
-                                              borderRadius:
-                                                  BorderRadius.circular(5),
-                                            ),
-                                            child: PhosphorIcon(
-                                              PhosphorIcons.star(
-                                                PhosphorIconsStyle.fill,
-                                              ),
-                                              size: 10,
-                                              color: HydraTokens.primaryAurora,
-                                            ),
-                                          ),
-                                        ),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Row(
-                                      children: [
-                                        Flexible(
-                                          child: Container(
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 6,
-                                              vertical: 1.5,
-                                            ),
-                                            decoration: BoxDecoration(
-                                              color: Colors.white
-                                                  .withOpacity(0.08),
-                                              borderRadius:
-                                                  BorderRadius.circular(4),
-                                            ),
-                                            child: Text(
-                                              game.platformName,
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: const TextStyle(
-                                                fontFamily: 'JetBrainsMono',
-                                                fontSize: 9.5,
-                                                fontWeight: FontWeight.w700,
-                                                color: HydraTokens.textPrimary,
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                        const SizedBox(width: 6),
-                                        Flexible(
-                                          child: Text(
-                                            isDownloading
-                                                ? (status?.speedLabel ??
-                                                    'Baixando em 2º plano...')
-                                                : '${game.formattedSize} • ${game.romFormatLabel}',
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: TextStyle(
-                                              fontFamily: 'JetBrainsMono',
-                                              fontSize: 10.5,
-                                              color: isDownloading
-                                                  ? HydraTokens.primaryAurora
-                                                  : HydraTokens.textSecondary,
-                                            ),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      game.name,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        fontFamily: 'ReadexPro',
-                                        fontSize: 14.5,
-                                        fontWeight: FontWeight.w700,
-                                        color: HydraTokens.textPrimary,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    if (isDownloading)
-                                      LoopProgressIndicator(
-                                        progress: progress,
-                                        label:
-                                            '${LoopProgressIndicator.formatPercent(progress)} • 2º plano',
-                                        color: HydraTokens.primaryAurora,
-                                        semanticsLabel:
-                                            'Progresso de download de ${game.name}',
-                                      )
-                                    else
-                                      Row(
-                                        children: [
-                                          PhosphorIcon(
-                                            PhosphorIcons.clock(
-                                              PhosphorIconsStyle.regular,
-                                            ),
-                                            size: 11,
-                                            color: HydraTokens.textSecondary,
-                                          ),
-                                          const SizedBox(width: 4),
-                                          Text(
-                                            formatPlaytime(
-                                              playtime.totalSeconds,
-                                            ),
-                                            style: const TextStyle(
-                                              fontFamily: 'JetBrainsMono',
-                                              fontSize: 10.5,
-                                              fontWeight: FontWeight.w600,
-                                              color: HydraTokens.textSecondary,
-                                            ),
-                                          ),
-                                          if (playtime.lastPlayed != null) ...[
-                                            const SizedBox(width: 6),
-                                            Flexible(
-                                              child: Text(
-                                                '• ${formatLastPlayed(playtime.lastPlayed)}',
-                                                maxLines: 1,
-                                                overflow:
-                                                    TextOverflow.ellipsis,
-                                                style: const TextStyle(
-                                                  fontFamily: 'Rubik',
-                                                  fontSize: 10.5,
-                                                  color: HydraTokens.textMuted,
-                                                ),
-                                              ),
-                                            ),
-                                          ],
-                                        ],
-                                      ),
-                                  ],
-                                ),
-                              ),
-                              const SizedBox(width: 10),
-                              if (isDownloading)
-                                OutlinedButton(
-                                  style: OutlinedButton.styleFrom(
-                                    foregroundColor: HydraTokens.accentDanger,
-                                    minimumSize: const Size(76, 48),
-                                    tapTargetSize:
-                                        MaterialTapTargetSize.shrinkWrap,
-                                    side: BorderSide(
-                                      color: HydraTokens.accentDanger
-                                          .withOpacity(0.5),
-                                    ),
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 12,
-                                    ),
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(10),
-                                    ),
-                                  ),
-                                  onPressed: () =>
-                                      widget.onCancelDownload(game),
-                                  child: const Text(
-                                    'Cancelar',
-                                    style: TextStyle(
-                                      fontFamily: 'ReadexPro',
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                )
-                              else
-                                FilledButton(
-                                  style: FilledButton.styleFrom(
-                                    backgroundColor: HydraTokens.primaryAurora,
-                                    foregroundColor: HydraTokens.bgPureBlack,
-                                    minimumSize: const Size(72, 48),
-                                    tapTargetSize:
-                                        MaterialTapTargetSize.shrinkWrap,
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 16,
-                                    ),
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(10),
-                                    ),
-                                  ),
-                                  onPressed: romPath == null
-                                      ? null
-                                      : () => widget.onLaunchGame(
-                                            game,
-                                            romPath,
-                                          ),
-                                  child: const Text(
-                                    'Jogar',
-                                    style: TextStyle(
-                                      fontFamily: 'ReadexPro',
-                                      fontSize: 12.5,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                ),
+                      const DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            stops: [0.32, 0.72, 1.0],
+                            colors: [
+                              Colors.transparent,
+                              Color(0xAD000000),
+                              Color(0xF5000000),
                             ],
                           ),
-                        );
-                      },
-                    ),
+                        ),
+                      ),
+                      Positioned(
+                        left: 10,
+                        right: 10,
+                        bottom: 10,
+                        child: AnimatedGameLogo(
+                          game: widget.game,
+                          height: 24,
+                          maxWidthFraction: 1.0,
+                          itemIndex: widget.itemIndex,
+                          enableStagger: true,
+                          maxLines: 1,
+                          fallbackStyle: const TextStyle(
+                            fontFamily: 'ReadexPro',
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            color: PS5HydraTheme.textPrimary,
+                          ),
+                        ),
+                      ),
+                      if (widget.isDownloading)
+                        Container(
+                          color: Colors.black.withOpacity(0.72),
+                          padding: const EdgeInsets.all(12),
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              SizedBox(
+                                width: 40,
+                                height: 40,
+                                child: CircularProgressIndicator(
+                                  value: widget.status?.progress,
+                                  strokeWidth: 3.5,
+                                  color: PS5HydraTheme.auroraSpringMint,
+                                  backgroundColor: Colors.white24,
+                                ),
+                              ),
+                              const SizedBox(height: 10),
+                              Text(
+                                LoopProgressIndicator.formatPercent(
+                                  widget.status?.progress ?? 0,
+                                ),
+                                style: PS5HydraTheme.metaMonoStyle.copyWith(
+                                  fontSize: 13,
+                                  color: PS5HydraTheme.textPrimary,
+                                ),
+                              ),
+                              if (widget.status?.speedLabel != null) ...[
+                                const SizedBox(height: 2),
+                                Text(
+                                  widget.status!.speedLabel!,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontFamily: 'Rubik',
+                                    fontSize: 10,
+                                    color: PS5HydraTheme.textSecondary,
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
             ),
-          ],
+          ),
         ),
       ),
     );
   }
 }
+
 
 class _NewCollectionChipButton extends StatefulWidget {
   const _NewCollectionChipButton({required this.onTap});

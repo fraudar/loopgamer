@@ -95,7 +95,7 @@ const List<RommPlatformSpec> kRommPlatforms = [
     manufacturer: 'Multi-Console',
     releaseYear: 1983,
     defaultExtension: 'ROM',
-    accentColor: Color(0xFF00F5A0),
+    accentColor: Color(0xFFFFFFFF),
   ),
   RommPlatformSpec(
     slug: 'psp',
@@ -671,7 +671,7 @@ class EmulationGame {
       (p) => p.slug.toLowerCase() == platformSlug.toLowerCase(),
     );
     if (match.isNotEmpty) return match.first.accentColor;
-    return const Color(0xFF00F5A0);
+    return const Color(0xFFFFFFFF);
   }
 
   /// Gera um ID inteiro positivo determinístico (FNV-1a 32-bit, faixa > 100000)
