@@ -565,6 +565,54 @@ class GameAssetService {
         .toList();
   }
 
+  static const Set<String> _editionAndSequelTokens = {
+    '0',
+    '1',
+    '2',
+    '3',
+    '4',
+    '5',
+    '6',
+    '7',
+    '8',
+    '9',
+    'ii',
+    'iii',
+    'iv',
+    'v',
+    'vi',
+    'zero',
+    'gaiden',
+    'survivor',
+    'outbreak',
+    'veronica',
+    'revelations',
+    'village',
+    'biohazard',
+    'nemesis',
+    'director',
+    'remake',
+    'remaster',
+    'alpha',
+    'turbo',
+    'super',
+    'hyper',
+    'ultra',
+    'champion',
+    'max',
+    'portable',
+    'classic',
+    'advance',
+    'pocket',
+    '3d',
+    '64',
+    'ds',
+    'wii',
+    'x',
+    'plus',
+    'ex',
+  };
+
   /// Calcula similaridade normalizada `[0.0, 1.0]` entre título buscado e candidato.
   static double titleSimilarityScore(String query, String candidate) {
     final qNorm = EmulationGame.normalizeSearchText(cleanGameTitle(query));
@@ -582,6 +630,18 @@ class GameAssetService {
     final qTokens = _significantTokens(qNorm).toSet();
     final cTokens = _significantTokens(cNorm).toSet();
     if (qTokens.isEmpty || cTokens.isEmpty) return 0.0;
+
+    // Evita cruzar versões/sequências diferentes (ex.: Resident Evil 1/Gaiden vs 2/4/Remake)
+    for (final tok in cTokens) {
+      if (_editionAndSequelTokens.contains(tok) && !qTokens.contains(tok)) {
+        return 0.0;
+      }
+    }
+    for (final tok in qTokens) {
+      if (_editionAndSequelTokens.contains(tok) && !cTokens.contains(tok)) {
+        return 0.0;
+      }
+    }
 
     final matches = qTokens.intersection(cTokens).length;
     if (matches == 0) return 0.0;
@@ -622,12 +682,15 @@ class GameAssetService {
     final cleanTitle = cleanGameTitle(rawTitle);
     if (cleanTitle.isEmpty) return const GameAssets.empty();
 
+    final normalizedSlug = platformSlug?.trim().toLowerCase() ?? '';
     final baseKey = _cacheKey(cleanTitle);
-    final scopedKey = (platformSlug != null && platformSlug.isNotEmpty)
-        ? _cacheKey('$cleanTitle|$platformSlug')
+    final scopedKey = normalizedSlug.isNotEmpty
+        ? _cacheKey('$cleanTitle|$normalizedSlug')
         : baseKey;
 
-    final cached = _sessionCache[scopedKey] ?? _sessionCache[baseKey];
+    final cached = scopedKey != baseKey
+        ? _sessionCache[scopedKey]
+        : _sessionCache[baseKey];
     if (cached != null) return cached;
 
     final seeded = GameAssets(
@@ -651,6 +714,7 @@ class GameAssetService {
     final future = _semaphore.run(
       () => _resolvePipeline(
         cleanTitle: cleanTitle,
+        platformSlug: normalizedSlug,
         seeded: seeded,
         fallbackBoxartUrl: fallbackBoxartUrl,
         fallbackSnapUrl: fallbackSnapUrl,
@@ -661,8 +725,13 @@ class GameAssetService {
     try {
       final resolved = await future;
       _putInMemoryCache(scopedKey, resolved);
-      if (scopedKey != baseKey && resolved.hasLogo) {
-        _putInMemoryCache(baseKey, resolved);
+      if (scopedKey != baseKey &&
+          resolved.hasLogo &&
+          !_sessionCache.containsKey(baseKey)) {
+        _putInMemoryCache(
+          baseKey,
+          GameAssets(logoImageUrl: resolved.logoImageUrl, source: resolved.source),
+        );
       }
       return resolved;
     } finally {
@@ -680,15 +749,98 @@ class GameAssetService {
     }
   }
 
+  Future<String?> _resolveLibretroThumbnail(
+    String cleanTitle,
+    String platformSlug, {
+    required String kind, // 'Named_Boxarts' | 'Named_Snaps'
+    String? primaryCandidateUrl,
+  }) async {
+    final candidates = <String>[
+      if (primaryCandidateUrl != null && primaryCandidateUrl.isNotEmpty)
+        primaryCandidateUrl,
+    ];
+
+    final sanitized = cleanTitle
+        .replaceAll(RegExp(r'[&\*/:`<>?\\|"]'), '_')
+        .trim();
+    if (sanitized.isNotEmpty && platformSlug.isNotEmpty) {
+      final playlists = <String>[
+        EmulationGame(
+          igdbId: 0,
+          name: cleanTitle,
+          canonicalNoIntroName: cleanTitle,
+          summary: '',
+          genres: const [],
+          developer: '',
+          releaseYear: null,
+          rating: 0,
+          platformName: platformSlug,
+          platformSlug: platformSlug,
+          directRomUrl: '',
+        ).libretroPlaylistName,
+        if (platformSlug == 'cps1' || platformSlug == 'cps2') 'MAME',
+      ];
+      const suffixes = ['(USA)', '(USA) (Disc 1)', '(World)', '(Europe)', ''];
+      for (final playlist in playlists.toSet()) {
+        for (final sfx in suffixes) {
+          final fileName = sfx.isEmpty ? '$sanitized.png' : '$sanitized $sfx.png';
+          final url =
+              'https://thumbnails.libretro.com/${Uri.encodeComponent(playlist)}/$kind/${Uri.encodeComponent(fileName)}';
+          if (!candidates.contains(url)) candidates.add(url);
+        }
+      }
+    }
+
+    for (final url in candidates.take(6)) {
+      if (await _isUrlReachable(url)) {
+        return url;
+      }
+    }
+    return null;
+  }
+
   Future<GameAssets> _resolvePipeline({
     required String cleanTitle,
+    required String platformSlug,
     required GameAssets seeded,
     String? fallbackBoxartUrl,
     String? fallbackSnapUrl,
   }) async {
     var acc = seeded;
 
-    // 1. Opcionais com chave (quando configurados pelo ambiente)
+    // 1. Capas/snaps autênticos da plataforma via Libretro Thumbnails primeiro
+    if (!acc.hasCover &&
+        (platformSlug.isNotEmpty ||
+            (fallbackBoxartUrl != null && fallbackBoxartUrl.isNotEmpty))) {
+      final boxartUrl = await _resolveLibretroThumbnail(
+        cleanTitle,
+        platformSlug,
+        kind: 'Named_Boxarts',
+        primaryCandidateUrl: fallbackBoxartUrl,
+      );
+      if (boxartUrl != null) {
+        acc = acc.mergeWith(
+          GameAssets(coverImageUrl: boxartUrl, source: 'libretro'),
+        );
+      }
+    }
+    if (!acc.hasBackground &&
+        (platformSlug.isNotEmpty ||
+            (fallbackSnapUrl != null && fallbackSnapUrl.isNotEmpty))) {
+      final snapUrl = await _resolveLibretroThumbnail(
+        cleanTitle,
+        platformSlug,
+        kind: 'Named_Snaps',
+        primaryCandidateUrl: fallbackSnapUrl,
+      );
+      if (snapUrl != null) {
+        acc = acc.mergeWith(
+          GameAssets(backgroundImageUrl: snapUrl, source: 'libretro'),
+        );
+      }
+    }
+
+    // 2. Opcionais com chave (quando configurados pelo ambiente)
     final keyedTasks = <Future<GameAssets>>[];
     if (steamGridDbApiKey.trim().isNotEmpty &&
         (!acc.hasLogo || !acc.hasBackground || !acc.hasCover)) {
@@ -705,7 +857,7 @@ class GameAssetService {
       }
     }
 
-    // 2. Fontes 100% sem chave (Steam Store/CDN + GOG Catalog + Wikidata/Commons)
+    // 3. Fontes 100% sem chave (Steam Store/CDN + GOG Catalog + Wikidata/Commons)
     if (!acc.hasLogo || !acc.hasBackground || !acc.hasCover) {
       final keylessPrimary = await Future.wait([
         _fetchFromSteam(cleanTitle),
@@ -719,24 +871,6 @@ class GameAssetService {
     if (!acc.hasLogo || !acc.hasBackground) {
       final wikiAssets = await _fetchFromWikidataAndCommons(cleanTitle);
       acc = acc.mergeWith(wikiAssets);
-    }
-
-    // 3. Fallback opcional para imagens Libretro verificadas por HEAD
-    if (!acc.hasCover && fallbackBoxartUrl != null && fallbackBoxartUrl.isNotEmpty) {
-      if (await _isUrlReachable(fallbackBoxartUrl)) {
-        acc = acc.mergeWith(
-          GameAssets(coverImageUrl: fallbackBoxartUrl, source: 'libretro'),
-        );
-      }
-    }
-    if (!acc.hasBackground &&
-        fallbackSnapUrl != null &&
-        fallbackSnapUrl.isNotEmpty) {
-      if (await _isUrlReachable(fallbackSnapUrl)) {
-        acc = acc.mergeWith(
-          GameAssets(backgroundImageUrl: fallbackSnapUrl, source: 'libretro'),
-        );
-      }
     }
 
     return acc;
@@ -967,17 +1101,20 @@ class GameAssetService {
   // ===========================================================================
   Future<GameAssets> _fetchFromGog(String title) async {
     try {
-      final res = await _dio.get<Map<String, dynamic>>(
+      final res = await _dio.get<dynamic>(
         'https://catalog.gog.com/v1/catalog',
         queryParameters: {
           'limit': 6,
           'query': 'like:$title',
         },
       );
-      if ((res.statusCode ?? 0) < 200 || (res.statusCode ?? 0) >= 300) {
+      if ((res.statusCode ?? 0) < 200 ||
+          (res.statusCode ?? 0) >= 300 ||
+          res.data is! Map<String, dynamic>) {
         return const GameAssets.empty();
       }
-      final products = res.data?['products'] as List<dynamic>?;
+      final data = res.data as Map<String, dynamic>;
+      final products = data['products'] as List<dynamic>?;
       if (products == null || products.isEmpty) return const GameAssets.empty();
 
       Map<String, dynamic>? best;

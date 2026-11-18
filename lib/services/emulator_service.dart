@@ -930,13 +930,18 @@ class EmulatorService {
     final parentZipFile = File(
       '${romFile.parent.path}/${canonical.parentStem}.zip',
     );
+    final isCorruptOrUnreadable =
+        zipInspect == null || zipInspect.entryCount == 0;
     final isCps2MissingKey =
         canonical.platformSlug == 'cps2' && zipInspect?.hasKey == false;
     final isCloneNotNamedParent = currentStem != canonical.parentStem;
     final fileSize = await romFile.length();
     final suspiciousSplitSize = fileSize < 2 * 1024 * 1024;
 
-    if (!isCps2MissingKey && !isCloneNotNamedParent && !suspiciousSplitSize) {
+    if (!isCorruptOrUnreadable &&
+        !isCps2MissingKey &&
+        !isCloneNotNamedParent &&
+        !suspiciousSplitSize) {
       return romPath;
     }
 

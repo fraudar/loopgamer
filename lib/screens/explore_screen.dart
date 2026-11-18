@@ -5,8 +5,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:phosphor_flutter/phosphor_flutter.dart';
+import '../data/pc_port_catalog.dart';
 import '../models/app_settings.dart';
 import '../models/emulation_game.dart';
+import '../models/pc_port.dart';
 import '../services/game_asset_service.dart';
 import '../services/igdb_steamgriddb_service.dart';
 import '../services/rom_download_service.dart';
@@ -17,6 +19,7 @@ import '../widgets/loop_common_widgets.dart';
 import '../widgets/procedural_cover.dart';
 import 'game_detail_screen.dart';
 import 'home_screen.dart';
+import 'pc_ports_screen.dart';
 
 enum _CatalogSortMode { featured, alphaAsc, yearDesc }
 
@@ -436,6 +439,31 @@ class _ExploreScreenState extends State<ExploreScreen> {
     _platformCounts = counts;
     _filteredResults = filtered;
     _currentPlatformRetroCount = selectedRetroCount;
+  }
+
+  List<PcPortEntry> _matchingPcPorts() {
+    final q = EmulationGame.normalizeSearchText(_searchController.text);
+    if (q.isEmpty) {
+      if (_selectedCategory != RommPlatformCategory.all ||
+          _selectedPlatformSlug != 'todos') {
+        return const [];
+      }
+      return PcPortCatalog.entries
+          .where(
+            (e) =>
+                e.id == 'cuphead-mobile' ||
+                e.id == 'hollow-knight-vulkan' ||
+                e.id == 'hollow-knight-silksong',
+          )
+          .toList(growable: false);
+    }
+    final tokens = q.split(' ').where((t) => t.isNotEmpty).toList();
+    return PcPortCatalog.entries.where((e) {
+      final hay = EmulationGame.normalizeSearchText(
+        '${e.title} ${e.developer} ${e.genre} ${e.description}',
+      );
+      return tokens.every(hay.contains);
+    }).toList(growable: false);
   }
 
   Future<void> _loadInitialRealCatalog() async {
@@ -1272,7 +1300,29 @@ class _ExploreScreenState extends State<ExploreScreen> {
                                     ),
                                   ),
                                 ),
-                              if (_filteredResults.isEmpty)
+                              if (_matchingPcPorts().isNotEmpty &&
+                                  (_searchController.text.trim().isNotEmpty ||
+                                      (_selectedCategory ==
+                                              RommPlatformCategory.all &&
+                                          _selectedPlatformSlug == 'todos')))
+                                SliverToBoxAdapter(
+                                  child: _PcPortsSearchStrip(
+                                    ports: _matchingPcPorts(),
+                                    onTapPort: (entry) {
+                                      unawaited(
+                                        Navigator.of(context).push(
+                                          MaterialPageRoute<void>(
+                                            builder: (_) => PcPortsScreen(
+                                              initialEntryId: entry.id,
+                                            ),
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                ),
+                              if (_filteredResults.isEmpty &&
+                                  _matchingPcPorts().isEmpty)
                                 SliverToBoxAdapter(
                                   child: Center(
                                     child: Padding(
@@ -1838,7 +1888,9 @@ class _RomListRowCardState extends State<_RomListRowCard> {
                     Text(
                       isDownloading
                           ? 'Baixando ${LoopProgressIndicator.formatPercent(status.progress)}'
-                          : '${game.formattedSize} · ${game.romFormatLabel}',
+                          : game.hasKnownSize
+                              ? '${game.formattedSize} · ${game.romFormatLabel}'
+                              : game.romFormatLabel,
                       style: PS5HydraTheme.metaMonoStyle.copyWith(
                         color: isDownloading
                             ? PS5HydraTheme.auroraSpringMint
@@ -1935,10 +1987,12 @@ class _GameDetailSheetState extends State<GameDetailSheet> {
   );
   late RomDownloadStatus _status = widget.initialStatus;
   StreamSubscription<RomDownloadEvent>? _sub;
+  int _resolvedSizeBytes = 0;
 
   @override
   void initState() {
     super.initState();
+    _resolvedSizeBytes = widget.game.estimatedSizeBytes;
     final active = widget.downloadService.activeStatuses[widget.game.igdbId];
     if (active != null) {
       _status = active;
@@ -1948,6 +2002,16 @@ class _GameDetailSheetState extends State<GameDetailSheet> {
         setState(() => _status = event.status);
       }
     });
+    if (_resolvedSizeBytes <= 0 &&
+        !widget.game.directRomUrl.startsWith('external://')) {
+      unawaited(
+        widget.downloadService.resolveRealRomSizeBytes(widget.game).then((sz) {
+          if (sz > 0 && mounted) {
+            setState(() => _resolvedSizeBytes = sz);
+          }
+        }),
+      );
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         _sheetFocusNode.requestFocus();
@@ -1981,9 +2045,13 @@ class _GameDetailSheetState extends State<GameDetailSheet> {
   }
 
   Future<void> _startBackgroundDownload() async {
+    final gameToDownload = (_resolvedSizeBytes > 0 &&
+            _resolvedSizeBytes != widget.game.estimatedSizeBytes)
+        ? widget.game.copyWith(estimatedSizeBytes: _resolvedSizeBytes)
+        : widget.game;
     unawaited(
       widget.downloadService.startBackgroundDownload(
-        game: widget.game,
+        game: gameToDownload,
         onStatus: (st) {
           widget.onStatusChanged(st);
           if (mounted) {
@@ -2050,10 +2118,18 @@ class _GameDetailSheetState extends State<GameDetailSheet> {
         cleanCrc != '00000000' &&
         cleanCrc != 'N/A';
 
+    final effectiveSizeBytes = _status.totalBytes > 0
+        ? _status.totalBytes
+        : _resolvedSizeBytes;
+    final sizedGame = effectiveSizeBytes > 0 &&
+            effectiveSizeBytes != game.estimatedSizeBytes
+        ? game.copyWith(estimatedSizeBytes: effectiveSizeBytes)
+        : game;
+
     final metaParts = <String>[
       game.platformName,
       game.romFormatLabel,
-      if (game.hasKnownSize) game.formattedSize,
+      if (sizedGame.hasKnownSize) sizedGame.formattedSize,
       game.region,
       if (game.releaseYear != null) '${game.releaseYear}',
       if (game.developer.trim().isNotEmpty) game.developer.trim(),
@@ -2381,6 +2457,123 @@ class _GameDetailSheetState extends State<GameDetailSheet> {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _PcPortsSearchStrip extends StatelessWidget {
+  const _PcPortsSearchStrip({
+    required this.ports,
+    required this.onTapPort,
+  });
+
+  final List<PcPortEntry> ports;
+  final ValueChanged<PcPortEntry> onTapPort;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 10, 20, 2),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              PhosphorIcon(
+                PhosphorIcons.androidLogo(PhosphorIconsStyle.fill),
+                size: 14,
+                color: PS5HydraTheme.auroraSpringMint,
+              ),
+              const SizedBox(width: 6),
+              const Text(
+                'Ports Android / PC compatíveis',
+                style: TextStyle(
+                  fontFamily: 'ReadexPro',
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: PS5HydraTheme.textPrimary,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 70,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: ports.length,
+              separatorBuilder: (_, __) => const SizedBox(width: 8),
+              itemBuilder: (context, index) {
+                final entry = ports[index];
+                final isDirect = entry.source == PcPortSource.directApk ||
+                    entry.source == PcPortSource.githubRelease;
+                return InkWell(
+                  onTap: () => onTapPort(entry),
+                  borderRadius: BorderRadius.circular(10),
+                  child: Container(
+                    width: 240,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 11,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: HydraTokens.surfaceElevated1,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: PS5HydraTheme.auroraSpringMint.withOpacity(0.28),
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          entry.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontFamily: 'ReadexPro',
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w700,
+                            color: HydraTokens.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                '${entry.license} · ${entry.genre}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontFamily: 'Rubik',
+                                  fontSize: 10.5,
+                                  color: HydraTokens.textSecondary,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              isDirect ? 'Baixar APK' : 'Abrir',
+                              style: const TextStyle(
+                                fontFamily: 'ReadexPro',
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w700,
+                                color: PS5HydraTheme.auroraSpringMint,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
       ),
     );
   }
