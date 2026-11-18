@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:phosphor_flutter/phosphor_flutter.dart';
@@ -417,6 +416,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                           child: ProceduralCover(
                             title: game.name,
                             platformName: game.platformName,
+                            gameId: game.igdbId,
                             imageUrl: _resolvedAssets[game.igdbId]
                                     ?.coverImageUrl ??
                                 game.gridCoverUrl ??
@@ -805,25 +805,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
               switchInCurve: Curves.easeOut,
               child: SizedBox.expand(
                 key: ValueKey<int>(selectedGame.igdbId),
-                child: selectedBannerUrl != null &&
-                        selectedBannerUrl.isNotEmpty
-                    ? CachedNetworkImage(
-                        imageUrl: selectedBannerUrl,
-                        cacheManager: SessionMemoryCacheManager.instance,
-                        fit: BoxFit.cover,
-                        errorWidget: (_, __, ___) => ProceduralCover(
-                          title: selectedGame.name,
-                          platformName: selectedGame.platformName,
-                          borderRadius: 0,
-                          showBottomLabel: false,
-                        ),
-                      )
-                    : ProceduralCover(
-                        title: selectedGame.name,
-                        platformName: selectedGame.platformName,
-                        borderRadius: 0,
-                        showBottomLabel: false,
-                      ),
+                child: ProceduralCover(
+                  title: selectedGame.name,
+                  platformName: selectedGame.platformName,
+                  gameId: selectedGame.igdbId,
+                  isBanner: true,
+                  imageUrl: selectedBannerUrl,
+                  borderRadius: 0,
+                  showBottomLabel: false,
+                ),
               ),
             ),
 
@@ -1442,6 +1432,7 @@ class _LibraryHorizontalGameCardState
                       ProceduralCover(
                         title: widget.game.name,
                         platformName: widget.game.platformName,
+                        gameId: widget.game.igdbId,
                         imageUrl: widget.coverUrl,
                         borderRadius: 0,
                         compact: true,

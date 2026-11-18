@@ -8,6 +8,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
+import 'rom_download_service.dart';
 
 /// Bitmask padrão Libretro (RETRO_DEVICE_ID_JOYPAD_*)
 class RetroJoypadMask {
@@ -155,6 +156,11 @@ class EmulatorService {
     onListen: _ensureEventSubscription,
     onCancel: _maybeCancelEventSubscription,
   );
+  late final StreamController<bool> _networkStateController =
+      StreamController<bool>.broadcast(
+    onListen: _ensureEventSubscription,
+    onCancel: _maybeCancelEventSubscription,
+  );
 
   /// Último erro registrado em operações de save/load ou canal nativo.
   String? get lastError => _lastError;
@@ -175,6 +181,9 @@ class EmulatorService {
   /// Stream de mudanças no estado de conexão do gamepad físico.
   Stream<bool> get hardwareGamepadStateStream =>
       _hardwareGamepadStateController.stream;
+
+  /// Stream de mudanças de conectividade emitidas pelo `ConnectivityManager`.
+  Stream<bool> get networkStateStream => _networkStateController.stream;
 
   void _ensureEventSubscription() {
     if (_isDisposed || _eventSubscription != null) return;
@@ -210,6 +219,11 @@ class EmulatorService {
                 Map<String, dynamic>.from(event),
               );
             }
+          } else if (eventName == 'networkStatusChanged') {
+            final connected = event['connected'] == true;
+            if (!_networkStateController.isClosed) {
+              _networkStateController.add(connected);
+            }
           }
         },
         onError: (Object error) {
@@ -225,7 +239,8 @@ class EmulatorService {
     if (!_telemetryController.hasListener &&
         !_gamepadController.hasListener &&
         !_gamepadUiActionController.hasListener &&
-        !_hardwareGamepadStateController.hasListener) {
+        !_hardwareGamepadStateController.hasListener &&
+        !_networkStateController.hasListener) {
       unawaited(_eventSubscription?.cancel());
       _eventSubscription = null;
     }
@@ -574,15 +589,6 @@ class EmulatorService {
 
   static const int _pceCdBiosMinBytes = 256 * 1024 - 4096;
 
-  static const String _ppssppAssetsMissingMessage =
-      'Não foi possível preparar os arquivos de sistema do PPSSPP. '
-      'Sem eles (fontes, shaders e compat.ini) os jogos de PSP não inicializam. '
-      'Verifique sua conexão e tente novamente.';
-
-  static const String _dolphinSysMissingMessage =
-      'Não foi possível preparar os arquivos de sistema do Dolphin (Wii / GameCube). '
-      'Sem eles o jogo fecha sozinho na inicialização. Verifique sua conexão e tente novamente.';
-
   /// Confere se os assets oficiais do Dolphin já estão instalados.
   ///
   /// O marcador `Sys/codehandler.bin` é um arquivo real do pacote oficial
@@ -603,8 +609,16 @@ class EmulatorService {
   Future<void> _ensureDolphinSys(Directory systemDir) async {
     if (await _hasDolphinSys(systemDir)) return;
 
+    final net = await fetchNetworkStatus();
+    if (!net.connected) {
+      await _ensureMinimalDolphinLayout(systemDir);
+      debugPrint(
+        '[EmulatorService] Offline: Dolphin iniciado com layout local mínimo sem baixar Dolphin.zip.',
+      );
+      return;
+    }
+
     final tmpZip = File('${systemDir.path}/dolphin_sys.zip.part');
-    Object? lastError;
     for (var attempt = 1; attempt <= 2; attempt++) {
       try {
         await _dio
@@ -622,7 +636,6 @@ class EmulatorService {
         }
         await _runExtractDolphinAssetsInIsolate(tmpZip.path, systemDir.path);
       } catch (e) {
-        lastError = e;
         debugPrint(
           '[EmulatorService] Falha ao preparar Dolphin Sys (tentativa $attempt/2): $e',
         );
@@ -638,11 +651,16 @@ class EmulatorService {
       if (await _hasDolphinSys(systemDir)) return;
     }
 
-    throw StateError(
-      lastError == null
-          ? _dolphinSysMissingMessage
-          : '$_dolphinSysMissingMessage ($lastError)',
-    );
+    await _ensureMinimalDolphinLayout(systemDir);
+  }
+
+  Future<void> _ensureMinimalDolphinLayout(Directory systemDir) async {
+    for (final rel in const ['dolphin-emu/Sys', 'dolphin-emu/User/Config']) {
+      final dir = Directory('${systemDir.path}/$rel');
+      if (!await dir.exists()) {
+        await dir.create(recursive: true);
+      }
+    }
   }
 
   static Future<void> _runExtractDolphinAssetsInIsolate(
@@ -690,7 +708,18 @@ class EmulatorService {
   static Future<bool> _hasPpssppAssets(Directory systemDir) async {
     final marker = File('${systemDir.path}/PPSSPP/flash0/font/jpn0.pgf');
     try {
-      return await marker.exists() && await marker.length() > 1000;
+      if (await marker.exists() && await marker.length() > 1000) {
+        return true;
+      }
+      final fontDir = Directory('${systemDir.path}/PPSSPP/flash0/font');
+      if (await fontDir.exists()) {
+        await for (final entity in fontDir.list(followLinks: false)) {
+          if (entity is File && await entity.length() > 1000) {
+            return true;
+          }
+        }
+      }
+      return false;
     } catch (e) {
       debugPrint('[EmulatorService] Falha ao verificar assets PPSSPP: $e');
       return false;
@@ -698,14 +727,21 @@ class EmulatorService {
   }
 
   /// Baixa e extrai os assets do PPSSPP (fontes, shaders, compat.ini, lang),
-  /// sem os quais o core `ppsspp_libretro_android.so` não inicializa jogos.
-  /// Lança [StateError] quando os arquivos continuam ausentes, para que a
-  /// tela do jogo mostre o motivo em vez de fechar silenciosamente.
+  /// quando disponíveis e online; quando offline, cria o layout mínimo local
+  /// para nunca impedir jogos de PSP (ex.: Bleach: Heat the Soul 3) de abrir.
   Future<void> _ensurePpssppAssets(Directory systemDir) async {
     if (await _hasPpssppAssets(systemDir)) return;
 
+    final net = await fetchNetworkStatus();
+    if (!net.connected) {
+      await _ensureMinimalPpssppLayout(systemDir);
+      debugPrint(
+        '[EmulatorService] Offline: PPSSPP iniciando com layout mínimo local sem baixar PPSSPP.zip.',
+      );
+      return;
+    }
+
     final tmpZip = File('${systemDir.path}/ppsspp_sys.zip.part');
-    Object? lastError;
     for (var attempt = 1; attempt <= 2; attempt++) {
       try {
         await _dio
@@ -723,7 +759,6 @@ class EmulatorService {
         }
         await _runExtractPpssppAssetsInIsolate(tmpZip.path, systemDir.path);
       } catch (e) {
-        lastError = e;
         debugPrint(
           '[EmulatorService] Falha ao preparar assets PPSSPP (tentativa $attempt/2): $e',
         );
@@ -739,11 +774,247 @@ class EmulatorService {
       if (await _hasPpssppAssets(systemDir)) return;
     }
 
-    throw StateError(
-      lastError == null
-          ? _ppssppAssetsMissingMessage
-          : '$_ppssppAssetsMissingMessage ($lastError)',
+    await _ensureMinimalPpssppLayout(systemDir);
+    debugPrint(
+      '[EmulatorService] PPSSPP.zip indisponível no momento; prosseguindo com layout local mínimo.',
     );
+  }
+
+  Future<void> _ensureMinimalPpssppLayout(Directory systemDir) async {
+    for (final rel in const [
+      'PPSSPP/flash0/font',
+      'PPSSPP/shaders',
+      'PPSSPP/system',
+      'PPSSPP/lang',
+    ]) {
+      final dir = Directory('${systemDir.path}/$rel');
+      if (!await dir.exists()) {
+        await dir.create(recursive: true);
+      }
+    }
+  }
+
+  static const String _qsoundBiosUrl =
+      'https://archive.org/download/arcade_sfa3/qsound_hle.zip';
+
+  Future<void> _ensureQSoundBios(Directory systemDir, String? romPath) async {
+    try {
+      final fbneoDir = Directory('${systemDir.path}/fbneo');
+      if (!await fbneoDir.exists()) {
+        await fbneoDir.create(recursive: true);
+      }
+      final fbneoQsound = File('${fbneoDir.path}/qsound.zip');
+      if (!await fbneoQsound.exists() || await fbneoQsound.length() < 512) {
+        final net = await fetchNetworkStatus();
+        if (net.connected) {
+          final tmpFile = File('${fbneoQsound.path}.part');
+          try {
+            await _dio
+                .download(
+                  _qsoundBiosUrl,
+                  tmpFile.path,
+                  options: Options(
+                    receiveTimeout: const Duration(seconds: 20),
+                    sendTimeout: const Duration(seconds: 10),
+                  ),
+                )
+                .timeout(const Duration(seconds: 25));
+            if (await tmpFile.exists() && await tmpFile.length() >= 512) {
+              await tmpFile.rename(fbneoQsound.path);
+            }
+          } catch (e) {
+            debugPrint(
+              '[EmulatorService] Aviso ao baixar qsound_hle.zip ($e); prosseguindo.',
+            );
+          } finally {
+            await _deleteIfExists(tmpFile);
+          }
+        }
+      }
+      if (await fbneoQsound.exists() && await fbneoQsound.length() >= 512) {
+        for (final extraName in const ['qsound.zip', 'qsound_hle.zip']) {
+          final f1 = File('${fbneoDir.path}/$extraName');
+          if (!await f1.exists()) await fbneoQsound.copy(f1.path);
+          final f2 = File('${systemDir.path}/$extraName');
+          if (!await f2.exists()) await fbneoQsound.copy(f2.path);
+          if (romPath != null && romPath.isNotEmpty) {
+            final romParent = File(romPath).parent;
+            if (romParent.path.contains('arcade_')) {
+              final f3 = File('${romParent.path}/$extraName');
+              if (!await f3.exists()) await fbneoQsound.copy(f3.path);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('[EmulatorService] Falha ao preparar qsound.zip: $e');
+    }
+  }
+
+  /// Verifica e auto-repara romsets de arcade (CPS1/CPS2/NeoGeo) antes de
+  /// iniciar o core FBNeo, evitando erro de romset faltando arquivos (ex. `sfa3`).
+  Future<String> _prepareFbneoArcadeRom({
+    required Directory systemDir,
+    required String romPath,
+    required String platformSlug,
+  }) async {
+    if (platformSlug == 'cps1' ||
+        platformSlug == 'cps2' ||
+        platformSlug == 'mame' ||
+        platformSlug == 'arcade') {
+      await _ensureQSoundBios(systemDir, romPath);
+    }
+
+    final romFile = File(romPath);
+    if (!await romFile.exists()) return romPath;
+    final lower = romPath.toLowerCase();
+    if (!lower.endsWith('.zip')) return romPath;
+
+    final currentName = romFile.uri.pathSegments.isEmpty
+        ? ''
+        : romFile.uri.pathSegments.last.toLowerCase();
+    final currentStem = currentName.endsWith('.zip')
+        ? currentName.substring(0, currentName.length - 4)
+        : currentName;
+
+    ({bool hasKey, String? keyStem, int entryCount})? zipInspect;
+    try {
+      zipInspect = await Isolate.run(() {
+        final bytes = File(romPath).readAsBytesSync();
+        final arc = ZipDecoder().decodeBytes(bytes, verify: false);
+        var hasKey = false;
+        String? keyStem;
+        for (final entry in arc.files) {
+          final eName = entry.name.toLowerCase().split('/').last;
+          if (eName.endsWith('.key')) {
+            hasKey = true;
+            keyStem = eName.substring(0, eName.length - 4);
+            break;
+          }
+        }
+        return (hasKey: hasKey, keyStem: keyStem, entryCount: arc.files.length);
+      });
+    } catch (e) {
+      debugPrint('[EmulatorService] Falha ao inspecionar zip FBNeo ($romPath): $e');
+    }
+
+    // 1. Se o ZIP já contém `<parent>.key` (ex.: `sfa3.key` dentro de um arquivo
+    //    salvo como `sfa3ur1.zip`), garantir que o arquivo tenha o nome `<parent>.zip`
+    //    esperado pelo FBNeo.
+    if (zipInspect != null &&
+        zipInspect.hasKey &&
+        zipInspect.keyStem != null &&
+        zipInspect.keyStem!.isNotEmpty &&
+        zipInspect.keyStem != currentStem) {
+      final resolvedFromKey = RomDownloadService.resolveCanonicalFbneoParent(
+        zipInspect.keyStem!,
+      );
+      if (resolvedFromKey != null) {
+        final targetFile = File(
+          '${romFile.parent.path}/${resolvedFromKey.parentStem}.zip',
+        );
+        if (!await targetFile.exists() ||
+            await targetFile.length() < await romFile.length()) {
+          await romFile.copy(targetFile.path);
+        }
+        return targetFile.path;
+      }
+    }
+
+    // 2. Verifica se pertence a um parent canônico do FBNeo (CPS1 / CPS2)
+    final canonical = RomDownloadService.resolveCanonicalFbneoParent(
+      currentStem,
+    );
+    if (canonical == null) return romPath;
+
+    final parentZipFile = File(
+      '${romFile.parent.path}/${canonical.parentStem}.zip',
+    );
+    final isCps2MissingKey =
+        canonical.platformSlug == 'cps2' && zipInspect?.hasKey == false;
+    final isCloneNotNamedParent = currentStem != canonical.parentStem;
+    final fileSize = await romFile.length();
+    final suspiciousSplitSize = fileSize < 2 * 1024 * 1024;
+
+    if (!isCps2MissingKey && !isCloneNotNamedParent && !suspiciousSplitSize) {
+      return romPath;
+    }
+
+    // Se o parent .zip completo já estiver ao lado, retornar ele
+    if (parentZipFile.path != romPath &&
+        await parentZipFile.exists() &&
+        await parentZipFile.length() >= 1024 * 1024) {
+      return parentZipFile.path;
+    }
+
+    // Se online, baixa o parent non-merged oficial da coleção FBNeo 1.0.0.03
+    final net = await fetchNetworkStatus();
+    if (!net.connected) return romPath;
+
+    final folder = canonical.platformSlug; // 'cps1' or 'cps2'
+    final fbneoParentUrl =
+        'https://archive.org/download/fbneo-parent/fbneo_1_0_0_3_Parent/Parent%20games/$folder/${canonical.parentStem}.zip';
+    final tmpPart = File('${parentZipFile.path}.part');
+    try {
+      debugPrint(
+        '[EmulatorService] Auto-reparando romset FBNeo ($currentName -> ${canonical.parentStem}.zip)...',
+      );
+      await _dio
+          .download(
+            fbneoParentUrl,
+            tmpPart.path,
+            options: Options(
+              receiveTimeout: const Duration(seconds: 90),
+              sendTimeout: const Duration(seconds: 15),
+            ),
+          )
+          .timeout(const Duration(seconds: 180));
+      if (await tmpPart.exists() && await tmpPart.length() >= 512 * 1024) {
+        if (await parentZipFile.exists()) {
+          await parentZipFile.delete();
+        }
+        await tmpPart.rename(parentZipFile.path);
+        return parentZipFile.path;
+      }
+    } catch (e) {
+      debugPrint(
+        '[EmulatorService] Não foi possível baixar parent FBNeo (${canonical.parentStem}.zip): $e',
+      );
+    } finally {
+      await _deleteIfExists(tmpPart);
+    }
+    return romPath;
+  }
+
+  /// Pré-carrega em background (sem lançar erro offline) o core e os assets
+  /// de sistema necessários para que jogos baixados abram mesmo sem internet.
+  Future<void> prewarmPlatformAssets({
+    required String platformSlug,
+    required String coreSoName,
+  }) async {
+    if (_isDisposed) return;
+    final net = await fetchNetworkStatus();
+    if (!net.connected) return;
+    try {
+      final systemDir = await getApplicationSupportDirectory();
+      final lowerPlatform = platformSlug.toLowerCase();
+      await ensureCoreDownloaded(coreSoName: coreSoName);
+      if (lowerPlatform == 'psp' || coreSoName.contains('ppsspp')) {
+        await _ensurePpssppAssets(systemDir);
+      } else if (coreSoName.contains('dolphin') ||
+          lowerPlatform == 'gamecube' ||
+          lowerPlatform == 'wii') {
+        await _ensureDolphinSys(systemDir);
+      } else if (lowerPlatform == 'neogeo') {
+        await _ensureNeoGeoBios(systemDir, '');
+      } else if (lowerPlatform == 'cps1' ||
+          lowerPlatform == 'cps2' ||
+          lowerPlatform == 'mame') {
+        await _ensureQSoundBios(systemDir, null);
+      }
+    } catch (e) {
+      debugPrint('[EmulatorService] Prewarm opcional ($platformSlug): $e');
+    }
   }
 
   static Future<void> _runExtractPpssppAssetsInIsolate(
@@ -1168,9 +1439,22 @@ class EmulatorService {
       onDownloadProgress: onCoreDownloadProgress,
     );
 
-    // Para NeoGeo (FBNeo), garante neogeo.zip em system/fbneo/ e ao lado da ROM arcade
-    if (lowerPlatform == 'neogeo') {
-      await _ensureNeoGeoBios(systemDir, romPath);
+    // Para NeoGeo / CPS1 / CPS2 / MAME (FBNeo), garante BIOS e auto-repara
+    // romsets incompletos / renomeados antes do boot do core.
+    if (coreSoName == 'fbneo_libretro_android.so' ||
+        lowerPlatform == 'neogeo' ||
+        lowerPlatform == 'cps1' ||
+        lowerPlatform == 'cps2' ||
+        lowerPlatform == 'mame' ||
+        lowerPlatform == 'arcade') {
+      if (lowerPlatform == 'neogeo') {
+        await _ensureNeoGeoBios(systemDir, romPath);
+      }
+      romPath = await _prepareFbneoArcadeRom(
+        systemDir: systemDir,
+        romPath: romPath,
+        platformSlug: lowerPlatform,
+      );
     }
 
     // Para GameCube / Wii (Dolphin), baixa os assets de sistema oficiais do Libretro
@@ -1236,8 +1520,8 @@ TexDeposterize = False
 
 [Sound]
 EnableSound = ${audioEnabled ? 'True' : 'False'}
-AudioSync = False
-SoundSpeedHack = True
+AudioSync = True
+SoundSpeedHack = False
 ''');
       } catch (e) {
         debugPrint('[EmulatorService] Falha ao gravar ppsspp.ini: $e');
@@ -1621,6 +1905,31 @@ SoundSpeedHack = True
     }
   }
 
+  /// Seleciona uma pasta de jogo (ex.: pasta contendo `PS3_GAME/USRDIR/EBOOT.BIN`).
+  static Future<String?> pickExternalRomDirectory() async {
+    try {
+      final res = await _methodChannel.invokeMethod<String>(
+        'pickExternalRomDirectory',
+      );
+      if (res != null && res.trim().isNotEmpty) {
+        return res.trim();
+      }
+    } on MissingPluginException {
+      // Fallback fora do Android usa file_picker.
+    } catch (e) {
+      debugPrint(
+        '[EmulatorService] MethodChannel "pickExternalRomDirectory" falhou: $e',
+      );
+    }
+    try {
+      final dir = await FilePicker.platform.getDirectoryPath();
+      if (dir != null && dir.trim().isNotEmpty) return dir.trim();
+    } catch (e) {
+      debugPrint('[EmulatorService] FilePicker getDirectoryPath falhou: $e');
+    }
+    return null;
+  }
+
   /// Libera streams e fecha o cliente HTTP quando próprio.
   void dispose() {
     if (_isDisposed) return;
@@ -1638,6 +1947,9 @@ SoundSpeedHack = True
     }
     if (!_hardwareGamepadStateController.isClosed) {
       unawaited(_hardwareGamepadStateController.close());
+    }
+    if (!_networkStateController.isClosed) {
+      unawaited(_networkStateController.close());
     }
     if (_ownsDio) {
       _dio.close(force: true);

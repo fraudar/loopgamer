@@ -3,7 +3,10 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:typed_data';
 import 'package:archive/archive_io.dart';
+// ignore: implementation_imports
+import 'package:archive/src/lzma/lzma_decoder.dart';
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -135,6 +138,24 @@ class RomDownloadEvent {
   final RomDownloadStatus status;
 }
 
+class Ps3DumpValidationResult {
+  const Ps3DumpValidationResult({
+    required this.isValid,
+    this.resolvedRomPath,
+    this.errorMessage,
+    this.gameTitle,
+    this.titleId,
+    this.dumpFormat,
+  });
+
+  final bool isValid;
+  final String? resolvedRomPath;
+  final String? errorMessage;
+  final String? gameTitle;
+  final String? titleId;
+  final String? dumpFormat;
+}
+
 class _NonRetryableDownloadException implements Exception {
   const _NonRetryableDownloadException(this.message);
   final String message;
@@ -217,6 +238,9 @@ class RomDownloadService {
   final Map<int, EmulationGame> _activeGames = {};
   final Map<int, RomDownloadStatus> _activeStatuses = {};
   final Map<int, bool> _pauseRequested = {};
+  final Map<int, EmulationGame> _networkInterruptedGames = {};
+  final Set<Completer<void>> _networkResumeWaiters = {};
+  bool _restoredPendingDownloadsFromDisk = false;
   final Queue<_QueuedDownloadEntry> _pendingQueue =
       Queue<_QueuedDownloadEntry>();
   int _activeDownloadsCount = 0;
@@ -259,6 +283,8 @@ class RomDownloadService {
     '.cci',
     '.cxi',
     '.pkg',
+    '.sfb',
+    '.sfo',
     '.isz',
     '.nsp',
     '.xci',
@@ -309,7 +335,293 @@ class RomDownloadService {
         'https://archive.org/download/neo-geo-mvs-romset/kof98.zip',
     55104:
         'https://archive.org/download/neo-geo-mvs-romset/garou.zip',
+    // Capcom CPS1 / CPS2 (FBNeo 1.0.0.03 Parent non-merged)
+    55201:
+        'https://archive.org/download/fbneo-parent/fbneo_1_0_0_3_Parent/Parent%20games/cps2/sfa3.zip',
+    55202:
+        'https://archive.org/download/fbneo-parent/fbneo_1_0_0_3_Parent/Parent%20games/cps1/dino.zip',
+    55301:
+        'https://archive.org/download/fbneo-parent/fbneo_1_0_0_3_Parent/Parent%20games/cps2/mvsc.zip',
   };
+
+  /// Conjunto oficial de romsets parent CPS1 do FBNeo v1.0.0.03.
+  static const Set<String> _fbneoCps1Parents = {
+    '1941',
+    '3wonders',
+    'captcomm',
+    'cawing',
+    'dino',
+    'dynwar',
+    'ffight',
+    'forgottn',
+    'ghouls',
+    'knights',
+    'kod',
+    'mbombrd',
+    'megaman',
+    'mercs',
+    'msword',
+    'mtwins',
+    'nemo',
+    'pang3',
+    'pnickj',
+    'punisher',
+    'sf2',
+    'sf2ce',
+    'sf2hf',
+    'slammast',
+    'strider',
+    'unsquad',
+    'varth',
+    'willow',
+    'wof',
+  };
+
+  /// Conjunto oficial de romsets parent CPS2 do FBNeo v1.0.0.03.
+  static const Set<String> _fbneoCps2Parents = {
+    '1944',
+    '19xx',
+    'armwar',
+    'avsp',
+    'batcir',
+    'csclub',
+    'cybots',
+    'ddsom',
+    'ddtod',
+    'dimahoo',
+    'dstlk',
+    'ecofghtr',
+    'gigawing',
+    'hsf2',
+    'megaman2',
+    'mmatrix',
+    'mpang',
+    'msh',
+    'mshvsf',
+    'mvsc',
+    'nwarr',
+    'progear',
+    'pzloop2',
+    'ringdest',
+    'sfa',
+    'sfa2',
+    'sfa3',
+    'sfz2al',
+    'sgemf',
+    'spf2t',
+    'ssf2',
+    'ssf2t',
+    'vhunt2',
+    'vsav',
+    'vsav2',
+    'xmcota',
+    'xmvsf',
+  };
+
+  /// Mapa de prefixos/clones comuns do RetroAPI/MAME para seus parents FBNeo.
+  static const Map<String, String> _fbneoCloneToParent = {
+    'sfa3u': 'sfa3',
+    'sfa3ur1': 'sfa3',
+    'sfa3b': 'sfa3',
+    'sfa3h': 'sfa3',
+    'sfa3hr1': 'sfa3',
+    'sfa3r1': 'sfa3',
+    'sfz3j': 'sfa3',
+    'sfz3jr1': 'sfa3',
+    'sfz3a': 'sfa3',
+    'sfa2u': 'sfa2',
+    'sfa2ur1': 'sfa2',
+    'sfz2j': 'sfa2',
+    'sfau': 'sfa',
+    'sfaur1': 'sfa',
+    'sfzj': 'sfa',
+    'sfz2alj': 'sfz2al',
+    'mvscu': 'mvsc',
+    'mvscur1': 'mvsc',
+    'mvscj': 'mvsc',
+    'mvscjr1': 'mvsc',
+    'mvsca': 'mvsc',
+    'mvscar1': 'mvsc',
+    'mvsch': 'mvsc',
+    'mvscb': 'mvsc',
+    'mvscr1': 'mvsc',
+    'mvscjsing': 'mvsc',
+    'xmvsfu': 'xmvsf',
+    'xmvsfur1': 'xmvsf',
+    'xmvsfj': 'xmvsf',
+    'xmvsfa': 'xmvsf',
+    'xmvsfh': 'xmvsf',
+    'xmvsfb': 'xmvsf',
+    'xmvsfr1': 'xmvsf',
+    'xmcotau': 'xmcota',
+    'xmcotaj': 'xmcota',
+    'xmcotaa': 'xmcota',
+    'xmcotah': 'xmcota',
+    'mshu': 'msh',
+    'mshj': 'msh',
+    'msha': 'msh',
+    'mshh': 'msh',
+    'mshb': 'msh',
+    'mshvsfu': 'mshvsf',
+    'mshvsfj': 'mshvsf',
+    'vsavu': 'vsav',
+    'vsavj': 'vsav',
+    'vsava': 'vsav',
+    'vsavh': 'vsav',
+    'vsav2d': 'vsav2',
+    'dstlku': 'dstlk',
+    'dstlkj': 'dstlk',
+    'dstlka': 'dstlk',
+    'vampj': 'dstlk',
+    'ssf2tu': 'ssf2t',
+    'ssf2tur1': 'ssf2t',
+    'ssf2ta': 'ssf2t',
+    'ssf2xj': 'ssf2t',
+    'ssf2u': 'ssf2',
+    'ssf2j': 'ssf2',
+    'dinou': 'dino',
+    'dinoj': 'dino',
+    'dinoh': 'dino',
+    'captcommu': 'captcomm',
+    'captcomu': 'captcomm',
+    'captcommj': 'captcomm',
+    'captcomj': 'captcomm',
+    'captcommr1': 'captcomm',
+    'ffightu': 'ffight',
+    'ffightu1': 'ffight',
+    'ffightua': 'ffight',
+    'ffightub': 'ffight',
+    'ffightj': 'ffight',
+    'ffightj1': 'ffight',
+    'ffightj2': 'ffight',
+    'ffightj3': 'ffight',
+    'ffighta': 'ffight',
+    'punisheru': 'punisher',
+    'punishru': 'punisher',
+    'punisherj': 'punisher',
+    'punishrj': 'punisher',
+    'punisherh': 'punisher',
+    'sf2ceu': 'sf2ce',
+    'sf2ceua': 'sf2ce',
+    'sf2ceub': 'sf2ce',
+    'sf2ceuc': 'sf2ce',
+    'sf2cej': 'sf2ce',
+    'sf2cea': 'sf2ce',
+    'sf2u': 'sf2',
+    'sf2ua': 'sf2',
+    'sf2ub': 'sf2',
+    'sf2j': 'sf2',
+    'sf2hfu': 'sf2hf',
+    'sf2hfj': 'sf2hf',
+    'knightsu': 'knights',
+    'knightsj': 'knights',
+    'kodu': 'kod',
+    'kodj': 'kod',
+    'wofu': 'wof',
+    'wofj': 'wof',
+    'wofa': 'wof',
+    'avspu': 'avsp',
+    'avspj': 'avsp',
+    'avspa': 'avsp',
+    'ddsomu': 'ddsom',
+    'ddsomj': 'ddsom',
+    'ddsoma': 'ddsom',
+    'ddtodu': 'ddtod',
+    'ddtodj': 'ddtod',
+    'ddtoda': 'ddtod',
+    'batcirj': 'batcir',
+    'batcira': 'batcir',
+    'cybotsu': 'cybots',
+    'cybotsj': 'cybots',
+    'armwaru': 'armwar',
+    'armwarj': 'armwar',
+    'progearj': 'progear',
+    'progeara': 'progear',
+    'gigawingu': 'gigawing',
+    'gigawingj': 'gigawing',
+    'strideru': 'strider',
+    'striderj': 'strider',
+    'ghoulsu': 'ghouls',
+    'ghoulsj': 'ghouls',
+    '19xxu': '19xx',
+    '19xxj': '19xx',
+    '1944u': '1944',
+    '1944j': '1944',
+    '1941u': '1941',
+    '1941j': '1941',
+    'willowu': 'willow',
+    'willowj': 'willow',
+  };
+
+  /// Resolve um stem/arquivo de ROM arcade (`sfa3ur1.zip`, `sfa3`, etc.) para o
+  /// parent canônico do FBNeo (`parentStem`) e sua placa (`cps1` ou `cps2`), quando aplicável.
+  static ({String parentStem, String platformSlug})? resolveCanonicalFbneoParent(
+    String rawStemOrFile, {
+    String? gameTitle,
+  }) {
+    var clean = rawStemOrFile.trim().toLowerCase();
+    final slash = clean.lastIndexOf('/');
+    if (slash >= 0) clean = clean.substring(slash + 1);
+    clean = clean.replaceAll(RegExp(r'\.(zip|7z|key)$'), '').trim();
+
+    if (clean.isNotEmpty) {
+      if (_fbneoCps2Parents.contains(clean)) {
+        return (parentStem: clean, platformSlug: 'cps2');
+      }
+      if (_fbneoCps1Parents.contains(clean)) {
+        return (parentStem: clean, platformSlug: 'cps1');
+      }
+      final mapped = _fbneoCloneToParent[clean];
+      if (mapped != null) {
+        final slug = _fbneoCps2Parents.contains(mapped) ? 'cps2' : 'cps1';
+        return (parentStem: mapped, platformSlug: slug);
+      }
+      // Match por prefixo de parent quando o clone segue padrão `<parent><suffix>`
+      for (final p in _fbneoCps2Parents) {
+        if (clean.startsWith(p) &&
+            clean.length > p.length &&
+            RegExp(r'^[a-z0-9]{1,5}$').hasMatch(clean.substring(p.length))) {
+          return (parentStem: p, platformSlug: 'cps2');
+        }
+      }
+      for (final p in _fbneoCps1Parents) {
+        if (clean.startsWith(p) &&
+            clean.length > p.length &&
+            RegExp(r'^[a-z0-9]{1,5}$').hasMatch(clean.substring(p.length))) {
+          return (parentStem: p, platformSlug: 'cps1');
+        }
+      }
+    }
+
+    if (gameTitle != null && gameTitle.trim().isNotEmpty) {
+      final t = EmulationGame.normalizeSearchText(gameTitle);
+      if (t.contains('street fighter alpha 3')) {
+        return (parentStem: 'sfa3', platformSlug: 'cps2');
+      }
+      if (t.contains('street fighter alpha 2')) {
+        return (parentStem: 'sfa2', platformSlug: 'cps2');
+      }
+      if (t.contains('marvel vs capcom')) {
+        return (parentStem: 'mvsc', platformSlug: 'cps2');
+      }
+      if (t.contains('x men vs street fighter')) {
+        return (parentStem: 'xmvsf', platformSlug: 'cps2');
+      }
+      if (t.contains('cadillacs and dinosaurs')) {
+        return (parentStem: 'dino', platformSlug: 'cps1');
+      }
+      if (t.contains('captain commando')) {
+        return (parentStem: 'captcomm', platformSlug: 'cps1');
+      }
+      if (t.contains('final fight')) {
+        return (parentStem: 'ffight', platformSlug: 'cps1');
+      }
+      if (t.contains('the punisher')) {
+        return (parentStem: 'punisher', platformSlug: 'cps1');
+      }
+    }
+    return null;
+  }
 
   /// Tamanho mínimo razoável (bytes) para rejeitar scans de manual, patches, updates e demos pequenas.
   static int minBytesForPlatform(String platformSlug) {
@@ -379,7 +691,7 @@ class RomDownloadService {
       case 'ps2':
         return const ['.chd', '.iso', '.cso', '.zip'];
       case 'ps3':
-        return const ['.iso', '.pkg', '.zip'];
+        return const ['.iso', '.pkg', '.bin', '.zip', '.7z'];
       case 'gamecube':
         return const ['.rvz', '.iso', '.gcz', '.gcm', '.zip'];
       case 'wii':
@@ -514,6 +826,34 @@ class RomDownloadService {
     List<String> filePaths, {
     String? platformSlug,
   }) {
+    if (platformSlug?.toLowerCase() == 'ps3') {
+      String? ps3GameEboot;
+      String? usrdirEboot;
+      String? plainEboot;
+      String? ps3Iso;
+      String? ps3Pkg;
+      for (final p in filePaths) {
+        final norm = p.replaceAll('\\', '/').toLowerCase();
+        if (norm.contains('__macosx')) continue;
+        if (norm.endsWith('/ps3_game/usrdir/eboot.bin') ||
+            norm == 'ps3_game/usrdir/eboot.bin') {
+          ps3GameEboot ??= p;
+        } else if (norm.endsWith('/usrdir/eboot.bin') ||
+            norm == 'usrdir/eboot.bin') {
+          usrdirEboot ??= p;
+        } else if (norm.endsWith('/eboot.bin') || norm == 'eboot.bin') {
+          plainEboot ??= p;
+        } else if (norm.endsWith('.iso')) {
+          ps3Iso ??= p;
+        } else if (norm.endsWith('.pkg')) {
+          ps3Pkg ??= p;
+        }
+      }
+      final ps3Best =
+          ps3GameEboot ?? usrdirEboot ?? plainEboot ?? ps3Iso ?? ps3Pkg;
+      if (ps3Best != null) return ps3Best;
+    }
+
     const priority = [
       '.m3u',
       '.cue',
@@ -544,6 +884,7 @@ class RomDownloadService {
       '.3ds',
       '.cci',
       '.cxi',
+      '.pkg',
       '.bin',
     ];
     final validFiles = filePaths.where((p) {
@@ -644,7 +985,11 @@ class RomDownloadService {
                 .split(Platform.pathSeparator)
                 .last
                 .toLowerCase();
-            if (baseName == 'neogeo.zip') continue;
+            if (baseName == 'neogeo.zip' ||
+                baseName == 'qsound.zip' ||
+                baseName == 'qsound_hle.zip') {
+              continue;
+            }
             final len = await entity.length();
             if (len >= minStubBytes) {
               return entity.path;
@@ -687,6 +1032,82 @@ class RomDownloadService {
       );
     }
     return null;
+  }
+
+  /// Resolve em lote os caminhos das ROMs existentes em uma única varredura
+  /// da pasta `roms/`, evitando dezenas de chamadas concorrentes de I/O durante buscas.
+  Future<Map<int, String>> resolveExistingRomPathsBatch(
+    Iterable<int> igdbIds,
+  ) async {
+    final targetIds = igdbIds.toSet();
+    final result = <int, String>{};
+    if (targetIds.isEmpty) return result;
+    const int minStubBytes = 1024;
+
+    // 1. Aproveita entradas já resolvidas em memória
+    for (final id in targetIds) {
+      final st = _activeStatuses[id];
+      if (st?.state == RomActionState.readyToPlay &&
+          st?.localPath != null &&
+          st!.localPath!.trim().isNotEmpty) {
+        result[id] = st.localPath!;
+      }
+    }
+    if (result.length == targetIds.length) return result;
+
+    try {
+      final dir = await _romsDirectory();
+      final entities = await dir.list(followLinks: false).toList();
+      final romFilePrefix = RegExp(r'^rom_(-?\d+)_');
+      final arcadeDirPrefix = RegExp(r'^arcade_(-?\d+)$');
+
+      for (final entity in entities) {
+        final name = _basename(entity.path);
+        final lowerName = name.toLowerCase();
+        if (entity is Directory) {
+          final gm = _gameFolderRegex.firstMatch(name);
+          if (gm != null) {
+            final id = int.tryParse(gm.group(1)!);
+            if (id != null &&
+                targetIds.contains(id) &&
+                !result.containsKey(id)) {
+              final resolved = await resolveExistingRomPath(id);
+              if (resolved != null) result[id] = resolved;
+            }
+            continue;
+          }
+          final am = arcadeDirPrefix.firstMatch(name);
+          if (am != null) {
+            final id = int.tryParse(am.group(1)!);
+            if (id != null &&
+                targetIds.contains(id) &&
+                !result.containsKey(id)) {
+              final resolved = await resolveExistingRomPath(id);
+              if (resolved != null) result[id] = resolved;
+            }
+            continue;
+          }
+        } else if (entity is File &&
+            !lowerName.endsWith('.part') &&
+            !lowerName.endsWith('_jp2.zip')) {
+          final rm = romFilePrefix.firstMatch(name);
+          if (rm != null) {
+            final id = int.tryParse(rm.group(1)!);
+            if (id != null &&
+                targetIds.contains(id) &&
+                !result.containsKey(id)) {
+              final len = await entity.length();
+              if (len >= minStubBytes) {
+                result[id] = entity.path;
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('[RomDownloadService] Falha em resolveExistingRomPathsBatch: $e');
+    }
+    return result;
   }
 
   /// Retorna o caminho do arquivo de download parcial (.part) se existir.
@@ -1904,6 +2325,171 @@ class RomDownloadService {
     _refreshQueuePositions();
   }
 
+  Future<File> _activeDownloadsFile() async {
+    final baseDir = await getApplicationSupportDirectory();
+    return File('${baseDir.path}/active_downloads.json');
+  }
+
+  Future<void> _persistPendingDownloadEntry(EmulationGame game) async {
+    if (_isDisposed) return;
+    try {
+      final file = await _activeDownloadsFile();
+      final Map<String, dynamic> entries = {};
+      if (await file.exists()) {
+        try {
+          final decoded = jsonDecode(await file.readAsString());
+          if (decoded is Map) {
+            for (final e in decoded.entries) {
+              entries[e.key.toString()] = e.value;
+            }
+          }
+        } catch (_) {}
+      }
+      entries['${game.igdbId}'] = {
+        'igdbId': game.igdbId,
+        'name': game.name,
+        'canonicalNoIntroName': game.canonicalNoIntroName,
+        'summary': game.summary,
+        'genres': game.genres,
+        'developer': game.developer,
+        'releaseYear': game.releaseYear,
+        'rating': game.rating,
+        'platformName': game.platformName,
+        'platformSlug': game.platformSlug,
+        'directRomUrl': game.directRomUrl,
+        'region': game.region,
+        'crc32': game.crc32,
+        'gridCoverUrl': game.gridCoverUrl,
+        'heroBannerUrl': game.heroBannerUrl,
+        'logoUrl': game.logoUrl,
+        'estimatedSizeBytes': game.estimatedSizeBytes,
+      };
+      if (!await file.parent.exists()) {
+        await file.parent.create(recursive: true);
+      }
+      await file.writeAsString(jsonEncode(entries), flush: true);
+    } catch (_) {}
+  }
+
+  Future<void> _removePendingDownloadEntry(int igdbId) async {
+    if (_isDisposed) return;
+    try {
+      final file = await _activeDownloadsFile();
+      if (!await file.exists()) return;
+      final decoded = jsonDecode(await file.readAsString());
+      if (decoded is! Map) return;
+      final key = '$igdbId';
+      if (!decoded.containsKey(key)) return;
+      final updated = Map<String, dynamic>.from(decoded)..remove(key);
+      if (updated.isEmpty) {
+        await file.delete();
+      } else {
+        await file.writeAsString(jsonEncode(updated), flush: true);
+      }
+    } catch (_) {}
+  }
+
+  /// Acorda downloads aguardando rede e retoma automaticamente downloads
+  /// interrompidos por perda de conexão ou reinício ao retornar para o app.
+  Future<void> onAppOrNetworkResumed() async {
+    if (_isDisposed) return;
+
+    // 1. Acorda qualquer retry que estava esperando conexão voltar
+    final waiters = List<Completer<void>>.from(_networkResumeWaiters);
+    _networkResumeWaiters.clear();
+    for (final w in waiters) {
+      if (!w.isCompleted) {
+        w.complete();
+      }
+    }
+
+    final net = await EmulatorService.fetchNetworkStatus();
+    if (!net.connected || _isDisposed) return;
+
+    // 2. Restaura do disco downloads pendentes de execuções anteriores
+    if (!_restoredPendingDownloadsFromDisk) {
+      _restoredPendingDownloadsFromDisk = true;
+      try {
+        final file = await _activeDownloadsFile();
+        if (await file.exists()) {
+          final decoded = jsonDecode(await file.readAsString());
+          if (decoded is Map) {
+            for (final raw in decoded.values) {
+              if (raw is! Map) continue;
+              final map = Map<String, dynamic>.from(raw);
+              final id = (map['igdbId'] as num?)?.toInt();
+              final name = map['name'] as String?;
+              final slug = map['platformSlug'] as String?;
+              final platformName = map['platformName'] as String?;
+              final directUrl = map['directRomUrl'] as String?;
+              if (id == null ||
+                  name == null ||
+                  slug == null ||
+                  platformName == null ||
+                  directUrl == null ||
+                  directUrl.isEmpty) {
+                continue;
+              }
+              if (_pauseRequested[id] == true ||
+                  _activeStatuses[id]?.state == RomActionState.paused) {
+                continue;
+              }
+              final part = await _resolvePartFile(id);
+              if (part == null || !await part.exists()) {
+                unawaited(_removePendingDownloadEntry(id));
+                continue;
+              }
+              final restoredGame = EmulationGame(
+                igdbId: id,
+                name: name,
+                canonicalNoIntroName:
+                    (map['canonicalNoIntroName'] as String?) ?? name,
+                summary: (map['summary'] as String?) ?? '',
+                genres: (map['genres'] as List<dynamic>?)
+                        ?.map((e) => e.toString())
+                        .toList() ??
+                    const <String>[],
+                developer: (map['developer'] as String?) ?? '',
+                releaseYear: (map['releaseYear'] as num?)?.toInt(),
+                rating: (map['rating'] as num?)?.toDouble(),
+                platformName: platformName,
+                platformSlug: slug,
+                directRomUrl: directUrl,
+                region: (map['region'] as String?) ?? 'USA',
+                crc32: (map['crc32'] as String?) ?? '',
+                gridCoverUrl: map['gridCoverUrl'] as String?,
+                heroBannerUrl: map['heroBannerUrl'] as String?,
+                logoUrl: map['logoUrl'] as String?,
+                estimatedSizeBytes:
+                    (map['estimatedSizeBytes'] as num?)?.toInt() ?? 0,
+              );
+              _networkInterruptedGames.putIfAbsent(id, () => restoredGame);
+            }
+          }
+        }
+      } catch (e) {
+        debugPrint(
+          '[RomDownloadService] Falha ao restaurar active_downloads.json: $e',
+        );
+      }
+    }
+
+    // 3. Retoma todos os downloads interrompidos pela rede
+    final toResume = _networkInterruptedGames.values.toList();
+    for (final game in toResume) {
+      if (_isDisposed) return;
+      if (_pauseRequested[game.igdbId] == true) continue;
+      final existingStatus = _activeStatuses[game.igdbId]?.state;
+      if (existingStatus == RomActionState.downloading ||
+          existingStatus == RomActionState.readyToPlay) {
+        _networkInterruptedGames.remove(game.igdbId);
+        continue;
+      }
+      _networkInterruptedGames.remove(game.igdbId);
+      unawaited(startBackgroundDownload(game: game));
+    }
+  }
+
   /// Inicia ou continua download em segundo plano com suporte a fila, pausa e HTTP Range
   Future<String?> startBackgroundDownload({
     required EmulationGame game,
@@ -1944,6 +2530,8 @@ class RomDownloadService {
     final opSeq = (_operationSeq[game.igdbId] ?? 0) + 1;
     _operationSeq[game.igdbId] = opSeq;
     _pauseRequested[game.igdbId] = false;
+    _networkInterruptedGames.remove(game.igdbId);
+    unawaited(_persistPendingDownloadEntry(game));
 
     bool isCurrentOperation() =>
         !_isDisposed && identical(_cancelTokens[game.igdbId], cancelToken);
@@ -2027,6 +2615,8 @@ class RomDownloadService {
       );
 
       if (result != null && isCurrentOperation()) {
+        _networkInterruptedGames.remove(game.igdbId);
+        unawaited(_removePendingDownloadEntry(game.igdbId));
         _completedNotificationCount++;
         final ready = RomDownloadStatus(
           state: RomActionState.readyToPlay,
@@ -2050,6 +2640,8 @@ class RomDownloadService {
           (e is DioException &&
               e.type == DioExceptionType.cancel &&
               cancelToken.cancelError?.error == 'PAUSED_BY_USER')) {
+        _networkInterruptedGames.remove(game.igdbId);
+        unawaited(_removePendingDownloadEntry(game.igdbId));
         final partFile = await _resolvePartFile(game.igdbId);
         if (!isCurrentOperation()) return null;
         final downloaded =
@@ -2078,13 +2670,42 @@ class RomDownloadService {
       }
 
       if (e is _NonRetryableDownloadException) {
+        _networkInterruptedGames.remove(game.igdbId);
+        unawaited(_removePendingDownloadEntry(game.igdbId));
         unawaited(_cleanPartFiles(game.igdbId, expectedSeq: opSeq));
+        _failedNotificationCount++;
+        notify(
+          RomDownloadStatus(
+            state: RomActionState.notDownloaded,
+            errorMessage: _friendlyErrorMessage(e),
+            isQueued: false,
+            queuePosition: 0,
+          ),
+          forceNotification: true,
+        );
+        return null;
       }
 
+      // Falha transitória de rede / desconexão: mantém `.part` e registra para
+      // retomada automática assim que a conexão voltar ou o usuário retornar ao app.
+      _networkInterruptedGames[game.igdbId] = game;
+      final partFile = await _resolvePartFile(game.igdbId);
+      if (!isCurrentOperation()) return null;
+      final downloaded =
+          (partFile != null && await partFile.exists()) ? await partFile.length() : 0;
+      final total = game.estimatedSizeBytes > 0
+          ? game.estimatedSizeBytes
+          : (downloaded > 0 ? downloaded * 2 : 0);
+      final progress =
+          total > 0 ? (downloaded / total).clamp(0.01, 0.99) : 0.0;
       _failedNotificationCount++;
       notify(
         RomDownloadStatus(
-          state: RomActionState.notDownloaded,
+          state: RomActionState.paused,
+          progress: progress,
+          downloadedBytes: downloaded,
+          totalBytes: total,
+          speedLabel: 'Aguardando conexão...',
           errorMessage: _friendlyErrorMessage(e),
           isQueued: false,
           queuePosition: 0,
@@ -2107,6 +2728,8 @@ class RomDownloadService {
   /// Pausa um download ativo preservando o arquivo `.part` para continuação posterior.
   void pauseDownload(int igdbId) {
     _pauseRequested[igdbId] = true;
+    _networkInterruptedGames.remove(igdbId);
+    unawaited(_removePendingDownloadEntry(igdbId));
     final removedFromQueue = _removeQueuedEntryById(igdbId);
     final token = _cancelTokens[igdbId];
     if (token != null && !token.isCancelled) {
@@ -2137,6 +2760,8 @@ class RomDownloadService {
   /// Cancela e exclui arquivos parciais
   void cancelDownload(int igdbId) {
     _pauseRequested.remove(igdbId);
+    _networkInterruptedGames.remove(igdbId);
+    unawaited(_removePendingDownloadEntry(igdbId));
     final cancelSeq = (_operationSeq[igdbId] ?? 0) + 1;
     _operationSeq[igdbId] = cancelSeq;
     final removedFromQueue = _removeQueuedEntryById(igdbId);
@@ -2268,6 +2893,35 @@ class RomDownloadService {
     return RegExp(r'^[0-9A-F]{8}$').hasMatch(clean) && clean != '00000000';
   }
 
+  Future<void> _delayWithCancelOrResume(
+    Duration duration,
+    CancelToken cancelToken,
+  ) async {
+    if (cancelToken.isCancelled) {
+      throw DioException.requestCancelled(
+        requestOptions: RequestOptions(path: ''),
+        reason: cancelToken.cancelError?.error,
+      );
+    }
+    final resumeCompleter = Completer<void>();
+    _networkResumeWaiters.add(resumeCompleter);
+    try {
+      await Future.any<void>([
+        Future<void>.delayed(duration),
+        cancelToken.whenCancel.then((_) {}),
+        resumeCompleter.future,
+      ]);
+    } finally {
+      _networkResumeWaiters.remove(resumeCompleter);
+    }
+    if (cancelToken.isCancelled) {
+      throw DioException.requestCancelled(
+        requestOptions: RequestOptions(path: ''),
+        reason: cancelToken.cancelError?.error,
+      );
+    }
+  }
+
   Future<void> _waitForRetryWithNetworkCheck({
     required int attempt,
     required bool checkNetwork,
@@ -2285,8 +2939,10 @@ class RomDownloadService {
         : 0.05;
 
     if (checkNetwork) {
-      for (int waitRound = 0; waitRound < 3; waitRound++) {
-        if (cancelToken.isCancelled || !isCurrentOperation()) {
+      // Enquanto o aparelho estiver realmente sem rede, aguarda sem gastar
+      // tentativas de retry e acorda na hora quando a rede/app retornar.
+      for (int waitRound = 0; waitRound < 120; waitRound++) {
+        if (cancelToken.isCancelled || !isCurrentOperation() || _isDisposed) {
           throw DioException.requestCancelled(
             requestOptions: RequestOptions(path: ''),
             reason: cancelToken.cancelError?.error,
@@ -2300,10 +2956,10 @@ class RomDownloadService {
             progress: progress,
             downloadedBytes: currentBytes,
             totalBytes: expectedTotalBytes,
-            speedLabel: 'Aguardando rede...',
+            speedLabel: 'Aguardando conexão...',
           ),
         );
-        await _delayWithCancel(const Duration(seconds: 3), cancelToken);
+        await _delayWithCancelOrResume(const Duration(seconds: 4), cancelToken);
       }
     }
 
@@ -3436,21 +4092,346 @@ class RomDownloadService {
         requireTitleMatch: requireTitleMatch,
       )?.name;
 
-  static Future<void> _runExtractZipToDiskInIsolate(
-    String zipPath,
-    String extractPath,
+  /// Valida um dump de PS3 (pasta `PS3_GAME/USRDIR/EBOOT.BIN`, ISO descriptografada ou `.pkg`).
+  ///
+  /// Executa a verificação binária em [Isolate.run] para não travar a interface.
+  static Future<Ps3DumpValidationResult> validatePs3DumpContent(
+    String path,
   ) {
-    return Isolate.run(
-      () => extractFileToDisk(zipPath, extractPath, bufferSize: 1024 * 1024),
-    );
+    return Isolate.run(() => _validatePs3DumpSync(path));
   }
 
-  /// Extrai um arquivo `.zip` em streaming para [extractDir] preservando `.cue`/`.bin`
+  static Ps3DumpValidationResult _validatePs3DumpSync(String path) {
+    try {
+      final cleanPath = path.trim();
+      if (cleanPath.isEmpty) {
+        return const Ps3DumpValidationResult(
+          isValid: false,
+          errorMessage: 'Caminho do dump de PS3 inválido.',
+        );
+      }
+
+      const ps3DumpTip =
+          'Para gerar um dump válido a partir dos seus discos, use o próprio PS3 com CFW ou HEN e ferramentas como ManaGunZ, multiMAN ou IRISMAN — elas já criam ISO descriptografada ou pasta prontas para o RPCS3.';
+
+      bool hasValidEbootMagic(File file) {
+        if (!file.existsSync()) return false;
+        final len = file.lengthSync();
+        if (len < 16) return false;
+        final raf = file.openSync(mode: FileMode.read);
+        try {
+          final hdr = raf.readSync(4);
+          if (hdr.length < 4) return false;
+          final isSelf = hdr[0] == 0x53 &&
+              hdr[1] == 0x43 &&
+              hdr[2] == 0x45 &&
+              hdr[3] == 0x00; // SCE\0
+          final isElf = hdr[0] == 0x7F &&
+              hdr[1] == 0x45 &&
+              hdr[2] == 0x4C &&
+              hdr[3] == 0x46; // \x7FELF
+          return isSelf || isElf;
+        } finally {
+          raf.closeSync();
+        }
+      }
+
+      File? findEbootInDirectory(Directory root, {int maxDepth = 3}) {
+        final directCandidates = [
+          File('${root.path}/PS3_GAME/USRDIR/EBOOT.BIN'),
+          File('${root.path}/USRDIR/EBOOT.BIN'),
+          File('${root.path}/EBOOT.BIN'),
+        ];
+        for (final c in directCandidates) {
+          if (c.existsSync()) return c;
+        }
+        if (maxDepth <= 0) return null;
+        try {
+          for (final entity in root.listSync(followLinks: false)) {
+            if (entity is Directory) {
+              final found = findEbootInDirectory(entity, maxDepth: maxDepth - 1);
+              if (found != null) return found;
+            }
+          }
+        } catch (_) {}
+        return null;
+      }
+
+      ({String? title, String? titleId}) parseParamSfo(File sfoFile) {
+        if (!sfoFile.existsSync()) return (title: null, titleId: null);
+        try {
+          final bytes = sfoFile.readAsBytesSync();
+          if (bytes.length < 20 ||
+              bytes[0] != 0x00 ||
+              bytes[1] != 0x50 ||
+              bytes[2] != 0x53 ||
+              bytes[3] != 0x46) {
+            return (title: null, titleId: null);
+          }
+          final bd = ByteData.sublistView(bytes);
+          final keyTableOffset = bd.getUint32(8, Endian.little);
+          final dataTableOffset = bd.getUint32(12, Endian.little);
+          final count = bd.getUint32(16, Endian.little);
+          String? title;
+          String? titleId;
+          for (var i = 0; i < count && 20 + i * 16 + 16 <= bytes.length; i++) {
+            final base = 20 + i * 16;
+            final keyOffset = bd.getUint16(base, Endian.little);
+            final dataFmt = bd.getUint16(base + 2, Endian.little);
+            final dataLen = bd.getUint32(base + 4, Endian.little);
+            final dataOffset = bd.getUint32(base + 12, Endian.little);
+            final kStart = keyTableOffset + keyOffset;
+            if (kStart >= bytes.length) continue;
+            var kEnd = kStart;
+            while (kEnd < bytes.length && bytes[kEnd] != 0) {
+              kEnd++;
+            }
+            final key = utf8.decode(bytes.sublist(kStart, kEnd), allowMalformed: true);
+            if (dataFmt == 0x0204 &&
+                dataTableOffset + dataOffset + dataLen <= bytes.length) {
+              final rawVal = bytes.sublist(
+                dataTableOffset + dataOffset,
+                dataTableOffset + dataOffset + dataLen,
+              );
+              final zeroIdx = rawVal.indexOf(0);
+              final sliced = zeroIdx >= 0 ? rawVal.sublist(0, zeroIdx) : rawVal;
+              final val = utf8.decode(sliced, allowMalformed: true).trim();
+              if (key == 'TITLE' && val.isNotEmpty) title = val;
+              if (key == 'TITLE_ID' && val.isNotEmpty) titleId = val;
+            }
+          }
+          return (title: title, titleId: titleId);
+        } catch (_) {
+          return (title: null, titleId: null);
+        }
+      }
+
+      if (FileSystemEntity.isDirectorySync(cleanPath)) {
+        final dir = Directory(cleanPath);
+        final eboot = findEbootInDirectory(dir);
+        if (eboot == null) {
+          return const Ps3DumpValidationResult(
+            isValid: false,
+            errorMessage:
+                'Pasta inválida: não foi encontrado "PS3_GAME/USRDIR/EBOOT.BIN". $ps3DumpTip',
+          );
+        }
+        if (!hasValidEbootMagic(eboot)) {
+          return const Ps3DumpValidationResult(
+            isValid: false,
+            errorMessage:
+                'O arquivo PS3_GAME/USRDIR/EBOOT.BIN encontrado está corrompido ou criptografado (não possui cabeçalho SELF/ELF válido). $ps3DumpTip',
+          );
+        }
+        final ps3GameDir = eboot.parent.parent;
+        final sfo = parseParamSfo(File('${ps3GameDir.path}/PARAM.SFO'));
+        return Ps3DumpValidationResult(
+          isValid: true,
+          resolvedRomPath: eboot.path,
+          gameTitle: sfo.title,
+          titleId: sfo.titleId,
+          dumpFormat: 'folder',
+        );
+      }
+
+      final file = File(cleanPath);
+      if (!file.existsSync()) {
+        return const Ps3DumpValidationResult(
+          isValid: false,
+          errorMessage: 'Arquivo de dump de PS3 não encontrado no dispositivo.',
+        );
+      }
+
+      final lower = cleanPath.replaceAll('\\', '/').toLowerCase();
+      final baseName = lower.split('/').last;
+
+      // Caso o usuário selecione EBOOT.BIN, PS3_DISC.SFB ou PARAM.SFO dentro de PS3_GAME
+      if (baseName == 'eboot.bin' ||
+          baseName == 'ps3_disc.sfb' ||
+          baseName == 'param.sfo') {
+        Directory searchRoot = file.parent;
+        if (lower.endsWith('/usrdir/eboot.bin')) {
+          searchRoot = file.parent.parent;
+        }
+        if (baseName == 'param.sfo' &&
+            searchRoot.path.replaceAll('\\', '/').toLowerCase().endsWith('/ps3_game')) {
+          searchRoot = searchRoot;
+        }
+        final eboot = baseName == 'eboot.bin'
+            ? file
+            : findEbootInDirectory(searchRoot, maxDepth: 2);
+        if (eboot == null) {
+          return const Ps3DumpValidationResult(
+            isValid: false,
+            errorMessage:
+                'Estrutura PS3_GAME/USRDIR/EBOOT.BIN incompleta na pasta selecionada. $ps3DumpTip',
+          );
+        }
+        if (!hasValidEbootMagic(eboot)) {
+          return const Ps3DumpValidationResult(
+            isValid: false,
+            errorMessage:
+                'EBOOT.BIN inválido ou criptografado (cabeçalho esperado: SCE\\0 ou ELF). $ps3DumpTip',
+          );
+        }
+        final ps3GameDir = eboot.parent.parent;
+        final sfo = parseParamSfo(File('${ps3GameDir.path}/PARAM.SFO'));
+        return Ps3DumpValidationResult(
+          isValid: true,
+          resolvedRomPath: eboot.path,
+          gameTitle: sfo.title,
+          titleId: sfo.titleId,
+          dumpFormat: 'folder',
+        );
+      }
+
+      if (lower.endsWith('.pkg')) {
+        final raf = file.openSync(mode: FileMode.read);
+        try {
+          final hdr = raf.readSync(4);
+          final isPkg = hdr.length >= 4 &&
+              hdr[0] == 0x7F &&
+              hdr[1] == 0x50 &&
+              hdr[2] == 0x4B &&
+              hdr[3] == 0x47;
+          if (!isPkg) {
+            return const Ps3DumpValidationResult(
+              isValid: false,
+              errorMessage:
+                  'Arquivo .pkg de PS3 inválido (assinatura \\x7FPKG ausente).',
+            );
+          }
+          return Ps3DumpValidationResult(
+            isValid: true,
+            resolvedRomPath: file.path,
+            dumpFormat: 'pkg',
+          );
+        } finally {
+          raf.closeSync();
+        }
+      }
+
+      if (lower.endsWith('.iso') || lower.endsWith('.img')) {
+        final totalLen = file.lengthSync();
+        if (totalLen < 64 * 1024) {
+          return const Ps3DumpValidationResult(
+            isValid: false,
+            errorMessage: 'A ISO de PS3 está incompleta ou pequena demais.',
+          );
+        }
+        final raf = file.openSync(mode: FileMode.read);
+        try {
+          final scanLen = totalLen < 16 * 1024 * 1024 ? totalLen : 16 * 1024 * 1024;
+          final scanBytes = raf.readSync(scanLen);
+          final textScan = String.fromCharCodes(scanBytes);
+          final hasPs3Marker = textScan.contains('PS3_DISC.SFB') ||
+              textScan.contains('PS3_GAME') ||
+              textScan.contains('PLAYSTATION3') ||
+              textScan.contains('PS3VOLUME');
+          if (!hasPs3Marker) {
+            return const Ps3DumpValidationResult(
+              isValid: false,
+              errorMessage:
+                  'Esta imagem ISO não possui estrutura de disco PS3 (PS3_DISC.SFB / PS3_GAME). $ps3DumpTip',
+            );
+          }
+
+          // Localiza o registro ISO9660 do arquivo EBOOT.BIN dentro dos primeiros 16 MB
+          int? ebootLba;
+          int? ebootSize;
+          final patterns = <List<int>>[
+            ascii.encode('EBOOT.BIN;1'),
+            ascii.encode('EBOOT.BIN'),
+          ];
+          for (final pat in patterns) {
+            for (var i = 33; i <= scanBytes.length - pat.length; i++) {
+              var match = true;
+              for (var j = 0; j < pat.length; j++) {
+                if (scanBytes[i + j] != pat[j]) {
+                  match = false;
+                  break;
+                }
+              }
+              if (!match) continue;
+              // Em um directory record ISO9660:
+              // recStart + 32 = file identifier length
+              // recStart + 33 = file identifier
+              // recStart + 2..5 = Extent LBA (uint32 LE)
+              // recStart + 10..13 = Data Length (uint32 LE)
+              final nameLen = scanBytes[i - 1];
+              if (nameLen == pat.length ||
+                  (nameLen >= 9 && nameLen <= 15 && scanBytes[i - 1] >= pat.length)) {
+                final recStart = i - 33;
+                if (recStart >= 0 && recStart + 33 + nameLen <= scanBytes.length) {
+                  final bd = ByteData.sublistView(scanBytes);
+                  final lba = bd.getUint32(recStart + 2, Endian.little);
+                  final size = bd.getUint32(recStart + 10, Endian.little);
+                  if (lba > 0 && lba * 2048 < totalLen && size > 0) {
+                    ebootLba = lba;
+                    ebootSize = size;
+                    break;
+                  }
+                }
+              }
+            }
+            if (ebootLba != null) break;
+          }
+
+          if (ebootLba != null && ebootSize != null) {
+            final offset = ebootLba * 2048;
+            if (offset + 4 <= totalLen) {
+              raf.setPositionSync(offset);
+              final hdr = raf.readSync(4);
+              final isDecryptedSelf = hdr.length >= 4 &&
+                  ((hdr[0] == 0x53 &&
+                          hdr[1] == 0x43 &&
+                          hdr[2] == 0x45 &&
+                          hdr[3] == 0x00) ||
+                      (hdr[0] == 0x7F &&
+                          hdr[1] == 0x45 &&
+                          hdr[2] == 0x4C &&
+                          hdr[3] == 0x46));
+              if (!isDecryptedSelf) {
+                return const Ps3DumpValidationResult(
+                  isValid: false,
+                  errorMessage:
+                      'Esta ISO de PS3 está criptografada (Redump bruto) e não pode rodar no RPCS3. $ps3DumpTip',
+                );
+              }
+            }
+          }
+
+          return Ps3DumpValidationResult(
+            isValid: true,
+            resolvedRomPath: file.path,
+            dumpFormat: 'iso',
+          );
+        } finally {
+          raf.closeSync();
+        }
+      }
+
+      return const Ps3DumpValidationResult(
+        isValid: false,
+        errorMessage:
+            'Formato não reconhecido para dump de PS3. Envie a pasta do jogo (PS3_GAME/USRDIR/EBOOT.BIN), ISO já descriptografada ou arquivo .zip / .7z.',
+      );
+    } catch (e) {
+      return Ps3DumpValidationResult(
+        isValid: false,
+        errorMessage: 'Erro ao validar dump de PS3: $e',
+      );
+    }
+  }
+
+  /// Extrai um arquivo `.zip` ou `.7z` em [Isolate] dedicado reportando progresso real
   /// e retorna o caminho da ROM principal válida para [platformSlug], ou `null`.
-  static Future<String?> extractAndPickRomFromZip({
-    required String zipPath,
+  static Future<String?> extractAndPickRomFromArchive({
+    required String archivePath,
     required Directory extractDir,
     required String platformSlug,
+    void Function(double progress, String statusLabel)? onProgress,
+    bool deleteSourceOnSuccess = false,
   }) async {
     try {
       if (await extractDir.exists()) {
@@ -3458,44 +4439,106 @@ class RomDownloadService {
       }
       await extractDir.create(recursive: true);
 
-      final extractPath = extractDir.path;
-      await _runExtractZipToDiskInIsolate(zipPath, extractPath);
+      onProgress?.call(0.02, 'Preparando extração...');
 
-      final entities = await extractDir.list(recursive: true).toList();
-      final extractedPaths = <String>[];
-      int largestDataBytes = 0;
-      for (final entity in entities) {
-        if (entity is File) {
-          extractedPaths.add(entity.path);
-          final lower = entity.path.toLowerCase();
-          if (!lower.endsWith('.cue') &&
-              !lower.endsWith('.m3u') &&
-              !lower.endsWith('.sbi')) {
-            final len = await entity.length();
-            if (len > largestDataBytes) largestDataBytes = len;
+      final receivePort = ReceivePort();
+      final lowerArchive = archivePath.toLowerCase();
+      final is7z = lowerArchive.endsWith('.7z');
+      final completer = Completer<List<String>>();
+
+      late final StreamSubscription<dynamic> sub;
+      sub = receivePort.listen((message) {
+        if (message is Map) {
+          final type = message['type'];
+          if (type == 'progress') {
+            final p = (message['progress'] as num?)?.toDouble() ?? 0.0;
+            final entryName = (message['entryName'] as String?) ?? '';
+            final pct = (p * 100).clamp(0, 100).toStringAsFixed(0);
+            final label = entryName.isNotEmpty
+                ? 'Extraindo $entryName ($pct%)...'
+                : 'Extraindo pacote ($pct%)...';
+            onProgress?.call(p.clamp(0.0, 0.96), label);
+          } else if (type == 'done') {
+            final files = (message['files'] as List<dynamic>? ?? const [])
+                .map((e) => e.toString())
+                .toList();
+            if (!completer.isCompleted) completer.complete(files);
+          } else if (type == 'error') {
+            final err = (message['message'] as String?) ??
+                'Falha desconhecida na extração.';
+            if (!completer.isCompleted) {
+              completer.completeError(StateError(err));
+            }
           }
+        }
+      });
+
+      final extractPath = extractDir.path;
+      await Isolate.spawn<_ArchiveIsolateArgs>(
+        _extractArchiveWorkerEntry,
+        _ArchiveIsolateArgs(
+          sendPort: receivePort.sendPort,
+          archivePath: archivePath,
+          extractPath: extractPath,
+          is7z: is7z,
+        ),
+      );
+
+      final extractedPaths = await completer.future;
+      await sub.cancel();
+      receivePort.close();
+
+      onProgress?.call(0.97, 'Validando conteúdo extraído...');
+
+      int largestDataBytes = 0;
+      for (final filePath in extractedPaths) {
+        final f = File(filePath);
+        if (!await f.exists()) continue;
+        final lower = filePath.toLowerCase();
+        if (!lower.endsWith('.cue') &&
+            !lower.endsWith('.m3u') &&
+            !lower.endsWith('.sbi')) {
+          final len = await f.length();
+          if (len > largestDataBytes) largestDataBytes = len;
         }
       }
 
-      final picked = pickPreferredExtractedRom(
+      var picked = pickPreferredExtractedRom(
         extractedPaths,
         platformSlug: platformSlug,
       );
-      debugPrint(
-        '[Extract] zip=$zipPath candidatos=${extractedPaths.length} '
-        'escolhido=$picked maiores=${extractedPaths.length} '
-        'nomes=${extractedPaths.map((p) => p.split("/").last).take(15).join(", ")}',
-      );
+
+      // Para PS3 em .zip/.7z, confere se o dump extraído é realmente válido
+      if (platformSlug.toLowerCase() == 'ps3') {
+        final ps3Validation = await validatePs3DumpContent(
+          picked ?? extractDir.path,
+        );
+        if (!ps3Validation.isValid) {
+          if (await extractDir.exists()) {
+            await extractDir.delete(recursive: true);
+          }
+          throw StateError(
+            ps3Validation.errorMessage ??
+                'O pacote não contém um dump válido de PS3.',
+          );
+        }
+        picked = ps3Validation.resolvedRomPath ?? picked;
+      }
+
       if (picked != null &&
-          largestDataBytes >= minBytesForPlatform(platformSlug)) {
-        final zipFile = File(zipPath);
-        if (await zipFile.exists()) {
-          await zipFile.delete();
+          (platformSlug.toLowerCase() == 'ps3' ||
+              largestDataBytes >= minBytesForPlatform(platformSlug))) {
+        if (deleteSourceOnSuccess) {
+          final arcFile = File(archivePath);
+          if (await arcFile.exists()) {
+            await arcFile.delete();
+          }
         }
         final pickedIsZip = picked.toLowerCase().endsWith('.zip');
-        for (final entity in entities) {
-          if (entity is! File || entity.path == picked) continue;
-          final baseLower = _basename(entity.path).toLowerCase();
+        for (final p in extractedPaths) {
+          if (p == picked) continue;
+          final entity = File(p);
+          final baseLower = _basename(p).toLowerCase();
           final isTemp =
               baseLower.endsWith('.tmp') || baseLower.contains('.tmp_');
           final isResidualArchive =
@@ -3531,13 +4574,18 @@ class RomDownloadService {
             } catch (_) {}
           }
         }
+        onProgress?.call(1.0, 'Conteúdo validado!');
         return picked;
       }
 
-      await extractDir.delete(recursive: true);
+      if (await extractDir.exists()) {
+        await extractDir.delete(recursive: true);
+      }
       return null;
     } catch (e) {
-      debugPrint('[RomDownloadService] Falha ao extrair ZIP $zipPath: $e');
+      debugPrint(
+        '[RomDownloadService] Falha ao extrair arquivo $archivePath: $e',
+      );
       try {
         if (await extractDir.exists()) {
           await extractDir.delete(recursive: true);
@@ -3547,9 +4595,26 @@ class RomDownloadService {
           '[RomDownloadService] Falha ao remover pasta de extração $extractDir: $cleanupErr',
         );
       }
+      if (e is StateError) rethrow;
       return null;
     }
   }
+
+  /// Extrai um arquivo `.zip` em streaming para [extractDir] preservando `.cue`/`.bin`
+  /// e retorna o caminho da ROM principal válida para [platformSlug], ou `null`.
+  static Future<String?> extractAndPickRomFromZip({
+    required String zipPath,
+    required Directory extractDir,
+    required String platformSlug,
+    void Function(double progress, String statusLabel)? onProgress,
+  }) =>
+      extractAndPickRomFromArchive(
+        archivePath: zipPath,
+        extractDir: extractDir,
+        platformSlug: platformSlug,
+        onProgress: onProgress,
+        deleteSourceOnSuccess: true,
+      );
 
   Future<String?> _findUnlockedArchiveMirror({
     required EmulationGame game,
@@ -3559,9 +4624,21 @@ class RomDownloadService {
     final rawDirect = game.directRomUrl.trim();
     if (rawDirect.isNotEmpty) {
       final clean = rawDirect.split('?').first.split('#').first;
-      final last = clean.split('/').last.toLowerCase();
+      final last = Uri.decodeComponent(clean.split('/').last).toLowerCase();
       if (last.endsWith('.zip') || last.endsWith('.7z')) {
         expectedArchiveFile = last;
+      }
+    }
+
+    final isArcade = _isArcadePlatform(game.platformSlug);
+    String? canonicalFbneoZip;
+    if (isArcade) {
+      final canonical = resolveCanonicalFbneoParent(
+        expectedArchiveFile ?? '',
+        gameTitle: game.name,
+      );
+      if (canonical != null) {
+        canonicalFbneoZip = '${canonical.parentStem}.zip';
       }
     }
 
@@ -3588,8 +4665,14 @@ class RomDownloadService {
             .whereType<Map<String, dynamic>>()
             .toList();
 
-        if (expectedArchiveFile != null) {
-          final targetLower = expectedArchiveFile;
+        // Em arcade FBNeo, prioriza o romset parent non-merged completo antes do clone.
+        final candidateTargets = <String>[
+          if (canonicalFbneoZip != null) canonicalFbneoZip,
+          if (expectedArchiveFile != null &&
+              expectedArchiveFile != canonicalFbneoZip)
+            expectedArchiveFile,
+        ];
+        for (final targetLower in candidateTargets) {
           final targetStem = targetLower.replaceAll(RegExp(r'\.(zip|7z)$'), '');
           for (final f in files) {
             final name = (f['name'] as String?) ?? '';
@@ -3640,8 +4723,8 @@ class RomDownloadService {
       return fallbackCollectionUrl;
     }
 
-    final isArcade = _isArcadePlatform(game.platformSlug);
-    final expectedStem = expectedArchiveFile?.replaceAll(
+    final effectiveExpectedArchive = canonicalFbneoZip ?? expectedArchiveFile;
+    final expectedStem = effectiveExpectedArchive?.replaceAll(
       RegExp(r'\.(zip|7z)$'),
       '',
     );
@@ -3738,8 +4821,8 @@ class RomDownloadService {
                     .whereType<Map<String, dynamic>>()
                     .toList();
 
-            if (isArcade && expectedArchiveFile != null) {
-              final targetLower = expectedArchiveFile;
+            if (isArcade && effectiveExpectedArchive != null) {
+              final targetLower = effectiveExpectedArchive;
               final targetStem = expectedStem ?? '';
               final minArcadeBytes = minBytesForPlatform(game.platformSlug);
               for (final f in files) {
@@ -3843,11 +4926,16 @@ class RomDownloadService {
       case 'mastersystem':
         return const ['retrocollection-1g1r-sega-master-system'];
       case 'neogeo':
-        return const ['neo-geo-mvs-romset', 'svcpcb.7z'];
+        return const ['neo-geo-mvs-romset', 'fbneo-parent', 'svcpcb.7z'];
       case 'cps1':
       case 'cps2':
+        return const ['fbneo-parent', 'finalburn-neo-fbneo_20260810'];
       case 'mame':
-        return const ['svcpcb.7z'];
+        return const [
+          'fbneo-parent',
+          'finalburn-neo-fbneo_20260810',
+          'svcpcb.7z',
+        ];
       default:
         return const [];
     }
@@ -3924,9 +5012,9 @@ class RomDownloadService {
     required String fallbackUrl,
     required String fallbackExt,
   }) {
-    for (final candidate in [preferredSource, fallbackUrl]) {
+    String? extractFile(String candidate) {
       final raw = candidate.trim();
-      if (raw.isEmpty) continue;
+      if (raw.isEmpty) return null;
       final clean = raw.split('?').first.split('#').first;
       final slashIdx = clean.lastIndexOf('/');
       final last = slashIdx >= 0 ? clean.substring(slashIdx + 1) : clean;
@@ -3936,6 +5024,31 @@ class RomDownloadService {
         final safe = decoded.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
         if (safe.isNotEmpty) return safe;
       }
+      return null;
+    }
+
+    // Se a URL real resolvida já entrega um romset parent canônico do FBNeo
+    // (ex.: `fbneo-parent/.../sfa3.zip`), nunca sobrescrevê-la com o nome de clone.
+    final fallbackFile = extractFile(fallbackUrl);
+    final preferredFile = extractFile(preferredSource);
+    if (fallbackFile != null) {
+      final fbResolved = resolveCanonicalFbneoParent(fallbackFile);
+      final fbStem =
+          fallbackFile.replaceAll(RegExp(r'\.(zip|7z)$', caseSensitive: false), '').toLowerCase();
+      if (fbResolved != null && fbResolved.parentStem == fbStem) {
+        return fallbackFile;
+      }
+    }
+    if (preferredFile != null) {
+      final resolvedPref = resolveCanonicalFbneoParent(preferredFile);
+      if (resolvedPref != null) {
+        final ext = preferredFile.toLowerCase().endsWith('.7z') ? '.7z' : '.zip';
+        return '${resolvedPref.parentStem}$ext';
+      }
+      return preferredFile;
+    }
+    if (fallbackFile != null) {
+      return fallbackFile;
     }
     return 'romset$fallbackExt';
   }
@@ -3962,7 +5075,7 @@ class RomDownloadService {
     'psx': ['.cue', '.bin', '.img'],
     'ps2': ['.cue', '.bin', '.img'],
     'psp': ['.cue', '.bin', '.img'],
-    'ps3': ['.img'],
+    'ps3': ['.img', '.sfb', '.sfo', '.7z'],
     'saturn': ['.cue', '.bin', '.iso', '.img'],
     'dreamcast': ['.gdi', '.cdi', '.iso', '.img'],
     'gamecube': ['.img'],
@@ -3998,31 +5111,62 @@ class RomDownloadService {
     return importExtensionsForPlatform(platformSlug).contains(name.substring(dotIdx));
   }
 
-  /// Vincula diretamente um arquivo ROM/ISO externo a partir de [sourcePath] sem
-  /// copiar ou duplicar arquivos no armazenamento do app.
-  /// Apenas `.zip` comprimidos de consoles (não arcade) são extraídos para
-  /// a pasta do jogo, mantendo o `.zip` externo intacto sem duplicação.
+  /// Vincula diretamente um arquivo ROM/ISO ou pasta de dump externa (`PS3_GAME`)
+  /// a partir de [sourcePath] sem copiar ou duplicar arquivos desnecessariamente.
+  ///
+  /// Pacotes `.zip` e `.7z` de consoles (não arcade) são extraídos em um [Isolate]
+  /// com progresso via [onProgress] mantendo o arquivo original intacto, e dumps
+  /// de PS3 passam por validação de integridade (ISO descriptografada,
+  /// `PS3_GAME/USRDIR/EBOOT.BIN` ou `.pkg`).
   Future<({String localPath, int totalBytes})?> importExternalRomFile({
     required int igdbId,
     required String sourcePath,
     required String platformSlug,
+    void Function(double progress, String statusLabel)? onProgress,
   }) async {
+    final isDir = await FileSystemEntity.isDirectory(sourcePath);
     final sourceFile = File(sourcePath);
-    if (!await sourceFile.exists()) return null;
+    if (!isDir && !await sourceFile.exists()) return null;
 
     var usedFilePickerCacheCopy = false;
     try {
       final dir = await _romsDirectory();
+      final lowerPlatform = platformSlug.toLowerCase();
       final rawName = _basename(sourcePath);
       final lowerName = rawName.toLowerCase();
       late final String targetPath;
 
-      if (!_isArcadePlatform(platformSlug) && lowerName.endsWith('.zip')) {
+      if (isDir) {
+        if (lowerPlatform == 'ps3') {
+          onProgress?.call(0.5, 'Validando pasta PS3_GAME/USRDIR/EBOOT.BIN...');
+          final validation = await validatePs3DumpContent(sourcePath);
+          if (!validation.isValid || validation.resolvedRomPath == null) {
+            throw StateError(
+              validation.errorMessage ??
+                  'A pasta selecionada não contém PS3_GAME/USRDIR/EBOOT.BIN válido.',
+            );
+          }
+          targetPath = validation.resolvedRomPath!;
+        } else {
+          final entities =
+              await Directory(sourcePath).list(recursive: true).toList();
+          final candidates = entities.whereType<File>().map((f) => f.path).toList();
+          final picked = pickPreferredExtractedRom(
+            candidates,
+            platformSlug: platformSlug,
+          );
+          if (picked == null) return null;
+          targetPath = picked;
+        }
+      } else if (!_isArcadePlatform(platformSlug) &&
+          (lowerName.endsWith('.zip') || lowerName.endsWith('.7z'))) {
         final gameDir = Directory('${dir.path}/game_$igdbId');
-        final extracted = await extractAndPickRomFromZip(
-          zipPath: sourcePath,
+        final extracted = await extractAndPickRomFromArchive(
+          archivePath: sourcePath,
           extractDir: gameDir,
           platformSlug: platformSlug,
+          onProgress: onProgress,
+          deleteSourceOnSuccess: false,
         );
         if (extracted != null) {
           targetPath = extracted;
@@ -4035,14 +5179,30 @@ class RomDownloadService {
               await gameDir.delete(recursive: true);
             }
           } catch (_) {}
+          if (lowerPlatform == 'ps3') {
+            throw StateError(
+              'O pacote selecionado não contém uma ISO descriptografada ou pasta PS3_GAME/USRDIR/EBOOT.BIN válida.',
+            );
+          }
           targetPath = sourceFile.path;
         }
+      } else if (lowerPlatform == 'ps3') {
+        onProgress?.call(0.4, 'Verificando dump de PS3...');
+        final validation = await validatePs3DumpContent(sourceFile.path);
+        if (!validation.isValid || validation.resolvedRomPath == null) {
+          throw StateError(
+            validation.errorMessage ??
+                'Dump de PS3 inválido ou criptografado.',
+          );
+        }
+        targetPath = validation.resolvedRomPath!;
       } else {
         // Execução direta no local original (ISO, CHD, CSO, PBP, RVZ, CUE+BIN,
         // ROMs soltas e conjuntos arcade ZIP/7z) sem copiar nem duplicar dados.
         targetPath = sourceFile.path;
       }
 
+      onProgress?.call(1.0, 'Concluído!');
       final totalBytes =
           await LibraryStorageService.resolveInstalledRomSizeBytes(targetPath);
       return (localPath: targetPath, totalBytes: totalBytes);
@@ -4107,6 +5267,13 @@ class RomDownloadService {
   void dispose() {
     if (_isDisposed) return;
     _isDisposed = true;
+    final waiters = List<Completer<void>>.from(_networkResumeWaiters);
+    _networkResumeWaiters.clear();
+    for (final w in waiters) {
+      if (!w.isCompleted) {
+        w.complete();
+      }
+    }
     while (_pendingQueue.isNotEmpty) {
       final entry = _pendingQueue.removeFirst();
       if (!entry.slotCompleter.isCompleted) {
@@ -4119,6 +5286,7 @@ class RomDownloadService {
       }
     }
     _cancelTokens.clear();
+    _networkInterruptedGames.clear();
     if (!_eventsController.isClosed) {
       unawaited(_eventsController.close());
     }
@@ -4132,4 +5300,1039 @@ class _SpeedSample {
   const _SpeedSample(this.time, this.bytes);
   final DateTime time;
   final int bytes;
+}
+
+class _ArchiveIsolateArgs {
+  const _ArchiveIsolateArgs({
+    required this.sendPort,
+    required this.archivePath,
+    required this.extractPath,
+    required this.is7z,
+  });
+
+  final SendPort sendPort;
+  final String archivePath;
+  final String extractPath;
+  final bool is7z;
+}
+
+void _extractArchiveWorkerEntry(_ArchiveIsolateArgs args) {
+  try {
+    final extractedFiles = <String>[];
+    if (args.is7z) {
+      try {
+        SevenZipArchiveExtractor.extractToDisk(
+          archivePath: args.archivePath,
+          extractPath: args.extractPath,
+          onProgress: (p, entry) {
+            args.sendPort.send({
+              'type': 'progress',
+              'progress': p,
+              'entryName': entry,
+            });
+          },
+          outFiles: extractedFiles,
+        );
+      } catch (pureErr) {
+        // Fallback para binário nativo 7z/7za se disponível no ambiente
+        var cliOk = false;
+        for (final cmd in const ['7z', '7za']) {
+          try {
+            final res = Process.runSync(
+              cmd,
+              ['x', args.archivePath, '-o${args.extractPath}', '-y'],
+            );
+            if (res.exitCode == 0) {
+              cliOk = true;
+              extractedFiles.clear();
+              for (final e
+                  in Directory(args.extractPath).listSync(recursive: true)) {
+                if (e is File) extractedFiles.add(e.path);
+              }
+              break;
+            }
+          } catch (_) {}
+        }
+        if (!cliOk) {
+          rethrow;
+        }
+        debugPrint('[7z] Extraído via CLI após fallback: $pureErr');
+      }
+    } else {
+      _extractZipWithProgress(
+        zipPath: args.archivePath,
+        extractPath: args.extractPath,
+        onProgress: (p, entry) {
+          args.sendPort.send({
+            'type': 'progress',
+            'progress': p,
+            'entryName': entry,
+          });
+        },
+        outFiles: extractedFiles,
+      );
+    }
+    args.sendPort.send({
+      'type': 'done',
+      'files': extractedFiles,
+    });
+  } catch (e) {
+    args.sendPort.send({
+      'type': 'error',
+      'message': '$e',
+    });
+  }
+}
+
+void _extractZipWithProgress({
+  required String zipPath,
+  required String extractPath,
+  required void Function(double progress, String entryName) onProgress,
+  required List<String> outFiles,
+}) {
+  final rootDir = Directory(extractPath);
+  if (!rootDir.existsSync()) rootDir.createSync(recursive: true);
+  final canonicalRoot = rootDir.resolveSymbolicLinksSync();
+  final rootPrefix = canonicalRoot.endsWith(Platform.pathSeparator)
+      ? canonicalRoot
+      : '$canonicalRoot${Platform.pathSeparator}';
+
+  final input = InputFileStream(zipPath);
+  try {
+    final archive = ZipDecoder().decodeBuffer(input);
+    var totalBytes = 0;
+    for (final file in archive.files) {
+      if (file.isFile) {
+        totalBytes += file.size > 0 ? file.size : 0;
+      }
+    }
+    var extractedBytes = 0;
+    var lastReportMs = 0;
+
+    for (final file in archive.files) {
+      final normName = file.name.replaceAll('\\', '/');
+      if (normName.isEmpty ||
+          normName.contains('..') ||
+          normName.startsWith('/')) {
+        continue;
+      }
+      final outPath = '$extractPath/$normName';
+      if (!file.isFile) {
+        Directory(outPath).createSync(recursive: true);
+        continue;
+      }
+      final outFile = File(outPath);
+      outFile.parent.createSync(recursive: true);
+      final canonicalParent = outFile.parent.resolveSymbolicLinksSync();
+      if (canonicalParent != canonicalRoot &&
+          !canonicalParent.startsWith(rootPrefix)) {
+        continue;
+      }
+
+      final output = OutputFileStream(outFile.path, bufferSize: 1024 * 1024);
+      try {
+        file.writeContent(output);
+        file.clear();
+      } finally {
+        output.closeSync();
+      }
+      outFiles.add(outFile.path);
+      extractedBytes += file.size > 0 ? file.size : outFile.lengthSync();
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      if (nowMs - lastReportMs >= 80 || extractedBytes >= totalBytes) {
+        lastReportMs = nowMs;
+        final p = totalBytes > 0 ? (extractedBytes / totalBytes) : 0.5;
+        onProgress(p.clamp(0.0, 1.0), normName.split('/').last);
+      }
+    }
+  } finally {
+    input.closeSync();
+  }
+}
+
+/// Extrator `.7z` em Dart puro (suporta Copy, LZMA, LZMA2, Deflate, BZip2,
+/// EncodedHeader, sólidos e filtros BCJ x86/PowerPC/ARM) executável em [Isolate].
+class SevenZipArchiveExtractor {
+  static const List<int> _kSignature = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
+
+  static void extractToDisk({
+    required String archivePath,
+    required String extractPath,
+    required void Function(double progress, String entryName) onProgress,
+    required List<String> outFiles,
+  }) {
+    final file = File(archivePath);
+    if (!file.existsSync()) {
+      throw StateError('Arquivo .7z não encontrado.');
+    }
+    final raf = file.openSync(mode: FileMode.read);
+    try {
+      final fileLen = raf.lengthSync();
+      if (fileLen < 32) {
+        throw StateError('Arquivo .7z corrompido (cabeçalho menor que 32 bytes).');
+      }
+      final sigHdr = raf.readSync(32);
+      for (var i = 0; i < 6; i++) {
+        if (sigHdr[i] != _kSignature[i]) {
+          throw StateError('Arquivo inválido: assinatura 7z ausente.');
+        }
+      }
+      final bd = ByteData.sublistView(sigHdr);
+      final nextHeaderOffset = bd.getUint64(12, Endian.little);
+      final nextHeaderSize = bd.getUint64(20, Endian.little);
+      final headerPos = 32 + nextHeaderOffset;
+      if (nextHeaderSize == 0 || headerPos + nextHeaderSize > fileLen) {
+        throw StateError('Cabeçalho .7z fora dos limites do arquivo.');
+      }
+
+      raf.setPositionSync(headerPos);
+      var headerBytes = raf.readSync(nextHeaderSize);
+      var hr = _SzByteReader(headerBytes);
+      final firstId = hr.readByte();
+      if (firstId == 0x17) {
+        // EncodedHeader: descompacta o próprio cabeçalho antes de parsear Header (0x01)
+        final hdrStreams = _readStreamsInfo(hr);
+        if (hdrStreams.folders.isEmpty) {
+          throw StateError('Cabeçalho codificado .7z vazio.');
+        }
+        headerBytes = _decodeFolder(
+          raf: raf,
+          packPos: 32 + hdrStreams.packPos,
+          packSizes: hdrStreams.packSizes,
+          folder: hdrStreams.folders.first,
+          packStartIdx: 0,
+        );
+        hr = _SzByteReader(headerBytes);
+        final innerId = hr.readByte();
+        if (innerId != 0x01) {
+          throw StateError('Cabeçalho .7z interno inesperado ($innerId).');
+        }
+      } else if (firstId != 0x01) {
+        throw StateError('Marcador de cabeçalho .7z inválido ($firstId).');
+      }
+
+      final parsed = _readMainHeader(hr);
+      final rootDir = Directory(extractPath);
+      if (!rootDir.existsSync()) rootDir.createSync(recursive: true);
+      final canonicalRoot = rootDir.resolveSymbolicLinksSync();
+      final rootPrefix = canonicalRoot.endsWith(Platform.pathSeparator)
+          ? canonicalRoot
+          : '$canonicalRoot${Platform.pathSeparator}';
+
+      // Mapeia os streams não vazios (SubStreams) para arquivos não vazios
+      final nonEmptyFiles = <_SzFileEntry>[];
+      var totalUnpackBytes = 0;
+      for (final entry in parsed.files) {
+        if (!entry.hasStream) {
+          if (!entry.isAnti && entry.name.isNotEmpty) {
+            final cleanRel = _sanitizeRelPath(entry.name);
+            if (cleanRel != null) {
+              final target = '$extractPath/$cleanRel';
+              if (entry.isDirectory) {
+                Directory(target).createSync(recursive: true);
+              } else {
+                final f = File(target);
+                f.parent.createSync(recursive: true);
+                f.writeAsBytesSync(const <int>[]);
+                outFiles.add(f.path);
+              }
+            }
+          }
+        } else {
+          nonEmptyFiles.add(entry);
+        }
+      }
+
+      final streams = parsed.mainStreams;
+      if (streams == null || streams.folders.isEmpty) return;
+
+      for (final folder in streams.folders) {
+        for (final sz in folder.subStreamSizes) {
+          totalUnpackBytes += sz;
+        }
+      }
+      if (totalUnpackBytes == 0) totalUnpackBytes = 1;
+
+      var packCursor = 0;
+      var fileCursor = 0;
+      var extractedBytes = 0;
+
+      for (final folder in streams.folders) {
+        final folderData = _decodeFolder(
+          raf: raf,
+          packPos: 32 + streams.packPos,
+          packSizes: streams.packSizes,
+          folder: folder,
+          packStartIdx: packCursor,
+        );
+        packCursor += folder.numPackedStreams;
+
+        var offset = 0;
+        for (final subSize in folder.subStreamSizes) {
+          if (fileCursor >= nonEmptyFiles.length) break;
+          final entry = nonEmptyFiles[fileCursor++];
+          final sliceEnd = (offset + subSize).clamp(0, folderData.length);
+          final chunk = Uint8List.sublistView(folderData, offset, sliceEnd);
+          offset = sliceEnd;
+
+          final cleanRel = _sanitizeRelPath(entry.name);
+          if (cleanRel != null) {
+            final outFile = File('$extractPath/$cleanRel');
+            outFile.parent.createSync(recursive: true);
+            final canonicalParent = outFile.parent.resolveSymbolicLinksSync();
+            if (canonicalParent == canonicalRoot ||
+                canonicalParent.startsWith(rootPrefix)) {
+              outFile.writeAsBytesSync(chunk, flush: true);
+              outFiles.add(outFile.path);
+            }
+          }
+          extractedBytes += subSize;
+          onProgress(
+            (extractedBytes / totalUnpackBytes).clamp(0.0, 1.0),
+            entry.name.split('/').last,
+          );
+        }
+      }
+    } finally {
+      raf.closeSync();
+    }
+  }
+
+  static String? _sanitizeRelPath(String rawName) {
+    final norm = rawName.replaceAll('\\', '/').trim();
+    if (norm.isEmpty || norm.startsWith('/') || norm.contains('..')) {
+      return null;
+    }
+    return norm;
+  }
+
+  static ({_SzStreamsInfo? mainStreams, List<_SzFileEntry> files}) _readMainHeader(
+    _SzByteReader r,
+  ) {
+    _SzStreamsInfo? mainStreams;
+    var files = <_SzFileEntry>[];
+    while (r.hasMore) {
+      final id = r.readByte();
+      if (id == 0x00) break;
+      switch (id) {
+        case 0x02: // ArchiveProperties
+          while (true) {
+            final pid = r.readByte();
+            if (pid == 0x00) break;
+            final pSize = r.readNumber();
+            r.skip(pSize);
+          }
+          break;
+        case 0x03: // AdditionalStreamsInfo
+          _readStreamsInfo(r);
+          break;
+        case 0x04: // MainStreamsInfo
+          mainStreams = _readStreamsInfo(r);
+          break;
+        case 0x05: // FilesInfo
+          files = _readFilesInfo(r);
+          break;
+        default:
+          throw StateError('Propriedade .7z desconhecida no cabeçalho ($id).');
+      }
+    }
+    return (mainStreams: mainStreams, files: files);
+  }
+
+  static _SzStreamsInfo _readStreamsInfo(_SzByteReader r) {
+    var packPos = 0;
+    final packSizes = <int>[];
+    final folders = <_SzFolder>[];
+
+    while (r.hasMore) {
+      final id = r.readByte();
+      if (id == 0x00) break;
+      switch (id) {
+        case 0x06: // PackInfo
+          packPos = r.readNumber();
+          final numPackStreams = r.readNumber();
+          while (true) {
+            final pid = r.readByte();
+            if (pid == 0x00) break;
+            if (pid == 0x09) {
+              for (var i = 0; i < numPackStreams; i++) {
+                packSizes.add(r.readNumber());
+              }
+            } else if (pid == 0x0A) {
+              _skipCrcDigests(r, numPackStreams);
+            } else {
+              throw StateError('PackInfo inválido ($pid).');
+            }
+          }
+          break;
+        case 0x07: // UnpackInfo
+          while (true) {
+            final pid = r.readByte();
+            if (pid == 0x00) break;
+            if (pid == 0x0B) {
+              final numFolders = r.readNumber();
+              final external = r.readByte();
+              if (external != 0) {
+                throw StateError('External UnpackInfo não suportado em .7z.');
+              }
+              for (var i = 0; i < numFolders; i++) {
+                folders.add(_readFolder(r));
+              }
+            } else if (pid == 0x0C) {
+              for (final f in folders) {
+                final sizes = <int>[];
+                for (var s = 0; s < f.totalOutStreams; s++) {
+                  sizes.add(r.readNumber());
+                }
+                f.unpackSizes = sizes;
+              }
+            } else if (pid == 0x0A) {
+              _skipCrcDigests(r, folders.length);
+            } else {
+              throw StateError('UnpackInfo inválido ($pid).');
+            }
+          }
+          break;
+        case 0x08: // SubStreamsInfo
+          final numSubStreams = List<int>.filled(folders.length, 1);
+          final explicitSizes = <List<int>>[
+            for (var i = 0; i < folders.length; i++) <int>[],
+          ];
+          while (true) {
+            final pid = r.readByte();
+            if (pid == 0x00) break;
+            if (pid == 0x0D) {
+              for (var i = 0; i < folders.length; i++) {
+                numSubStreams[i] = r.readNumber();
+              }
+            } else if (pid == 0x09) {
+              for (var i = 0; i < folders.length; i++) {
+                final count = numSubStreams[i];
+                for (var j = 0; j < count - 1; j++) {
+                  explicitSizes[i].add(r.readNumber());
+                }
+              }
+            } else if (pid == 0x0A) {
+              var crcCount = 0;
+              for (var i = 0; i < folders.length; i++) {
+                if (numSubStreams[i] != 1) crcCount += numSubStreams[i];
+              }
+              _skipCrcDigests(r, crcCount);
+            } else {
+              throw StateError('SubStreamsInfo inválido ($pid).');
+            }
+          }
+          for (var i = 0; i < folders.length; i++) {
+            final totalSize = folders[i].finalUnpackSize;
+            final count = numSubStreams[i];
+            if (count == 1) {
+              folders[i].subStreamSizes = [totalSize];
+            } else {
+              var sum = 0;
+              for (final s in explicitSizes[i]) {
+                sum += s;
+              }
+              folders[i].subStreamSizes = [
+                ...explicitSizes[i],
+                (totalSize - sum).clamp(0, totalSize),
+              ];
+            }
+          }
+          break;
+        default:
+          throw StateError('StreamsInfo .7z inválido ($id).');
+      }
+    }
+
+    for (final f in folders) {
+      if (f.subStreamSizes.isEmpty) {
+        f.subStreamSizes = [f.finalUnpackSize];
+      }
+    }
+    return _SzStreamsInfo(
+      packPos: packPos,
+      packSizes: packSizes,
+      folders: folders,
+    );
+  }
+
+  static _SzFolder _readFolder(_SzByteReader r) {
+    final numCoders = r.readNumber();
+    final coders = <_SzCoder>[];
+    var totalIn = 0;
+    var totalOut = 0;
+
+    for (var i = 0; i < numCoders; i++) {
+      final flags = r.readByte();
+      final idSize = flags & 0x0F;
+      final isComplex = (flags & 0x10) != 0;
+      final hasAttrs = (flags & 0x20) != 0;
+      final codecId = r.readBytes(idSize);
+      var numIn = 1;
+      var numOut = 1;
+      if (isComplex) {
+        numIn = r.readNumber();
+        numOut = r.readNumber();
+      }
+      Uint8List attrs = Uint8List(0);
+      if (hasAttrs) {
+        final attrLen = r.readNumber();
+        attrs = r.readBytes(attrLen);
+      }
+      coders.add(_SzCoder(
+        codecId: codecId,
+        numInStreams: numIn,
+        numOutStreams: numOut,
+        properties: attrs,
+      ));
+      totalIn += numIn;
+      totalOut += numOut;
+    }
+
+    final numBindPairs = totalOut - 1;
+    final bindInIndices = <int>{};
+    final bindPairs = <(int, int)>[];
+    for (var i = 0; i < numBindPairs; i++) {
+      final inIdx = r.readNumber();
+      final outIdx = r.readNumber();
+      bindInIndices.add(inIdx);
+      bindPairs.add((inIdx, outIdx));
+    }
+
+    final numPacked = totalIn - numBindPairs;
+    final packedIndices = <int>[];
+    if (numPacked == 1) {
+      var found = 0;
+      for (var i = 0; i < totalIn; i++) {
+        if (!bindInIndices.contains(i)) {
+          found = i;
+          break;
+        }
+      }
+      packedIndices.add(found);
+    } else {
+      for (var i = 0; i < numPacked; i++) {
+        packedIndices.add(r.readNumber());
+      }
+    }
+
+    return _SzFolder(
+      coders: coders,
+      totalInStreams: totalIn,
+      totalOutStreams: totalOut,
+      bindPairs: bindPairs,
+      packedIndices: packedIndices,
+    );
+  }
+
+  static void _skipCrcDigests(_SzByteReader r, int count) {
+    final allDefined = r.readByte();
+    var definedCount = count;
+    if (allDefined == 0) {
+      final maskBytes = (count + 7) >> 3;
+      final mask = r.readBytes(maskBytes);
+      definedCount = 0;
+      for (var i = 0; i < count; i++) {
+        if ((mask[i >> 3] & (0x80 >> (i & 7))) != 0) definedCount++;
+      }
+    }
+    r.skip(definedCount * 4);
+  }
+
+  static List<_SzFileEntry> _readFilesInfo(_SzByteReader r) {
+    final numFiles = r.readNumber();
+    final emptyStreams = List<bool>.filled(numFiles, false);
+    var emptyFiles = <bool>[];
+    var antiFiles = <bool>[];
+    var names = List<String>.filled(numFiles, '');
+    final dirAttribs = List<bool>.filled(numFiles, false);
+
+    while (r.hasMore) {
+      final propType = r.readByte();
+      if (propType == 0x00) break;
+      final propSize = r.readNumber();
+      final propBytes = r.readBytes(propSize);
+      final pr = _SzByteReader(propBytes);
+
+      switch (propType) {
+        case 0x0E: // kEmptyStream
+          for (var i = 0; i < numFiles; i++) {
+            emptyStreams[i] =
+                (propBytes[i >> 3] & (0x80 >> (i & 7))) != 0;
+          }
+          break;
+        case 0x0F: // kEmptyFile
+          final emptyCount = emptyStreams.where((e) => e).length;
+          emptyFiles = List<bool>.generate(
+            emptyCount,
+            (i) => (propBytes[i >> 3] & (0x80 >> (i & 7))) != 0,
+          );
+          break;
+        case 0x10: // kAnti
+          final emptyCount = emptyStreams.where((e) => e).length;
+          antiFiles = List<bool>.generate(
+            emptyCount,
+            (i) => (propBytes[i >> 3] & (0x80 >> (i & 7))) != 0,
+          );
+          break;
+        case 0x11: // kName
+          final external = pr.readByte();
+          if (external != 0) {
+            throw StateError('Nomes externos .7z não suportados.');
+          }
+          final units = <int>[];
+          var fileIdx = 0;
+          while (pr.hasMore && fileIdx < numFiles) {
+            final lo = pr.readByte();
+            final hi = pr.hasMore ? pr.readByte() : 0;
+            final codeUnit = lo | (hi << 8);
+            if (codeUnit == 0) {
+              names[fileIdx++] = String.fromCharCodes(units);
+              units.clear();
+            } else {
+              units.add(codeUnit);
+            }
+          }
+          break;
+        case 0x14: // kWinAttrib
+          final allDef = pr.readByte();
+          final maskBytes = allDef == 0 ? ((numFiles + 7) >> 3) : 0;
+          final mask = maskBytes > 0 ? pr.readBytes(maskBytes) : Uint8List(0);
+          for (var i = 0; i < numFiles; i++) {
+            final def = allDef != 0 ||
+                (mask[i >> 3] & (0x80 >> (i & 7))) != 0;
+            if (def && pr.hasMore) {
+              final attr = pr.readByte() |
+                  (pr.readByte() << 8) |
+                  (pr.readByte() << 16) |
+                  (pr.readByte() << 24);
+              dirAttribs[i] = (attr & 0x10) != 0;
+            }
+          }
+          break;
+        default:
+          break;
+      }
+    }
+
+    final result = <_SzFileEntry>[];
+    var emptyIdx = 0;
+    for (var i = 0; i < numFiles; i++) {
+      final isEmptyStream = emptyStreams[i];
+      var isEmptyFile = false;
+      var isAnti = false;
+      if (isEmptyStream) {
+        if (emptyIdx < emptyFiles.length) isEmptyFile = emptyFiles[emptyIdx];
+        if (emptyIdx < antiFiles.length) isAnti = antiFiles[emptyIdx];
+        emptyIdx++;
+      }
+      final isDir =
+          dirAttribs[i] || (isEmptyStream && !isEmptyFile && !isAnti);
+      result.add(_SzFileEntry(
+        name: names[i],
+        hasStream: !isEmptyStream,
+        isDirectory: isDir,
+        isAnti: isAnti,
+      ));
+    }
+    return result;
+  }
+
+  static Uint8List _decodeFolder({
+    required RandomAccessFile raf,
+    required int packPos,
+    required List<int> packSizes,
+    required _SzFolder folder,
+    required int packStartIdx,
+  }) {
+    var offset = packPos;
+    for (var i = 0; i < packStartIdx && i < packSizes.length; i++) {
+      offset += packSizes[i];
+    }
+
+    final inStreams = <int, Uint8List>{};
+    for (var p = 0; p < folder.packedIndices.length; p++) {
+      final packIdx = packStartIdx + p;
+      final size = packIdx < packSizes.length ? packSizes[packIdx] : 0;
+      raf.setPositionSync(offset);
+      inStreams[folder.packedIndices[p]] = raf.readSync(size);
+      offset += size;
+    }
+
+    // Caso mais comum: pipeline de 1 coder ou coders encadeados pelos bindPairs
+    final outStreams = <int, Uint8List>{};
+    var remainingCoders = List<int>.generate(folder.coders.length, (i) => i);
+
+    final outOffsets = <int>[];
+    final inOffsets = <int>[];
+    var accIn = 0;
+    var accOut = 0;
+    for (final c in folder.coders) {
+      inOffsets.add(accIn);
+      outOffsets.add(accOut);
+      accIn += c.numInStreams;
+      accOut += c.numOutStreams;
+    }
+
+    while (remainingCoders.isNotEmpty) {
+      var progressed = false;
+      for (final cIdx in List<int>.from(remainingCoders)) {
+        final coder = folder.coders[cIdx];
+        final firstIn = inOffsets[cIdx];
+        final firstOut = outOffsets[cIdx];
+
+        // Resolve todas as entradas do coder (direto do arquivo ou via bindPair)
+        final coderInputs = <Uint8List>[];
+        var ready = true;
+        for (var k = 0; k < coder.numInStreams; k++) {
+          final streamIdx = firstIn + k;
+          if (inStreams.containsKey(streamIdx)) {
+            coderInputs.add(inStreams[streamIdx]!);
+          } else {
+            final bound = folder.bindPairs
+                .where((bp) => bp.$1 == streamIdx)
+                .map((bp) => bp.$2)
+                .firstOrNull;
+            if (bound != null && outStreams.containsKey(bound)) {
+              coderInputs.add(outStreams[bound]!);
+            } else {
+              ready = false;
+              break;
+            }
+          }
+        }
+        if (!ready) continue;
+
+        final outSize = firstOut < folder.unpackSizes.length
+            ? folder.unpackSizes[firstOut]
+            : folder.finalUnpackSize;
+        outStreams[firstOut] = _runCoder(
+          codecId: coder.codecId,
+          properties: coder.properties,
+          input: coderInputs.first,
+          outSize: outSize,
+        );
+        remainingCoders.remove(cIdx);
+        progressed = true;
+      }
+      if (!progressed) {
+        throw StateError('Pipeline de codecs .7z inválido.');
+      }
+    }
+
+    // O stream de saída final é o que não está ligado como saída em nenhum bindPair
+    final boundOuts = folder.bindPairs.map((bp) => bp.$2).toSet();
+    for (var i = 0; i < folder.totalOutStreams; i++) {
+      if (!boundOuts.contains(i) && outStreams.containsKey(i)) {
+        return outStreams[i]!;
+      }
+    }
+    return outStreams.values.last;
+  }
+
+  static Uint8List _runCoder({
+    required Uint8List codecId,
+    required Uint8List properties,
+    required Uint8List input,
+    required int outSize,
+  }) {
+    bool isCodec(List<int> target) {
+      if (codecId.length != target.length) return false;
+      for (var i = 0; i < target.length; i++) {
+        if (codecId[i] != target[i]) return false;
+      }
+      return true;
+    }
+
+    // Copy [0x00]
+    if (isCodec(const [0x00])) {
+      return input;
+    }
+
+    // LZMA [0x03, 0x01, 0x01]
+    if (isCodec(const [0x03, 0x01, 0x01])) {
+      if (properties.length < 5) {
+        throw StateError('Propriedades LZMA ausentes no .7z.');
+      }
+      var props = properties[0];
+      final pb = props ~/ 45;
+      props -= pb * 45;
+      final lp = props ~/ 9;
+      final lc = props - lp * 9;
+      final decoder = LzmaDecoder();
+      decoder.reset(
+        positionBits: pb,
+        literalPositionBits: lp,
+        literalContextBits: lc,
+        resetDictionary: true,
+      );
+      return decoder.decode(InputStream(input), outSize);
+    }
+
+    // LZMA2 [0x21]
+    if (isCodec(const [0x21])) {
+      return _decodeLzma2(input);
+    }
+
+    // Deflate [0x04, 0x01, 0x08]
+    if (isCodec(const [0x04, 0x01, 0x08])) {
+      final decoded = Inflate(input).getBytes();
+      return decoded is Uint8List ? decoded : Uint8List.fromList(decoded);
+    }
+
+    // BZip2 [0x04, 0x02, 0x02]
+    if (isCodec(const [0x04, 0x02, 0x02])) {
+      final decoded = BZip2Decoder().decodeBytes(input);
+      return decoded is Uint8List ? decoded : Uint8List.fromList(decoded);
+    }
+
+    // BCJ x86 [0x03, 0x03, 0x01, 0x03]
+    if (isCodec(const [0x03, 0x03, 0x01, 0x03])) {
+      return _decodeBcjX86(Uint8List.fromList(input));
+    }
+
+    // BCJ PowerPC [0x03, 0x03, 0x02, 0x05]
+    if (isCodec(const [0x03, 0x03, 0x02, 0x05])) {
+      return _decodeBcjPpc(Uint8List.fromList(input));
+    }
+
+    // BCJ ARM [0x03, 0x03, 0x05, 0x01]
+    if (isCodec(const [0x03, 0x03, 0x05, 0x01])) {
+      return _decodeBcjArm(Uint8List.fromList(input));
+    }
+
+    final hexId = codecId.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    throw StateError('Codec .7z não suportado: 0x$hexId');
+  }
+
+  static Uint8List _decodeLzma2(Uint8List input) {
+    final stream = InputStream(input);
+    final decoder = LzmaDecoder();
+    final out = BytesBuilder(copy: false);
+
+    while (!stream.isEOS) {
+      final control = stream.readByte();
+      if (control & 0x80 == 0) {
+        if (control == 0) {
+          decoder.reset(resetDictionary: true);
+          break;
+        } else if (control == 1) {
+          decoder.reset(resetDictionary: true);
+          final len = ((stream.readByte() << 8) | stream.readByte()) + 1;
+          out.add(decoder.decodeUncompressed(stream.readBytes(len), len));
+        } else if (control == 2) {
+          final len = ((stream.readByte() << 8) | stream.readByte()) + 1;
+          out.add(decoder.decodeUncompressed(stream.readBytes(len), len));
+        } else {
+          throw StateError('Código de controle LZMA2 desconhecido ($control).');
+        }
+      } else {
+        final reset = (control >> 5) & 0x3;
+        final unpackLen =
+            (((control & 0x1F) << 16) |
+                    (stream.readByte() << 8) |
+                    stream.readByte()) +
+                1;
+        final packLen = ((stream.readByte() << 8) | stream.readByte()) + 1;
+        int? lc;
+        int? lp;
+        int? pb;
+        if (reset >= 2) {
+          var props = stream.readByte();
+          pb = props ~/ 45;
+          props -= pb * 45;
+          lp = props ~/ 9;
+          lc = props - lp * 9;
+        }
+        if (reset > 0) {
+          decoder.reset(
+            literalContextBits: lc,
+            literalPositionBits: lp,
+            positionBits: pb,
+            resetDictionary: reset == 3,
+          );
+        }
+        out.add(decoder.decode(stream.readBytes(packLen), unpackLen));
+      }
+    }
+    return out.takeBytes();
+  }
+
+  static Uint8List _decodeBcjX86(Uint8List buf) {
+    if (buf.length < 5) return buf;
+    var pos = 0;
+    var prevMask = 0;
+    while (pos <= buf.length - 5) {
+      final b = buf[pos];
+      if (b != 0xE8 && b != 0xE9) {
+        pos++;
+        prevMask = (prevMask << 1) & 0xFF;
+        continue;
+      }
+      if ((prevMask & 0x07) == 0) {
+        final src = (buf[pos + 1]) |
+            (buf[pos + 2] << 8) |
+            (buf[pos + 3] << 16) |
+            (buf[pos + 4] << 24);
+        final top = buf[pos + 4];
+        if (top == 0x00 || top == 0xFF) {
+          final dest = (src - (pos + 5)) & 0xFFFFFFFF;
+          buf[pos + 1] = dest & 0xFF;
+          buf[pos + 2] = (dest >> 8) & 0xFF;
+          buf[pos + 3] = (dest >> 16) & 0xFF;
+          buf[pos + 4] = ((dest >> 24) & 0x01) == 0x01 ? 0xFF : 0x00;
+          pos += 5;
+          prevMask = 0;
+          continue;
+        }
+      }
+      pos++;
+      prevMask = (prevMask << 1) & 0xFF;
+    }
+    return buf;
+  }
+
+  static Uint8List _decodeBcjPpc(Uint8List buf) {
+    for (var i = 0; i + 4 <= buf.length; i += 4) {
+      if ((buf[i] >> 2) == 0x12 && (buf[i + 3] & 0x03) == 0x01) {
+        var src = ((buf[i] & 0x03) << 24) |
+            (buf[i + 1] << 16) |
+            (buf[i + 2] << 8) |
+            (buf[i + 3] & 0xFC);
+        var dest = src - i;
+        buf[i] = 0x48 | ((dest >> 24) & 0x03);
+        buf[i + 1] = (dest >> 16) & 0xFF;
+        buf[i + 2] = (dest >> 8) & 0xFF;
+        buf[i + 3] = (buf[i + 3] & 0x03) | (dest & 0xFC);
+      }
+    }
+    return buf;
+  }
+
+  static Uint8List _decodeBcjArm(Uint8List buf) {
+    for (var i = 0; i + 4 <= buf.length; i += 4) {
+      if (buf[i + 3] == 0xEB) {
+        var src = (buf[i] | (buf[i + 1] << 8) | (buf[i + 2] << 16)) << 2;
+        var dest = (src - (i + 8)) >> 2;
+        buf[i] = dest & 0xFF;
+        buf[i + 1] = (dest >> 8) & 0xFF;
+        buf[i + 2] = (dest >> 16) & 0xFF;
+      }
+    }
+    return buf;
+  }
+}
+
+class _SzByteReader {
+  _SzByteReader(this._bytes);
+  final Uint8List _bytes;
+  int _pos = 0;
+
+  bool get hasMore => _pos < _bytes.length;
+
+  int readByte() {
+    if (_pos >= _bytes.length) {
+      throw StateError('Fim inesperado ao ler cabeçalho .7z.');
+    }
+    return _bytes[_pos++];
+  }
+
+  Uint8List readBytes(int count) {
+    if (count <= 0) return Uint8List(0);
+    if (_pos + count > _bytes.length) {
+      throw StateError('Leitura além dos limites do cabeçalho .7z.');
+    }
+    final slice = Uint8List.sublistView(_bytes, _pos, _pos + count);
+    _pos += count;
+    return slice;
+  }
+
+  void skip(int count) {
+    _pos = (_pos + count).clamp(0, _bytes.length);
+  }
+
+  int readNumber() {
+    final first = readByte();
+    var mask = 0x80;
+    var value = 0;
+    for (var i = 0; i < 8; i++) {
+      if ((first & mask) == 0) {
+        final high = first & (mask - 1);
+        value |= high << (8 * i);
+        return value;
+      }
+      value |= readByte() << (8 * i);
+      mask >>= 1;
+    }
+    return value;
+  }
+}
+
+class _SzCoder {
+  const _SzCoder({
+    required this.codecId,
+    required this.numInStreams,
+    required this.numOutStreams,
+    required this.properties,
+  });
+
+  final Uint8List codecId;
+  final int numInStreams;
+  final int numOutStreams;
+  final Uint8List properties;
+}
+
+class _SzFolder {
+  _SzFolder({
+    required this.coders,
+    required this.totalInStreams,
+    required this.totalOutStreams,
+    required this.bindPairs,
+    required this.packedIndices,
+  });
+
+  final List<_SzCoder> coders;
+  final int totalInStreams;
+  final int totalOutStreams;
+  final List<(int, int)> bindPairs;
+  final List<int> packedIndices;
+  List<int> unpackSizes = const [];
+  List<int> subStreamSizes = const [];
+
+  int get numPackedStreams => packedIndices.length;
+
+  int get finalUnpackSize {
+    if (unpackSizes.isEmpty) return 0;
+    final boundOuts = bindPairs.map((bp) => bp.$2).toSet();
+    for (var i = 0; i < unpackSizes.length; i++) {
+      if (!boundOuts.contains(i)) return unpackSizes[i];
+    }
+    return unpackSizes.last;
+  }
+}
+
+class _SzStreamsInfo {
+  const _SzStreamsInfo({
+    required this.packPos,
+    required this.packSizes,
+    required this.folders,
+  });
+
+  final int packPos;
+  final List<int> packSizes;
+  final List<_SzFolder> folders;
+}
+
+class _SzFileEntry {
+  const _SzFileEntry({
+    required this.name,
+    required this.hasStream,
+    required this.isDirectory,
+    required this.isAnti,
+  });
+
+  final String name;
+  final bool hasStream;
+  final bool isDirectory;
+  final bool isAnti;
 }

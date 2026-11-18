@@ -9,6 +9,7 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:io';
+import 'dart:isolate';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import '../models/emulation_game.dart';
@@ -101,6 +102,18 @@ class IgdbSteamGridService {
 
   /// Cache em memória das respostas da RetroAPI (retroapi.konsumer.workers.dev)
   static final Map<String, List<EmulationGame>> _retroApiCache = {};
+  final Map<String, Future<List<EmulationGame>>> _inFlightRetroApiBySlug = {};
+  final Map<String, Future<List<EmulationGame>>> _inFlightRealCatalogByKey = {};
+
+  /// Cache de textos pré-normalizados para busca instantânea na barra de pesquisa.
+  static final Map<
+      int,
+      ({
+        String normTitle,
+        String baseTitle,
+        String normCanonical,
+        String metaHaystack,
+      })> _searchIndexCache = {};
 
   /// Cache em memória de artes SteamGridDB por título normalizado (evita chamadas duplicadas)
   static final Map<String, ({String? grid, String? hero, String? logo})>
@@ -111,6 +124,7 @@ class IgdbSteamGridService {
   /// Limpa os caches em memória (útil para isolamento em testes).
   static void clearCacheForTesting() {
     _retroApiCache.clear();
+    _searchIndexCache.clear();
     _sgdbArtCache.clear();
     _sgdbInFlight.clear();
   }
@@ -197,6 +211,40 @@ class IgdbSteamGridService {
     final querySpec = _retroApiEndpointForPlatform(slug);
     if (querySpec == null) return const [];
 
+    final inFlight = _inFlightRetroApiBySlug[slug];
+    if (inFlight != null) {
+      final parsed = await inFlight;
+      if (offset >= parsed.length) return const [];
+      return parsed.skip(offset).take(maxPerPlatform).toList();
+    }
+
+    final fetchFuture = _loadAndParseRetroApiPlatform(
+      slug: slug,
+      querySpec: querySpec,
+      cancelToken: cancelToken,
+    );
+    _inFlightRetroApiBySlug[slug] = fetchFuture;
+    try {
+      final parsed = await fetchFuture;
+      if (offset >= parsed.length) return const [];
+      return parsed.skip(offset).take(maxPerPlatform).toList();
+    } finally {
+      if (identical(_inFlightRetroApiBySlug[slug], fetchFuture)) {
+        unawaited(_inFlightRetroApiBySlug.remove(slug));
+      }
+    }
+  }
+
+  Future<List<EmulationGame>> _loadAndParseRetroApiPlatform({
+    required String slug,
+    required ({
+      String url,
+      String platformLabel,
+      String platformDisplay,
+      String defaultDeveloper,
+    }) querySpec,
+    CancelToken? cancelToken,
+  }) async {
     try {
       final res = await _dio.get<dynamic>(
         querySpec.url,
@@ -211,125 +259,20 @@ class IgdbSteamGridService {
       final data = res.data;
       if (data is! List) return const [];
 
-      final Map<String, ({int score, bool preferred, EmulationGame item})>
-          bestByKey = {};
       final minValidBytes = RomDownloadService.minBytesForPlatform(slug);
-
-      for (final group in data) {
-        if (group is! List) continue;
-        for (final raw in group.whereType<Map<String, dynamic>>()) {
-          final rawName = (raw['name'] as String?)?.trim() ?? '';
-          if (rawName.isEmpty) continue;
-
-          final lowerName = rawName.toLowerCase();
-          if (lowerName.contains('(beta') ||
-              lowerName.contains('(proto') ||
-              lowerName.contains('(demo') ||
-              lowerName.contains('(sample') ||
-              lowerName.contains('(pirate') ||
-              lowerName.contains('(trial') ||
-              lowerName.contains('(kiosk') ||
-              lowerName.contains('(taikenban') ||
-              lowerName.contains('(preview') ||
-              lowerName.contains('[b]')) {
-            continue;
-          }
-
-          final isPreferredRegion = rawName.contains('(USA') ||
-              rawName.contains('(World') ||
-              rawName.contains('(Europe') ||
-              !rawName.contains('(');
-
-          final cleanDisplayTitle = rawName
-              .replaceAll(RegExp(r'\s*\([^)]*\)'), '')
-              .replaceAll(' - ', ': ')
-              .trim();
-          if (cleanDisplayTitle.isEmpty) continue;
-
-          final dedupeKey = '${slug}_${cleanDisplayTitle.toLowerCase()}';
-          final romName = (raw['rom_name'] as String?) ?? '$rawName.rom';
-          final rawSize = _parseByteSize(raw['size']);
-          final sizeBytes = rawSize > 0 ? rawSize : 0;
-
-          final lowerRom = romName.toLowerCase();
-          final isCue = lowerRom.endsWith('.cue');
-          int score = 0;
-          if (sizeBytes >= minValidBytes && !isCue) {
-            score += 10000;
-          } else if (sizeBytes > 0 && !isCue) {
-            score += 2000;
-          }
-          if (rawName.contains('(USA')) {
-            score += 500;
-          } else if (rawName.contains('(World')) {
-            score += 400;
-          } else if (rawName.contains('(Europe')) {
-            score += 300;
-          } else if (!rawName.contains('(')) {
-            score += 200;
-          }
-          if (!isCue) score += 50;
-
-          final existing = bestByKey[dedupeKey];
-          if (existing != null && score <= existing.score) {
-            continue;
-          }
-
-          final crc = ((raw['crc'] as String?) ?? '').toUpperCase();
-          final developer = (raw['developer'] as String?) ??
-              (raw['publisher'] as String?) ??
-              querySpec.defaultDeveloper;
-          final rawGenre = (raw['genre'] as String?)?.trim();
-          final genre =
-              (rawGenre != null && rawGenre.isNotEmpty) ? rawGenre : 'Retro';
-          final releaseYear = (raw['releaseyear'] as num?)?.toInt();
-          final rawDesc = (raw['description'] as String?)?.trim();
-          final region = rawName.contains('(USA')
-              ? 'USA'
-              : rawName.contains('(Europe')
-                  ? 'EUR'
-                  : 'WORLD';
-
-          final idSeed = EmulationGame.stableIdFromKey('${slug}_$rawName');
-
-          final item = EmulationGame(
-            igdbId: idSeed,
-            name: cleanDisplayTitle,
-            canonicalNoIntroName: rawName,
-            summary: (rawDesc != null && rawDesc.length > 12)
-                ? rawDesc
-                : 'Título clássico de ${querySpec.platformDisplay} desenvolvido por $developer${releaseYear != null ? " ($releaseYear)" : ""}. Catálogo integrado via RetroAPI & ROM-Gripper.',
-            genres: [genre, querySpec.platformLabel],
-            developer: developer,
-            releaseYear: releaseYear,
-            rating: 89,
-            platformName: querySpec.platformLabel,
-            platformSlug: slug,
-            region: region,
-            crc32: crc,
-            estimatedSizeBytes: sizeBytes,
-            directRomUrl:
-                'retroapi://$slug/${Uri.encodeComponent(romName)}',
-          );
-
-          bestByKey[dedupeKey] = (
-            score: score,
-            preferred: isPreferredRegion,
-            item: item,
-          );
-        }
-      }
-
-      final parsed = <EmulationGame>[
-        for (final entry in bestByKey.values)
-          if (entry.preferred) entry.item,
-        for (final entry in bestByKey.values)
-          if (!entry.preferred) entry.item,
-      ];
+      final parsed = await Isolate.run(
+        () => _parseRetroApiPayloadSync(
+          data: data,
+          slug: slug,
+          platformLabel: querySpec.platformLabel,
+          platformDisplay: querySpec.platformDisplay,
+          defaultDeveloper: querySpec.defaultDeveloper,
+          minValidBytes: minValidBytes,
+        ),
+      );
 
       _retroApiCache[slug] = parsed;
-      if (offset >= parsed.length) return const [];
-      return parsed.skip(offset).take(maxPerPlatform).toList();
+      return parsed;
     } on DioException catch (e) {
       if (e.type == DioExceptionType.cancel) rethrow;
       debugPrint(
@@ -340,6 +283,159 @@ class IgdbSteamGridService {
       debugPrint('[IgdbSteamGridService] Falha RetroAPI ($slug): $e');
       return const [];
     }
+  }
+
+  static List<EmulationGame> _parseRetroApiPayloadSync({
+    required List<dynamic> data,
+    required String slug,
+    required String platformLabel,
+    required String platformDisplay,
+    required String defaultDeveloper,
+    required int minValidBytes,
+  }) {
+    final Map<String, ({int score, bool preferred, EmulationGame item})>
+        bestByKey = {};
+    final parenRegex = RegExp(r'\s*\([^)]*\)');
+    final isArcadeSlug = slug == 'neogeo' ||
+        slug == 'cps1' ||
+        slug == 'cps2' ||
+        slug == 'mame' ||
+        slug == 'arcade';
+
+    for (final group in data) {
+      if (group is! List) continue;
+      for (final raw in group) {
+        if (raw is! Map) continue;
+        final rawName = (raw['name'] as String?)?.trim() ?? '';
+        if (rawName.isEmpty) continue;
+
+        final lowerName = rawName.toLowerCase();
+        if (lowerName.contains('(beta') ||
+            lowerName.contains('(proto') ||
+            lowerName.contains('(demo') ||
+            lowerName.contains('(sample') ||
+            lowerName.contains('(pirate') ||
+            lowerName.contains('(trial') ||
+            lowerName.contains('(kiosk') ||
+            lowerName.contains('(taikenban') ||
+            lowerName.contains('(preview') ||
+            lowerName.contains('[b]')) {
+          continue;
+        }
+
+        final isPreferredRegion = rawName.contains('(USA') ||
+            rawName.contains('(World') ||
+            rawName.contains('(Europe') ||
+            rawName.contains('(Euro') ||
+            !rawName.contains('(');
+
+        final cleanDisplayTitle = rawName
+            .replaceAll(parenRegex, '')
+            .replaceAll(' - ', ': ')
+            .trim();
+        if (cleanDisplayTitle.isEmpty) continue;
+
+        final dedupeKey = '${slug}_${cleanDisplayTitle.toLowerCase()}';
+        var romName = (raw['rom_name'] as String?) ?? '$rawName.rom';
+        final rawSize = _parseByteSize(raw['size']);
+        final sizeBytes = rawSize > 0 ? rawSize : 0;
+
+        final lowerRom = romName.toLowerCase();
+        final isCue = lowerRom.endsWith('.cue');
+        int score = 0;
+        if (sizeBytes >= minValidBytes && !isCue) {
+          score += 10000;
+        } else if (sizeBytes > 0 && !isCue) {
+          score += 2000;
+        }
+
+        if (isArcadeSlug) {
+          final resolvedFbneo = RomDownloadService.resolveCanonicalFbneoParent(
+            lowerRom,
+            gameTitle: cleanDisplayTitle,
+          );
+          final rawStem = lowerRom.replaceAll(
+            RegExp(r'\.(zip|7z)$', caseSensitive: false),
+            '',
+          );
+          if (resolvedFbneo != null && rawStem == resolvedFbneo.parentStem) {
+            score += 50000;
+          }
+          // Prefer non-merged full romsets over tiny split clone zips
+          score += (sizeBytes ~/ 65536).clamp(0, 8000);
+          if (resolvedFbneo != null &&
+              (slug == 'cps1' || slug == 'cps2') &&
+              (lowerRom.endsWith('.zip') || lowerRom.endsWith('.7z'))) {
+            romName = '${resolvedFbneo.parentStem}.zip';
+          }
+        }
+
+        if (rawName.contains('(USA')) {
+          score += isArcadeSlug ? 350 : 500;
+        } else if (rawName.contains('(World')) {
+          score += isArcadeSlug ? 450 : 400;
+        } else if (rawName.contains('(Europe') || rawName.contains('(Euro')) {
+          score += isArcadeSlug ? 400 : 300;
+        } else if (!rawName.contains('(')) {
+          score += 200;
+        }
+        if (!isCue) score += 50;
+
+        final existing = bestByKey[dedupeKey];
+        if (existing != null && score <= existing.score) {
+          continue;
+        }
+
+        final crc = ((raw['crc'] as String?) ?? '').toUpperCase();
+        final developer = (raw['developer'] as String?) ??
+            (raw['publisher'] as String?) ??
+            defaultDeveloper;
+        final rawGenre = (raw['genre'] as String?)?.trim();
+        final genre =
+            (rawGenre != null && rawGenre.isNotEmpty) ? rawGenre : 'Retro';
+        final releaseYear = (raw['releaseyear'] as num?)?.toInt();
+        final rawDesc = (raw['description'] as String?)?.trim();
+        final region = rawName.contains('(USA')
+            ? 'USA'
+            : (rawName.contains('(Europe') || rawName.contains('(Euro'))
+                ? 'EUR'
+                : 'WORLD';
+
+        final idSeed = EmulationGame.stableIdFromKey('${slug}_$rawName');
+
+        final item = EmulationGame(
+          igdbId: idSeed,
+          name: cleanDisplayTitle,
+          canonicalNoIntroName: rawName,
+          summary: (rawDesc != null && rawDesc.length > 12)
+              ? rawDesc
+              : '$cleanDisplayTitle para $platformDisplay ($developer${releaseYear != null ? ", $releaseYear" : ""}).',
+          genres: [genre, platformLabel],
+          developer: developer,
+          releaseYear: releaseYear,
+          rating: 89,
+          platformName: platformLabel,
+          platformSlug: slug,
+          region: region,
+          crc32: crc,
+          estimatedSizeBytes: sizeBytes,
+          directRomUrl: 'retroapi://$slug/${Uri.encodeComponent(romName)}',
+        );
+
+        bestByKey[dedupeKey] = (
+          score: score,
+          preferred: isPreferredRegion,
+          item: item,
+        );
+      }
+    }
+
+    return <EmulationGame>[
+      for (final entry in bestByKey.values)
+        if (entry.preferred) entry.item,
+      for (final entry in bestByKey.values)
+        if (!entry.preferred) entry.item,
+    ];
   }
 
   ({
@@ -792,6 +888,27 @@ class IgdbSteamGridService {
     return true;
   }
 
+  static ({
+    String normTitle,
+    String baseTitle,
+    String normCanonical,
+    String metaHaystack,
+  }) _indexedSearchTerms(EmulationGame g) {
+    final key = Object.hash(g.igdbId, g.name, g.platformSlug);
+    final cached = _searchIndexCache[key];
+    if (cached != null) return cached;
+    final entry = (
+      normTitle: EmulationGame.normalizeSearchText(g.name),
+      baseTitle: _baseComparableTitle(g.name),
+      normCanonical: EmulationGame.normalizeSearchText(g.canonicalNoIntroName),
+      metaHaystack: EmulationGame.normalizeSearchText(
+        '${g.developer} ${g.platformName} ${g.fullConsoleName} ${g.genres.join(" ")}',
+      ),
+    );
+    _searchIndexCache[key] = entry;
+    return entry;
+  }
+
   static int _searchRelevanceScore(
     EmulationGame g,
     String normQuery,
@@ -801,11 +918,10 @@ class IgdbSteamGridService {
     if (normQuery.isEmpty) {
       return 1 + sourceBonus + (g.hasKnownSize ? 10 : 0);
     }
-    final normTitle = EmulationGame.normalizeSearchText(g.name);
-    final baseTitle = _baseComparableTitle(g.name);
-    final normCanonical = EmulationGame.normalizeSearchText(
-      g.canonicalNoIntroName,
-    );
+    final terms = _indexedSearchTerms(g);
+    final normTitle = terms.normTitle;
+    final baseTitle = terms.baseTitle;
+    final normCanonical = terms.normCanonical;
 
     int score = 0;
     if (normTitle == normQuery || baseTitle == normQuery) {
@@ -822,9 +938,7 @@ class IgdbSteamGridService {
             _containsAllTokens(normCanonical, queryTokens))) {
       score = 500;
     } else {
-      final metaHaystack = EmulationGame.normalizeSearchText(
-        '${g.developer} ${g.platformName} ${g.fullConsoleName} ${g.genres.join(" ")}',
-      );
+      final metaHaystack = terms.metaHaystack;
       if (metaHaystack.contains(normQuery) ||
           _containsAllTokens(metaHaystack, queryTokens)) {
         score = 250;
@@ -1690,6 +1804,32 @@ class IgdbSteamGridService {
   /// 2. Catálogo curado integrado
   /// 3. Milhares de jogos reais da RetroAPI (`retroapi.konsumer.workers.dev`)
   Future<List<EmulationGame>> fetchRealCatalog({
+    String rommServerUrl = '',
+    String rommApiToken = '',
+    CancelToken? cancelToken,
+  }) async {
+    if (_isDisposed || cancelToken?.isCancelled == true) return const [];
+    final catalogKey = '${rommServerUrl.trim()}|${rommApiToken.trim()}';
+    final existing = _inFlightRealCatalogByKey[catalogKey];
+    if (existing != null) {
+      return existing;
+    }
+    final future = _fetchRealCatalogInternal(
+      rommServerUrl: rommServerUrl,
+      rommApiToken: rommApiToken,
+      cancelToken: cancelToken,
+    );
+    _inFlightRealCatalogByKey[catalogKey] = future;
+    try {
+      return await future;
+    } finally {
+      if (identical(_inFlightRealCatalogByKey[catalogKey], future)) {
+        unawaited(_inFlightRealCatalogByKey.remove(catalogKey));
+      }
+    }
+  }
+
+  Future<List<EmulationGame>> _fetchRealCatalogInternal({
     String rommServerUrl = '',
     String rommApiToken = '',
     CancelToken? cancelToken,
