@@ -82,6 +82,38 @@ class CoverCacheService {
     return '${hash.toRadixString(16)}.img';
   }
 
+  String _gameMediaFileName(int gameId, {required bool isBanner}) =>
+      isBanner ? 'game_banner_$gameId.img' : 'game_cover_$gameId.img';
+
+  /// Retorna o arquivo de cache em disco para capa associada ao [gameId] ou [imageUrl].
+  File? getCachedCoverForGame(int gameId, [String? imageUrl]) =>
+      getCachedMediaForGame(gameId, imageUrl: imageUrl, isBanner: false);
+
+  /// Retorna o arquivo de cache em disco para banner associado ao [gameId] ou [bannerUrl].
+  File? getCachedBannerForGame(int gameId, [String? bannerUrl]) =>
+      getCachedMediaForGame(gameId, imageUrl: bannerUrl, isBanner: true);
+
+  File? getCachedMediaForGame(
+    int gameId, {
+    String? imageUrl,
+    required bool isBanner,
+  }) {
+    final byUrl = getCachedFileFast(imageUrl);
+    if (byUrl != null) return byUrl;
+    if (_cacheDir != null) {
+      final gameKey = _gameMediaFileName(gameId, isBanner: isBanner);
+      final file = File('${_cacheDir!.path}/$gameKey');
+      if (_cachedUrlKeys.contains(gameKey) ||
+          (file.existsSync() && file.lengthSync() > 100)) {
+        if (file.existsSync() && file.lengthSync() > 100) {
+          _cachedUrlKeys.add(gameKey);
+          return file;
+        }
+      }
+    }
+    return null;
+  }
+
   /// Retorna o arquivo de cache em disco se ele já existir, ou null
   File? getCachedFileFast(String? url) {
     if (url == null || url.trim().isEmpty) return null;
@@ -95,16 +127,57 @@ class CoverCacheService {
     return null;
   }
 
-  /// Baixa a capa para o disco de forma persistente
-  Future<File?> downloadAndCache(String url) async {
+  Future<void> _linkGameMediaAlias(
+    Directory dir,
+    File sourceFile,
+    int gameId, {
+    required bool isBanner,
+  }) async {
+    try {
+      final aliasKey = _gameMediaFileName(gameId, isBanner: isBanner);
+      final aliasFile = File('${dir.path}/$aliasKey');
+      if (!await aliasFile.exists() || await aliasFile.length() <= 100) {
+        await sourceFile.copy(aliasFile.path);
+      }
+      _cachedUrlKeys.add(aliasKey);
+    } catch (e) {
+      debugPrint('[CoverCacheService] Falha ao vincular mídia por gameId ($gameId): $e');
+    }
+  }
+
+  /// Baixa a capa ou banner para o disco de forma persistente (por URL e, se fornecido, por [gameId]).
+  Future<File?> downloadAndCache(
+    String url, {
+    int? gameId,
+    bool isBanner = false,
+  }) async {
     if (url.trim().isEmpty) return null;
 
     final cachedFast = getCachedFileFast(url);
-    if (cachedFast != null) return cachedFast;
+    if (cachedFast != null) {
+      if (gameId != null && _cacheDir != null) {
+        await _linkGameMediaAlias(
+          _cacheDir!,
+          cachedFast,
+          gameId,
+          isBanner: isBanner,
+        );
+      }
+      return cachedFast;
+    }
 
     final existing = _inFlightDownloads[url];
     if (existing != null) {
-      return existing.future;
+      final file = await existing.future;
+      if (file != null && gameId != null && _cacheDir != null) {
+        await _linkGameMediaAlias(
+          _cacheDir!,
+          file,
+          gameId,
+          isBanner: isBanner,
+        );
+      }
+      return file;
     }
 
     final opEpoch = _lifecycleEpoch;
@@ -124,6 +197,14 @@ class CoverCacheService {
 
       if (await targetFile.exists() && await targetFile.length() > 100) {
         _cachedUrlKeys.add(key);
+        if (gameId != null) {
+          await _linkGameMediaAlias(
+            dir,
+            targetFile,
+            gameId,
+            isBanner: isBanner,
+          );
+        }
         if (!completer.isCompleted) completer.complete(targetFile);
         return targetFile;
       }
@@ -154,6 +235,14 @@ class CoverCacheService {
           }
           await tempFile.rename(targetFile.path);
           _cachedUrlKeys.add(key);
+          if (gameId != null) {
+            await _linkGameMediaAlias(
+              dir,
+              targetFile,
+              gameId,
+              isBanner: isBanner,
+            );
+          }
           if (!completer.isCompleted) completer.complete(targetFile);
           return targetFile;
         }
@@ -180,6 +269,30 @@ class CoverCacheService {
       }
     }
     return null;
+  }
+
+  /// Garante persistência local em disco da capa e do banner de um jogo instalado,
+  /// permitindo exibição 100% offline na Biblioteca e Home.
+  Future<void> persistMediaForGame(
+    EmulationGame game, {
+    String? coverUrl,
+    String? bannerUrl,
+  }) async {
+    try {
+      await ensureCacheDirectory();
+      final effectiveCover = (coverUrl ?? game.resolvedGridCoverUrl).trim();
+      final effectiveBanner = (bannerUrl ?? game.resolvedHeroBannerUrl).trim();
+      await Future.wait([
+        if (effectiveCover.startsWith('http'))
+          downloadAndCache(effectiveCover, gameId: game.igdbId, isBanner: false),
+        if (effectiveBanner.startsWith('http'))
+          downloadAndCache(effectiveBanner, gameId: game.igdbId, isBanner: true),
+      ]);
+    } catch (e) {
+      debugPrint(
+        '[CoverCacheService] Falha ao persistir mídias offline (${game.name}): $e',
+      );
+    }
   }
 
   Future<void> _safeDeleteTemp(File? tempFile) async {

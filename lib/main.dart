@@ -17,6 +17,7 @@ import 'screens/libretro_player_screen.dart';
 import 'screens/settings_screen.dart';
 import 'services/cover_cache_service.dart';
 import 'services/emulator_service.dart';
+import 'services/game_asset_service.dart';
 import 'services/igdb_steamgriddb_service.dart';
 import 'services/library_storage_service.dart';
 import 'services/rom_download_service.dart';
@@ -24,6 +25,7 @@ import 'services/rom_platform_detector.dart';
 import 'services/settings_storage_service.dart';
 import 'theme/hydra_tokens.dart';
 import 'theme/ps5_hydra_theme.dart';
+import 'widgets/loop_common_widgets.dart';
 
 const SystemUiOverlayStyle _kLoopEdgeOverlayStyle = SystemUiOverlayStyle(
   statusBarColor: Colors.transparent,
@@ -54,7 +56,8 @@ class LoopGamerApp extends StatefulWidget {
   State<LoopGamerApp> createState() => _LoopGamerAppState();
 }
 
-class _LoopGamerAppState extends State<LoopGamerApp> {
+class _LoopGamerAppState extends State<LoopGamerApp>
+    with WidgetsBindingObserver {
   final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
   final IgdbSteamGridService _apiService = IgdbSteamGridService();
   final RomDownloadService _downloadService = RomDownloadService();
@@ -75,6 +78,7 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
   StreamSubscription<RomDownloadEvent>? _downloadEventsSub;
   StreamSubscription<bool>? _gamepadStateSub;
   StreamSubscription<Map<String, dynamic>>? _gamepadUiSub;
+  StreamSubscription<bool>? _networkStateSub;
 
   int _selectedTab = 0;
   bool _isPlayerActive = false;
@@ -94,6 +98,7 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     SystemChrome.setSystemUIOverlayStyle(_kLoopEdgeOverlayStyle);
     unawaited(
       SystemChrome.setPreferredOrientations([
@@ -124,12 +129,28 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
         _handleGlobalGamepadUiAction,
         onError: (_) {},
       );
+      _networkStateSub = _emulatorService.networkStateStream.listen(
+        (connected) {
+          if (connected && mounted) {
+            unawaited(_downloadService.onAppOrNetworkResumed());
+          }
+        },
+        onError: (_) {},
+      );
     }
     unawaited(_restoreState());
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && mounted) {
+      unawaited(_downloadService.onAppOrNetworkResumed());
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     final dlSub = _downloadEventsSub;
     if (dlSub != null) {
       unawaited(dlSub.cancel());
@@ -141,6 +162,10 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
     final gpUiSub = _gamepadUiSub;
     if (gpUiSub != null) {
       unawaited(gpUiSub.cancel());
+    }
+    final netSub = _networkStateSub;
+    if (netSub != null) {
+      unawaited(netSub.cancel());
     }
     if (widget.emulatorService == null) {
       _emulatorService.dispose();
@@ -185,6 +210,7 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
         Map<int, RomDownloadStatus>.from(_downloadStatusesNotifier.value);
 
     try {
+      await _coverCacheService.ensureCacheDirectory();
       loadedSettings = await _settingsStorage.loadSettings();
       loadedMeta = await _settingsStorage.loadUserMeta();
       final savedGames = await _libraryStorage.loadPersistedLibrary();
@@ -248,6 +274,10 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
         _settings = loadedSettings;
         _userMeta = loadedMeta;
       });
+      if (!Platform.environment.containsKey('FLUTTER_TEST')) {
+        unawaited(_persistMediaAndPrewarmInstalledGames(nextStatuses));
+        unawaited(_downloadService.onAppOrNetworkResumed());
+      }
     } catch (e) {
       debugPrint('[LoopGamerApp] Erro ao restaurar estado local: $e');
     }
@@ -256,6 +286,66 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
       rommServerUrl: loadedSettings.rommServerUrl,
       rommApiToken: loadedSettings.rommApiToken,
     );
+  }
+
+  Future<void> _persistMediaForInstalledGame(EmulationGame game) async {
+    if (Platform.environment.containsKey('FLUTTER_TEST') || !mounted) return;
+    try {
+      var updated = game;
+      var coverUrl = game.gridCoverUrl;
+      var bannerUrl = game.heroBannerUrl;
+      var logoUrl = game.logoUrl;
+      if (coverUrl == null ||
+          coverUrl.isEmpty ||
+          bannerUrl == null ||
+          bannerUrl.isEmpty) {
+        final assets = await GameAssetService.instance.fetchAssetsForGame(game);
+        if (assets.coverImageUrl != null && assets.coverImageUrl!.isNotEmpty) {
+          coverUrl = assets.coverImageUrl;
+        }
+        if (assets.backgroundImageUrl != null &&
+            assets.backgroundImageUrl!.isNotEmpty) {
+          bannerUrl = assets.backgroundImageUrl;
+        }
+        if (assets.logoImageUrl != null && assets.logoImageUrl!.isNotEmpty) {
+          logoUrl = assets.logoImageUrl;
+        }
+      }
+      updated = game.copyWith(
+        gridCoverUrl: coverUrl ?? game.resolvedGridCoverUrl,
+        heroBannerUrl: bannerUrl ?? game.resolvedHeroBannerUrl,
+        logoUrl: logoUrl,
+      );
+      _catalogById[game.igdbId] = updated;
+      await _libraryStorage.updateInstalledGameMetadata(updated);
+      await _coverCacheService.persistMediaForGame(
+        updated,
+        coverUrl: updated.resolvedGridCoverUrl,
+        bannerUrl: updated.resolvedHeroBannerUrl,
+      );
+    } catch (e) {
+      debugPrint('[LoopGamerApp] Erro ao salvar capa/banner offline: $e');
+    }
+  }
+
+  Future<void> _persistMediaAndPrewarmInstalledGames(
+    Map<int, RomDownloadStatus> statuses,
+  ) async {
+    for (final entry in statuses.entries) {
+      if (entry.value.state != RomActionState.readyToPlay ||
+          entry.value.localPath == null) {
+        continue;
+      }
+      final game = _catalogById[entry.key];
+      if (game == null) continue;
+      unawaited(_persistMediaForInstalledGame(game));
+      unawaited(
+        _emulatorService.prewarmPlatformAssets(
+          platformSlug: game.platformSlug,
+          coreSoName: game.libretroCoreSoName,
+        ),
+      );
+    }
   }
 
   Future<void> _loadRealCatalog({
@@ -380,6 +470,13 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
       _catalogById[game.igdbId] = normalizedGame;
       _refreshCatalogListCache();
       setState(() {});
+      unawaited(_persistMediaForInstalledGame(normalizedGame));
+      unawaited(
+        _emulatorService.prewarmPlatformAssets(
+          platformSlug: normalizedGame.platformSlug,
+          coreSoName: normalizedGame.libretroCoreSoName,
+        ),
+      );
     }
   }
 
@@ -650,11 +747,159 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
     String? pickedPath;
     var usedDirectAndroidPicker = false;
     var keepPickedPathForCopy = false;
+    var pickedIsDirectory = false;
 
     try {
       String? rawFileName;
 
-      if (Platform.isAndroid) {
+      // Pergunta se o usuário deseja importar um arquivo (.iso/.zip/.7z/etc.)
+      // ou uma pasta de dump de jogo (como PS3_GAME/USRDIR/EBOOT.BIN).
+      if (!navContext.mounted) return;
+      final pickKind = await showDialog<String?>(
+        context: navContext,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: HydraTokens.bgNearBlack,
+          shape: HydraTokens.dialogShape,
+          title: const Text(
+            'Importar Jogo ou Dump',
+            style: TextStyle(
+              fontFamily: 'ReadexPro',
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+              color: HydraTokens.textPrimary,
+            ),
+          ),
+          content: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 440),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  'Escolha entre selecionar um arquivo (.iso, .zip, .7z, .chd, .pkg, EBOOT.BIN...) ou a pasta do jogo (PS3_GAME/USRDIR/EBOOT.BIN).',
+                  style: TextStyle(
+                    fontFamily: 'Rubik',
+                    fontSize: 12.5,
+                    height: 1.4,
+                    color: HydraTokens.textSecondary,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: HydraTokens.surfaceElevated1,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: HydraTokens.borderSubtle10),
+                  ),
+                  child: const Text(
+                    'Dica para PS3: aceita pasta (PS3_GAME/USRDIR/EBOOT.BIN), ISO já descriptografada e .zip ou .7z. Para gerar esse dump a partir dos seus discos, use o próprio PS3 com CFW ou HEN e ferramentas como ManaGunZ, multiMAN ou IRISMAN — elas já criam ISO descriptografada ou pasta prontas para o RPCS3.',
+                    style: TextStyle(
+                      fontFamily: 'Rubik',
+                      fontSize: 11.5,
+                      height: 1.38,
+                      color: HydraTokens.textSecondary,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: HydraTokens.primaryAurora,
+                    foregroundColor: HydraTokens.bgPureBlack,
+                    minimumSize: const Size(48, 46),
+                  ),
+                  onPressed: () => Navigator.of(ctx).pop('file'),
+                  icon: PhosphorIcon(
+                    PhosphorIcons.fileArchive(PhosphorIconsStyle.bold),
+                    size: 16,
+                  ),
+                  label: const Text(
+                    'Selecionar Arquivo (.iso, .zip, .7z...)',
+                    style: TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: HydraTokens.textPrimary,
+                    side: const BorderSide(color: HydraTokens.borderSubtle10),
+                    minimumSize: const Size(48, 46),
+                  ),
+                  onPressed: () => Navigator.of(ctx).pop('folder'),
+                  icon: PhosphorIcon(
+                    PhosphorIcons.folderOpen(PhosphorIconsStyle.bold),
+                    size: 16,
+                  ),
+                  label: const Text(
+                    'Selecionar Pasta do Jogo (PS3_GAME)',
+                    style: TextStyle(
+                      fontFamily: 'ReadexPro',
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(null),
+              child: const Text('Cancelar'),
+            ),
+          ],
+        ),
+      );
+
+      if (pickKind == null || !mounted || !navContext.mounted) {
+        return;
+      }
+
+      if (pickKind == 'folder') {
+        if (Platform.isAndroid) {
+          var hasAccess = await EmulatorService.hasDirectStorageAccess();
+          if (!hasAccess && navContext.mounted) {
+            final askPermission = await showDialog<bool>(
+                  context: navContext,
+                  builder: (ctx) => AlertDialog(
+                    backgroundColor: HydraTokens.bgNearBlack,
+                    shape: HydraTokens.dialogShape,
+                    title: const Text('Acesso às pastas do armazenamento'),
+                    content: const Text(
+                      'Conceda permissão para abrir pastas PS3_GAME/USRDIR diretamente sem copiar gigabytes no aparelho.',
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.of(ctx).pop(false),
+                        child: const Text('Cancelar'),
+                      ),
+                      FilledButton(
+                        onPressed: () => Navigator.of(ctx).pop(true),
+                        child: const Text('Permitir acesso'),
+                      ),
+                    ],
+                  ),
+                ) ??
+                false;
+            if (!askPermission) return;
+            hasAccess = await EmulatorService.requestDirectStorageAccess();
+          }
+          if (!hasAccess) return;
+        }
+
+        final dirPath = await EmulatorService.pickExternalRomDirectory();
+        if (dirPath == null || dirPath.trim().isEmpty || !mounted || !navContext.mounted) {
+          return;
+        }
+        pickedPath = dirPath.trim();
+        pickedIsDirectory = true;
+        usedDirectAndroidPicker = true;
+        keepPickedPathForCopy = true;
+        rawFileName = pickedPath.split(RegExp(r'[/\\]')).where((s) => s.isNotEmpty).last;
+      } else if (Platform.isAndroid) {
         var hasAccess = await EmulatorService.hasDirectStorageAccess();
         if (!hasAccess && navContext.mounted) {
           final askPermission = await showDialog<bool>(
@@ -751,8 +996,9 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
       rawFileName = rawFileName.trim();
       final resolvedFileName = rawFileName;
       final dotIdx = resolvedFileName.lastIndexOf('.');
-      final rawStem =
-          dotIdx > 0 ? resolvedFileName.substring(0, dotIdx) : resolvedFileName;
+      final rawStem = !pickedIsDirectory && dotIdx > 0
+          ? resolvedFileName.substring(0, dotIdx)
+          : resolvedFileName;
       final defaultTitle = rawStem
           .replaceAll('_', ' ')
           .replaceAll(RegExp(r'\s+'), ' ')
@@ -762,7 +1008,7 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
         filePath: pickedPath,
       );
       debugPrint(
-        '[Import] arquivo="$resolvedFileName" path=$pickedPath '
+        '[Import] origem="$resolvedFileName" dir=$pickedIsDirectory path=$pickedPath '
         'detectado=${detection?.slug ?? "null"} '
         'fonte=${detection?.sourceLabel ?? "-"}',
       );
@@ -774,7 +1020,7 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
       String? selectedSlug = detection != null &&
               selectableSlugs.contains(detection.slug)
           ? detection.slug
-          : null;
+          : (pickedIsDirectory ? 'ps3' : null);
 
       String platformLabel(String? slug) => kRommPlatforms
           .firstWhere((p) => p.slug == slug, orElse: () => kRommPlatforms.first)
@@ -790,17 +1036,19 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
               builder: (ctx) => StatefulBuilder(
                 builder: (ctx, setDialogState) {
                   final lowerExt = resolvedFileName.toLowerCase();
-                  final isConsoleZip = lowerExt.endsWith('.zip') &&
+                  final isConsoleArchive = !pickedIsDirectory &&
+                      (lowerExt.endsWith('.zip') || lowerExt.endsWith('.7z')) &&
                       !const {'arcade', 'neogeo', 'fbneo', 'cps1', 'cps2', 'cps3'}
                           .contains(selectedSlug);
-                  final isArchiveWarning =
-                      lowerExt.endsWith('.7z') || lowerExt.endsWith('.rar');
+                  final isUnsupportedRar =
+                      !pickedIsDirectory && lowerExt.endsWith('.rar');
                   final slug = selectedSlug;
                   final platformCompatible = slug != null &&
-                      RomDownloadService.isImportExtensionCompatible(
-                        slug,
-                        resolvedFileName,
-                      );
+                      (pickedIsDirectory ||
+                          RomDownloadService.isImportExtensionCompatible(
+                            slug,
+                            resolvedFileName,
+                          ));
                   return AlertDialog(
                     backgroundColor: HydraTokens.bgNearBlack,
                     shape: HydraTokens.dialogShape,
@@ -832,24 +1080,47 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                             ),
                             const SizedBox(height: 6),
                             Text(
-                              isArchiveWarning
-                                  ? 'Arquivo compactado (.7z/.rar): descompacte antes para rodar .iso/.chd direto.'
-                                  : isConsoleZip
-                                      ? 'Será extraído para a Biblioteca sem duplicar o .zip original.'
-                                      : 'Execução direta sem cópia (arquivo original mantido em $pickedPath).',
+                              isUnsupportedRar
+                                  ? 'Arquivo .rar: converta ou descompacte para .zip, .7z, ISO ou pasta antes.'
+                                  : isConsoleArchive
+                                      ? 'Será extraído em 2º plano (Isolate) com barra de progresso e validação de conteúdo.'
+                                      : 'Execução direta sem cópia (arquivo/pasta original mantido em $pickedPath).',
                               maxLines: 3,
                               overflow: TextOverflow.ellipsis,
                               style: TextStyle(
                                 fontFamily: 'Rubik',
                                 fontSize: 11.5,
-                                color: isArchiveWarning
+                                color: isUnsupportedRar
                                     ? const Color(0xFFFFB74D)
                                     : HydraTokens.textSecondary,
                               ),
                             ),
+                            if (selectedSlug == 'ps3') ...[
+                              const SizedBox(height: 8),
+                              Container(
+                                padding: const EdgeInsets.all(8),
+                                decoration: BoxDecoration(
+                                  color: HydraTokens.surfaceElevated1,
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(
+                                    color: HydraTokens.borderSubtle10,
+                                  ),
+                                ),
+                                child: const Text(
+                                  'Dumps PS3 válidos: pasta PS3_GAME/USRDIR/EBOOT.BIN, ISO descriptografada ou .zip/.7z contendo esse dump. Use PS3 com CFW/HEN (ManaGunZ, multiMAN ou IRISMAN).',
+                                  style: TextStyle(
+                                    fontFamily: 'Rubik',
+                                    fontSize: 11,
+                                    height: 1.35,
+                                    color: HydraTokens.textSecondary,
+                                  ),
+                                ),
+                              ),
+                            ],
                             if (selectedSlug == null) ...[
+                              const SizedBox(height: 6),
                               const Text(
-                                'Plataforma não reconhecida. Escolha o console correto deste arquivo — o emulador é selecionado pela plataforma.',
+                                'Plataforma não reconhecida. Escolha o console correto — o emulador é selecionado pela plataforma.',
                                 style: TextStyle(
                                   fontFamily: 'Rubik',
                                   fontSize: 11.5,
@@ -857,9 +1128,9 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                                   color: Color(0xFFFFB74D),
                                 ),
                               ),
-                              const SizedBox(height: 6),
                             ] else if (detection != null &&
                                 detection.slug == selectedSlug) ...[
+                              const SizedBox(height: 6),
                               Text(
                                 'Plataforma detectada (${detection.sourceLabel}): ${platformLabel(selectedSlug)}.',
                                 style: const TextStyle(
@@ -869,7 +1140,6 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                                   color: HydraTokens.textSecondary,
                                 ),
                               ),
-                              const SizedBox(height: 6),
                             ],
                             const SizedBox(height: 12),
                             TextField(
@@ -955,7 +1225,7 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                           backgroundColor: HydraTokens.primaryAurora,
                           foregroundColor: HydraTokens.bgPureBlack,
                         ),
-                        onPressed: platformCompatible
+                        onPressed: platformCompatible && !isUnsupportedRar
                             ? () => Navigator.of(ctx).pop(slug)
                             : null,
                         child: const Text(
@@ -981,27 +1251,79 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
           while (_catalogById.containsKey(importId)) {
             importId++;
           }
-          if (navContext.mounted) {
-            final lowerExt = resolvedFileName.toLowerCase();
-            final isConsoleZip = lowerExt.endsWith('.zip') &&
-                !const {'arcade', 'neogeo', 'fbneo', 'cps1', 'cps2', 'cps3'}
-                    .contains(chosenSlug);
-            ScaffoldMessenger.of(navContext).showSnackBar(
-              SnackBar(
-                content: Text(
-                  isConsoleZip
-                      ? 'Extraindo .zip para a Biblioteca...'
-                      : 'Vinculando ISO/ROM para execução direta (sem copiar)...',
-                ),
-                duration: const Duration(seconds: 2),
+          final lowerExt = resolvedFileName.toLowerCase();
+          final needsProgressModal = (!pickedIsDirectory &&
+                  (lowerExt.endsWith('.zip') || lowerExt.endsWith('.7z')) &&
+                  !const {'arcade', 'neogeo', 'fbneo', 'cps1', 'cps2', 'cps3'}
+                      .contains(chosenSlug)) ||
+              chosenSlug == 'ps3';
+
+          final progressNotifier = ValueNotifier<({double p, String msg})>(
+            (p: 0.0, msg: 'Preparando importação...'),
+          );
+          var progressDialogShown = false;
+          BuildContext? dialogCtx;
+          if (needsProgressModal && navContext.mounted) {
+            progressDialogShown = true;
+            unawaited(
+              showDialog<void>(
+                context: navContext,
+                barrierDismissible: false,
+                builder: (dCtx) {
+                  dialogCtx = dCtx;
+                  return PopScope(
+                    canPop: false,
+                    child: AlertDialog(
+                      backgroundColor: HydraTokens.bgNearBlack,
+                      shape: HydraTokens.dialogShape,
+                      title: Text(
+                        chosenSlug == 'ps3'
+                            ? 'Processando Dump de PS3'
+                            : 'Extraindo Pacote',
+                        style: const TextStyle(
+                          fontFamily: 'ReadexPro',
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                          color: HydraTokens.textPrimary,
+                        ),
+                      ),
+                      content: SizedBox(
+                        width: 340,
+                        child: ValueListenableBuilder<({double p, String msg})>(
+                          valueListenable: progressNotifier,
+                          builder: (_, state, __) => LoopProgressIndicator(
+                            progress: state.p,
+                            label: state.msg,
+                            minHeight: 7,
+                          ),
+                        ),
+                      ),
+                    ),
+                  );
+                },
               ),
             );
           }
-          final imported = await _downloadService.importExternalRomFile(
-            igdbId: importId,
-            sourcePath: pickedPath,
-            platformSlug: chosenSlug,
-          );
+
+          ({String localPath, int totalBytes})? imported;
+          try {
+            imported = await _downloadService.importExternalRomFile(
+              igdbId: importId,
+              sourcePath: pickedPath,
+              platformSlug: chosenSlug,
+              onProgress: (p, label) {
+                progressNotifier.value = (p: p, msg: label);
+              },
+            );
+          } finally {
+            progressNotifier.dispose();
+            if (progressDialogShown && dialogCtx != null && dialogCtx!.mounted) {
+              Navigator.of(dialogCtx!).pop();
+            } else if (progressDialogShown && navContext.mounted) {
+              unawaited(Navigator.of(navContext, rootNavigator: true).maybePop());
+            }
+          }
+
           debugPrint(
             '[Import] id=$importId slug=$chosenSlug '
             'origem=$pickedPath -> ${imported?.localPath ?? "FALHOU"}',
@@ -1058,8 +1380,37 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
       }
     } catch (e) {
       if (navContext.mounted) {
-        ScaffoldMessenger.of(navContext).showSnackBar(
-          SnackBar(content: Text('Falha ao vincular ISO/ROM: $e')),
+        final msg = e is StateError ? e.message : 'Falha ao vincular ISO/ROM: $e';
+        await showDialog<void>(
+          context: navContext,
+          builder: (ctx) => AlertDialog(
+            backgroundColor: HydraTokens.bgNearBlack,
+            shape: HydraTokens.dialogShape,
+            title: const Text(
+              'Falha na Importação',
+              style: TextStyle(
+                fontFamily: 'ReadexPro',
+                fontSize: 15.5,
+                fontWeight: FontWeight.w700,
+                color: Color(0xFFF87171),
+              ),
+            ),
+            content: Text(
+              msg,
+              style: const TextStyle(
+                fontFamily: 'Rubik',
+                fontSize: 12.5,
+                height: 1.4,
+                color: HydraTokens.textPrimary,
+              ),
+            ),
+            actions: [
+              FilledButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text('Entendi'),
+              ),
+            ],
+          ),
         );
       }
     } finally {
@@ -1242,6 +1593,8 @@ class _LoopGamerAppState extends State<LoopGamerApp> {
                     hardwareGamepadListenable: _hardwareGamepadNotifier,
                     onSelectTab: (index) =>
                         setState(() => _selectedTab = index),
+                    onNetworkRestored: () =>
+                        unawaited(_downloadService.onAppOrNetworkResumed()),
                   ),
                 ),
               ],
@@ -1305,7 +1658,9 @@ class _LiveTopBarClockState extends State<_LiveTopBarClock> {
 
 /// Indicador real de Wi-Fi na barra superior (sem estado estático falso).
 class _LiveTopBarWifi extends StatefulWidget {
-  const _LiveTopBarWifi();
+  const _LiveTopBarWifi({this.onNetworkRestored});
+
+  final VoidCallback? onNetworkRestored;
 
   @override
   State<_LiveTopBarWifi> createState() => _LiveTopBarWifiState();
@@ -1337,11 +1692,15 @@ class _LiveTopBarWifiState extends State<_LiveTopBarWifi>
   Future<void> _refreshNetwork() async {
     final status = await EmulatorService.fetchNetworkStatus();
     if (!mounted) return;
+    final restored = !_connected && status.connected;
     if (status.connected != _connected || status.wifi != _wifi) {
       setState(() {
         _connected = status.connected;
         _wifi = status.wifi;
       });
+    }
+    if (restored) {
+      widget.onNetworkRestored?.call();
     }
   }
 
@@ -1441,6 +1800,7 @@ class _GameHubLandscapeTopBar extends StatelessWidget {
     required this.hasActiveDownloadListenable,
     required this.hardwareGamepadListenable,
     required this.onSelectTab,
+    this.onNetworkRestored,
   });
 
   final int currentIndex;
@@ -1448,6 +1808,7 @@ class _GameHubLandscapeTopBar extends StatelessWidget {
   final ValueListenable<bool> hasActiveDownloadListenable;
   final ValueListenable<bool> hardwareGamepadListenable;
   final ValueChanged<int> onSelectTab;
+  final VoidCallback? onNetworkRestored;
 
   @override
   Widget build(BuildContext context) {
@@ -1727,7 +2088,7 @@ class _GameHubLandscapeTopBar extends StatelessWidget {
                           margin: const EdgeInsets.symmetric(horizontal: 6),
                           color: Colors.white.withOpacity(0.18),
                         ),
-                        const _LiveTopBarWifi(),
+                        _LiveTopBarWifi(onNetworkRestored: onNetworkRestored),
                         const SizedBox(width: 6),
                         const _LiveTopBarClock(),
                         const SizedBox(width: 6),
