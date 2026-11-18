@@ -448,8 +448,11 @@ class EmulationGame {
     if (p == 'dreamcast') {
       return 'Sega - Dreamcast';
     }
-    if (p == 'neogeo' || p == 'cps1' || p == 'cps2') {
+    if (p == 'neogeo') {
       return 'SNK - Neo Geo';
+    }
+    if (p == 'cps1' || p == 'cps2') {
+      return 'FBNeo - Arcade Games';
     }
     if (p == 'mame' || p == 'arcade') {
       return 'MAME';

@@ -235,7 +235,253 @@ class IgdbSteamGridService {
     }
   }
 
-  Future<List<EmulationGame>> _loadAndParseRetroApiPlatform({
+  static bool _isTrackSecondaryOrBadDump(String rawName, String lowerRom) {
+    if (lowerRom.endsWith('.cue')) return true;
+    final trackMatch = RegExp(
+      r'\(track\s*0*(\d+)\)',
+      caseSensitive: false,
+    ).firstMatch(rawName);
+    if (trackMatch != null) {
+      final trackNum = int.tryParse(trackMatch.group(1) ?? '') ?? 1;
+      if (trackNum > 1) return true;
+    }
+    return false;
+  }
+
+  Future<List<EmulationGame>> _fetchArchiveCollectionGames({
+    required String slug,
+    required String platformLabel,
+    required String defaultDeveloper,
+    CancelToken? cancelToken,
+  }) async {
+    if (Platform.environment.containsKey('FLUTTER_TEST') && !_hasCustomDio) {
+      return const [];
+    }
+    final collections = RomDownloadService.collectionsForPlatform(slug);
+    if (collections.isEmpty) return const [];
+
+    final minValidBytes = RomDownloadService.minBytesForPlatform(slug);
+    final allowedExts = RomDownloadService.allowedExtensionsForPlatform(slug);
+    final results = <EmulationGame>[];
+
+    for (final collection in collections.take(2)) {
+      if (_isDisposed || cancelToken?.isCancelled == true) break;
+      try {
+        final res = await _dio
+            .get<dynamic>(
+              'https://archive.org/metadata/$collection',
+              cancelToken: cancelToken,
+              options: Options(receiveTimeout: const Duration(seconds: 15)),
+            )
+            .timeout(const Duration(seconds: 12));
+        if (!_isSuccessStatus(res.statusCode) ||
+            res.data is! Map<String, dynamic>) {
+          continue;
+        }
+        final data = res.data as Map<String, dynamic>;
+        if (data['metadata']?['access-restricted-item'] == 'true') {
+          continue;
+        }
+        final rawFiles = data['files'] as List<dynamic>? ?? const [];
+        if (rawFiles.isEmpty) continue;
+
+        final parsed = await _runParseArchiveCollectionInIsolate(
+          rawFiles: rawFiles,
+          collection: collection,
+          slug: slug,
+          platformLabel: platformLabel,
+          defaultDeveloper: defaultDeveloper,
+          minValidBytes: minValidBytes,
+          allowedExts: allowedExts,
+        );
+        results.addAll(parsed);
+        if (results.length >= 220) break;
+      } on DioException catch (e) {
+        if (e.type == DioExceptionType.cancel) rethrow;
+      } catch (e) {
+        debugPrint(
+          '[IgdbSteamGridService] Archive collection skip ($collection): $e',
+        );
+      }
+    }
+    return results;
+  }
+
+  static List<EmulationGame> _parseArchiveCollectionSync({
+    required List<dynamic> rawFiles,
+    required String collection,
+    required String slug,
+    required String platformLabel,
+    required String defaultDeveloper,
+    required int minValidBytes,
+    required List<String> allowedExts,
+  }) {
+    final isArcade = slug == 'cps1' ||
+        slug == 'cps2' ||
+        slug == 'neogeo' ||
+        slug == 'mame' ||
+        slug == 'arcade';
+    final parenRegex = RegExp(r'\s*\([^)]*\)|\s*\[[^\]]*\]');
+    final Map<String, ({int score, EmulationGame item})> bestByKey = {};
+
+    for (final f in rawFiles) {
+      if (f is! Map) continue;
+      if (f['private'] == true || f['private'] == 'true') continue;
+      final name = (f['name'] as String?)?.trim() ?? '';
+      if (name.isEmpty) continue;
+      final lower = name.toLowerCase();
+      if (lower.endsWith('.xml') ||
+          lower.endsWith('.sqlite') ||
+          lower.endsWith('.torrent') ||
+          lower.endsWith('.jpg') ||
+          lower.endsWith('.png') ||
+          lower.endsWith('.txt') ||
+          lower.endsWith('.cue')) {
+        continue;
+      }
+      final baseFile = name.split('/').last;
+      final lowerBase = baseFile.toLowerCase();
+      if (RomDownloadService.isJunkArchiveEntry(lowerBase) ||
+          RomDownloadService.isNonFullGameRelease(lowerBase)) {
+        continue;
+      }
+      if (_isTrackSecondaryOrBadDump(baseFile, lowerBase)) continue;
+      if (!allowedExts.any(lowerBase.endsWith) &&
+          !lowerBase.endsWith('.zip') &&
+          !lowerBase.endsWith('.7z')) {
+        continue;
+      }
+
+      final sizeBytes = _parseByteSize(f['size']);
+      if (sizeBytes <= 0 || (!isArcade && sizeBytes < minValidBytes)) {
+        continue;
+      }
+
+      final rawStem = baseFile.replaceAll(RegExp(r'\.[^.]+$'), '');
+      String cleanTitle = rawStem
+          .replaceAll(parenRegex, '')
+          .replaceAll('_', ' ')
+          .replaceAll(' - ', ': ')
+          .trim();
+      if (cleanTitle.isEmpty) continue;
+
+      var resolvedSlug = slug;
+      var resolvedLabel = platformLabel;
+      if (isArcade) {
+        final fbneo = RomDownloadService.resolveCanonicalFbneoParent(lowerBase);
+        if (slug == 'cps1' || slug == 'cps2') {
+          if (fbneo == null) continue;
+          if (!lower.contains('/cps1/') &&
+              !lower.contains('/cps2/') &&
+              fbneo.platformSlug != slug &&
+              !(slug == 'cps1' && fbneo.platformSlug == 'cps2')) {
+            continue;
+          }
+          resolvedSlug = slug;
+        }
+        // Pula arquivos BIOS dentro de coleções arcade
+        if (rawStem.toLowerCase() == 'qsound' ||
+            rawStem.toLowerCase() == 'qsound_hle' ||
+            rawStem.toLowerCase() == 'neogeo') {
+          continue;
+        }
+        if (cleanTitle.length <= 12 && !cleanTitle.contains(' ')) {
+          // Mantém identificador legível se não houver título expandido
+          cleanTitle = rawStem.toUpperCase();
+        }
+      }
+
+      final encodedPath =
+          name.split('/').map(Uri.encodeComponent).join('/');
+      final directUrl = 'https://archive.org/download/$collection/$encodedPath';
+      final crc = ((f['crc32'] as String?) ?? '').trim().toUpperCase();
+      final region = lowerBase.contains('(usa') || lowerBase.contains('(us)')
+          ? 'USA'
+          : (lowerBase.contains('(euro') || lowerBase.contains('(eu)')
+              ? 'EUR'
+              : 'WORLD');
+
+      int score = isArcade ? 1000 : 0;
+      if (region == 'USA') score += 500;
+      if (region == 'WORLD') score += 400;
+      if (lowerBase.endsWith('.rvz') ||
+          lowerBase.endsWith('.chd') ||
+          lowerBase.endsWith('.wbfs')) {
+        score += 300;
+      } else if (lowerBase.endsWith('.iso')) {
+        score += 200;
+      }
+
+      final dedupeKey = '$resolvedSlug|${cleanTitle.toLowerCase()}';
+      final existing = bestByKey[dedupeKey];
+      if (existing != null && score <= existing.score) continue;
+
+      bestByKey[dedupeKey] = (
+        score: score,
+        item: EmulationGame(
+          igdbId: EmulationGame.stableIdFromKey('${resolvedSlug}_$collection|$name'),
+          name: cleanTitle,
+          canonicalNoIntroName: rawStem,
+          summary:
+              '$cleanTitle ($resolvedLabel) — arquivo verificado no Internet Archive.',
+          genres: ['Retro', resolvedLabel],
+          developer: defaultDeveloper,
+          releaseYear: null,
+          rating: 88,
+          platformName: resolvedLabel,
+          platformSlug: resolvedSlug,
+          region: region,
+          crc32: crc.length == 8 ? crc : '',
+          estimatedSizeBytes: sizeBytes,
+          directRomUrl: directUrl,
+        ),
+      );
+    }
+
+    return bestByKey.values.map((e) => e.item).toList(growable: false);
+  }
+
+  static Future<List<EmulationGame>> _runParseArchiveCollectionInIsolate({
+    required List<dynamic> rawFiles,
+    required String collection,
+    required String slug,
+    required String platformLabel,
+    required String defaultDeveloper,
+    required int minValidBytes,
+    required List<String> allowedExts,
+  }) =>
+      Isolate.run(
+        () => _parseArchiveCollectionSync(
+          rawFiles: rawFiles,
+          collection: collection,
+          slug: slug,
+          platformLabel: platformLabel,
+          defaultDeveloper: defaultDeveloper,
+          minValidBytes: minValidBytes,
+          allowedExts: allowedExts,
+        ),
+      );
+
+  static Future<List<EmulationGame>> _runParseRetroApiInIsolate({
+    required List<dynamic> data,
+    required String slug,
+    required String platformLabel,
+    required String platformDisplay,
+    required String defaultDeveloper,
+    required int minValidBytes,
+  }) =>
+      Isolate.run(
+        () => _parseRetroApiPayloadSync(
+          data: data,
+          slug: slug,
+          platformLabel: platformLabel,
+          platformDisplay: platformDisplay,
+          defaultDeveloper: defaultDeveloper,
+          minValidBytes: minValidBytes,
+        ),
+      );
+
+  Future<List<EmulationGame>> _fetchRetroOnly({
     required String slug,
     required ({
       String url,
@@ -243,6 +489,7 @@ class IgdbSteamGridService {
       String platformDisplay,
       String defaultDeveloper,
     }) querySpec,
+    required int minValidBytes,
     CancelToken? cancelToken,
   }) async {
     try {
@@ -258,21 +505,14 @@ class IgdbSteamGridService {
       }
       final data = res.data;
       if (data is! List) return const [];
-
-      final minValidBytes = RomDownloadService.minBytesForPlatform(slug);
-      final parsed = await Isolate.run(
-        () => _parseRetroApiPayloadSync(
-          data: data,
-          slug: slug,
-          platformLabel: querySpec.platformLabel,
-          platformDisplay: querySpec.platformDisplay,
-          defaultDeveloper: querySpec.defaultDeveloper,
-          minValidBytes: minValidBytes,
-        ),
+      return await _runParseRetroApiInIsolate(
+        data: data,
+        slug: slug,
+        platformLabel: querySpec.platformLabel,
+        platformDisplay: querySpec.platformDisplay,
+        defaultDeveloper: querySpec.defaultDeveloper,
+        minValidBytes: minValidBytes,
       );
-
-      _retroApiCache[slug] = parsed;
-      return parsed;
     } on DioException catch (e) {
       if (e.type == DioExceptionType.cancel) rethrow;
       debugPrint(
@@ -281,6 +521,93 @@ class IgdbSteamGridService {
       return const [];
     } catch (e) {
       debugPrint('[IgdbSteamGridService] Falha RetroAPI ($slug): $e');
+      return const [];
+    }
+  }
+
+  Future<List<EmulationGame>> _loadAndParseRetroApiPlatform({
+    required String slug,
+    required ({
+      String url,
+      String platformLabel,
+      String platformDisplay,
+      String defaultDeveloper,
+    }) querySpec,
+    CancelToken? cancelToken,
+  }) async {
+    try {
+      final minValidBytes = RomDownloadService.minBytesForPlatform(slug);
+
+      final batches = await Future.wait([
+        _fetchRetroOnly(
+          slug: slug,
+          querySpec: querySpec,
+          minValidBytes: minValidBytes,
+          cancelToken: cancelToken,
+        ),
+        _fetchArchiveCollectionGames(
+          slug: slug,
+          platformLabel: querySpec.platformLabel,
+          defaultDeveloper: querySpec.defaultDeveloper,
+          cancelToken: cancelToken,
+        ),
+      ]);
+
+      final retroGames = batches[0];
+      final archiveGames = batches[1];
+
+      final archiveByNorm = <String, EmulationGame>{};
+      final archiveByStem = <String, EmulationGame>{};
+      for (final g in archiveGames) {
+        final norm = EmulationGame.normalizeSearchText(g.name);
+        if (norm.isNotEmpty) archiveByNorm[norm] = g;
+        final stem = g.canonicalNoIntroName.toLowerCase();
+        if (stem.isNotEmpty) archiveByStem[stem] = g;
+      }
+
+      final merged = <EmulationGame>[];
+      final seenNorm = <String>{};
+
+      for (final g in retroGames) {
+        final norm = EmulationGame.normalizeSearchText(g.name);
+        final stem = g.canonicalNoIntroName
+            .replaceAll(RegExp(r'\.(zip|7z)$', caseSensitive: false), '')
+            .toLowerCase();
+        final archiveMatch = archiveByNorm[norm] ?? archiveByStem[stem];
+        if (archiveMatch != null) {
+          merged.add(
+            g.copyWith(
+              estimatedSizeBytes: archiveMatch.estimatedSizeBytes,
+              directRomUrl: archiveMatch.directRomUrl,
+              crc32: g.crc32.isNotEmpty ? g.crc32 : archiveMatch.crc32,
+            ),
+          );
+          seenNorm.add(norm);
+        } else {
+          // Se já temos acervo Archive real com tamanhos válidos para a plataforma,
+          // evita poluir com entradas RetroAPI sem tamanho nem mirror confiável.
+          if (archiveGames.length >= 15 && !g.hasKnownSize) {
+            continue;
+          }
+          merged.add(g);
+          seenNorm.add(norm);
+        }
+      }
+
+      for (final g in archiveGames) {
+        final norm = EmulationGame.normalizeSearchText(g.name);
+        if (seenNorm.add(norm)) {
+          merged.add(g);
+        }
+      }
+
+      _retroApiCache[slug] = merged;
+      return merged;
+    } on DioException catch (e) {
+      if (e.type == DioExceptionType.cancel) rethrow;
+      return const [];
+    } catch (e) {
+      debugPrint('[IgdbSteamGridService] Falha catálogo ($slug): $e');
       return const [];
     }
   }
@@ -319,7 +646,11 @@ class IgdbSteamGridService {
             lowerName.contains('(kiosk') ||
             lowerName.contains('(taikenban') ||
             lowerName.contains('(preview') ||
-            lowerName.contains('[b]')) {
+            lowerName.contains('[b]') ||
+            lowerName.contains('[h') ||
+            lowerName.contains('[o') ||
+            lowerName.contains('[f') ||
+            lowerName.contains('[t')) {
           continue;
         }
 
@@ -338,14 +669,23 @@ class IgdbSteamGridService {
         final dedupeKey = '${slug}_${cleanDisplayTitle.toLowerCase()}';
         var romName = (raw['rom_name'] as String?) ?? '$rawName.rom';
         final rawSize = _parseByteSize(raw['size']);
-        final sizeBytes = rawSize > 0 ? rawSize : 0;
+        var sizeBytes = rawSize > 0 ? rawSize : 0;
 
         final lowerRom = romName.toLowerCase();
-        final isCue = lowerRom.endsWith('.cue');
+        if (_isTrackSecondaryOrBadDump(rawName, lowerRom)) {
+          continue;
+        }
+        if (!isArcadeSlug && sizeBytes > 0 && sizeBytes < minValidBytes) {
+          continue;
+        }
+        if (isArcadeSlug && sizeBytes > 0 && sizeBytes < 32 * 1024) {
+          continue;
+        }
+
         int score = 0;
-        if (sizeBytes >= minValidBytes && !isCue) {
+        if (sizeBytes >= minValidBytes) {
           score += 10000;
-        } else if (sizeBytes > 0 && !isCue) {
+        } else if (sizeBytes > 0) {
           score += 2000;
         }
 
@@ -366,6 +706,10 @@ class IgdbSteamGridService {
           if (resolvedFbneo != null &&
               (slug == 'cps1' || slug == 'cps2') &&
               (lowerRom.endsWith('.zip') || lowerRom.endsWith('.7z'))) {
+            if (rawStem != resolvedFbneo.parentStem) {
+              // Clone ZIPs listam apenas arquivos delta (poucos KB), nao o tamanho do parent
+              sizeBytes = 0;
+            }
             romName = '${resolvedFbneo.parentStem}.zip';
           }
         }
@@ -379,7 +723,7 @@ class IgdbSteamGridService {
         } else if (!rawName.contains('(')) {
           score += 200;
         }
-        if (!isCue) score += 50;
+        score += 50;
 
         final existing = bestByKey[dedupeKey];
         if (existing != null && score <= existing.score) {
@@ -481,7 +825,7 @@ class IgdbSteamGridService {
       case 'nds':
         return (
           url:
-              'https://retroapi.konsumer.workers.dev/api/nds/developer/Nintendo,Capcom,Konami,Sega,Atlus,Square%20Enix,HAL%20Laboratory',
+              'https://retroapi.konsumer.workers.dev/api/nds/releaseyear/2005,2006,2007,2008,2009,2010',
           platformLabel: 'NDS',
           platformDisplay: 'Nintendo DS',
           defaultDeveloper: 'Nintendo',
@@ -556,7 +900,7 @@ class IgdbSteamGridService {
       case 'dreamcast':
         return (
           url:
-              'https://retroapi.konsumer.workers.dev/api/dreamcast/developer/Sonic%20Team,Capcom,Namco,SEGA,Treasure,SNK',
+              'https://retroapi.konsumer.workers.dev/api/dreamcast/releaseyear/1999,2000,2001',
           platformLabel: 'DREAMCAST',
           platformDisplay: 'Sega Dreamcast',
           defaultDeveloper: 'Sega',
@@ -604,7 +948,7 @@ class IgdbSteamGridService {
       case 'saturn':
         return (
           url:
-              'https://retroapi.konsumer.workers.dev/api/saturn/genre/Action,Adventure,RPG,Fighting,Racing,Platform,Shooter',
+              'https://retroapi.konsumer.workers.dev/api/saturn/releaseyear/1995,1996,1997,1998',
           platformLabel: 'SATURN',
           platformDisplay: 'Sega Saturn',
           defaultDeveloper: 'Sega / Third-Party',
@@ -3513,5 +3857,90 @@ const List<EmulationGame> kVerifiedRealGamesCatalog = [
     region: 'USA',
     estimatedSizeBytes: 524288,
     directRomUrl: 'retroapi://mastersystem/Phantasy_Star.sms',
+  ),
+  EmulationGame(
+    igdbId: 670802711,
+    name: 'Resident Evil 4: Wii Edition',
+    canonicalNoIntroName: 'Resident Evil 4 - Wii Edition (USA)',
+    summary:
+        'Aclamada edição definitiva de Resident Evil 4 para Nintendo Wii com todos os extras e mira por movimento.',
+    genres: ['Survival Horror', 'Ação'],
+    developer: 'Capcom',
+    releaseYear: 2007,
+    rating: 94,
+    platformName: 'WII',
+    platformSlug: 'wii',
+    region: 'USA',
+    estimatedSizeBytes: 3519304180,
+    directRomUrl:
+        'https://archive.org/download/resident-evil-4-wii-edition-usa_202602/Resident%20Evil%204%20-%20Wii%20Edition%20%28USA%29.rvz',
+  ),
+  EmulationGame(
+    igdbId: 1153328141,
+    name: 'Street Fighter IV',
+    canonicalNoIntroName: 'Street Fighter IV (USA)',
+    summary:
+        'O renascimento clássico da série Street Fighter em 2.5D para PlayStation 3.',
+    genres: ['Luta', 'Arcade'],
+    developer: 'Capcom / Dimps',
+    releaseYear: 2009,
+    rating: 92,
+    platformName: 'PS3',
+    platformSlug: 'ps3',
+    region: 'USA',
+    estimatedSizeBytes: 10441003619,
+    directRomUrl:
+        'https://archive.org/download/street-fighter-iv-ps3-games/Street%20Fighter%20IV%20%28USA%2C%20Asia%29%20%28En%2CJa%2CFr%2CDe%2CEs%2CIt%2CKo%29.7z',
+  ),
+  EmulationGame(
+    igdbId: 1153328142,
+    name: 'Super Street Fighter IV: 3D Edition',
+    canonicalNoIntroName: 'Super Street Fighter IV - 3D Edition (USA)',
+    summary:
+        'Versão portátil completa para Nintendo 3DS com 35 lutadores e golpes em 60 FPS.',
+    genres: ['Luta', 'Arcade'],
+    developer: 'Capcom / Dimps',
+    releaseYear: 2011,
+    rating: 89,
+    platformName: '3DS',
+    platformSlug: '3ds',
+    region: 'USA',
+    estimatedSizeBytes: 1770424497,
+    directRomUrl:
+        'https://archive.org/download/20260424-140852/3DS0037%20-%20Super%20Street%20Fighter%20IV%203D%20Edition%20%28U%29.zip',
+  ),
+  EmulationGame(
+    igdbId: 99201,
+    name: 'Celeste Classic',
+    canonicalNoIntroName: 'Celeste Classic (World) (Homebrew)',
+    summary:
+        'Port homebrew completo de Celeste Classic para Game Boy Advance feito por JeffRuLz.',
+    genres: ['Plataforma', 'Indie'],
+    developer: 'JeffRuLz / Maddy Makes Games',
+    releaseYear: 2021,
+    rating: 93,
+    platformName: 'GBA',
+    platformSlug: 'gba',
+    region: 'WORLD',
+    estimatedSizeBytes: 5418424,
+    directRomUrl:
+        'https://github.com/JeffRuLz/Celeste-Classic-GBA/releases/download/v1.2/Celeste.Classic.v1.2.Homebrew.gba',
+  ),
+  EmulationGame(
+    igdbId: 99202,
+    name: 'Cave Story (Doukutsu Monogatari)',
+    canonicalNoIntroName: 'Cave Story (PT-BR) (Mega Drive)',
+    summary:
+        'Obra-prima indie metroidvania portada nativamente para Sega Mega Drive em Português.',
+    genres: ['Metroidvania', 'Indie', 'Plataforma'],
+    developer: 'Studio Pixel / andwn',
+    releaseYear: 2022,
+    rating: 95,
+    platformName: 'MEGA DRIVE',
+    platformSlug: 'md',
+    region: 'WORLD',
+    estimatedSizeBytes: 4194304,
+    directRomUrl:
+        'https://github.com/andwn/cave-story-md/releases/download/v0.8.8/doukutsu-br.gen',
   ),
 ];

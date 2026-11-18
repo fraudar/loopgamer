@@ -16,6 +16,7 @@ import 'screens/library_screen.dart';
 import 'screens/libretro_player_screen.dart';
 import 'screens/settings_screen.dart';
 import 'services/cover_cache_service.dart';
+import 'services/diagnostic_log_service.dart';
 import 'services/emulator_service.dart';
 import 'services/game_asset_service.dart';
 import 'services/igdb_steamgriddb_service.dart';
@@ -38,6 +39,7 @@ const SystemUiOverlayStyle _kLoopEdgeOverlayStyle = SystemUiOverlayStyle(
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  DiagnosticLogService.instance.installGlobalHooks();
   SystemChrome.setSystemUIOverlayStyle(_kLoopEdgeOverlayStyle);
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
@@ -286,6 +288,65 @@ class _LoopGamerAppState extends State<LoopGamerApp>
       rommServerUrl: loadedSettings.rommServerUrl,
       rommApiToken: loadedSettings.rommApiToken,
     );
+    if (!Platform.environment.containsKey('FLUTTER_TEST') && mounted) {
+      unawaited(_recoverPendingLocalArchives());
+    }
+  }
+
+  Future<void> _recoverPendingLocalArchives() async {
+    if (!mounted) return;
+    try {
+      final result = await _downloadService.recoverOrCleanUnextractedArchives(
+        catalogById: _catalogById,
+      );
+      if (!mounted) return;
+      var changed = false;
+      final nextStatuses =
+          Map<int, RomDownloadStatus>.from(_downloadStatusesNotifier.value);
+
+      for (final badId in result.cleanedInvalidIds) {
+        final existing = _catalogById[badId];
+        if (existing != null && existing.localRomPath != null) {
+          _catalogById[badId] = existing.copyWith(localRomPath: null);
+          nextStatuses.remove(badId);
+          await _libraryStorage.removeGameFromLibrary(badId);
+          changed = true;
+        }
+      }
+
+      for (final item in result.recovered) {
+        var game = item.game;
+        if (game == null) continue;
+        game = game.copyWith(
+          localRomPath: item.localPath,
+          estimatedSizeBytes:
+              item.sizeBytes > 0 ? item.sizeBytes : game.estimatedSizeBytes,
+        );
+        _catalogById[game.igdbId] = game;
+        await _libraryStorage.saveGameToLibrary(
+          game,
+          item.localPath,
+        );
+        nextStatuses[game.igdbId] = RomDownloadStatus(
+          state: RomActionState.readyToPlay,
+          progress: 1.0,
+          localPath: item.localPath,
+          downloadedBytes: item.sizeBytes,
+          totalBytes: item.sizeBytes,
+        );
+        unawaited(_persistMediaForInstalledGame(game));
+        changed = true;
+      }
+
+      if (changed && mounted) {
+        _refreshCatalogListCache();
+        _downloadStatusesNotifier.value = Map.unmodifiable(nextStatuses);
+        _syncSummaryNotifiers(_downloadStatusesNotifier.value);
+        setState(() {});
+      }
+    } catch (e) {
+      debugPrint('[LoopGamerApp] Erro ao recuperar pacotes locais: $e');
+    }
   }
 
   Future<void> _persistMediaForInstalledGame(EmulationGame game) async {
