@@ -1723,8 +1723,8 @@ const char* get_core_variable(const char* key) {
     return "disabled";
   if (k == "ppsspp_texture_filtering") return "Auto";
 
-  // 5. Frameskip dinâmico (AutoFrameSkip não reduz FPS quando GPU está livre)
-  if (k == "ppsspp_auto_frameskip") return "enabled";
+  // 5. Frameskip: desativado por padrão para preservar a velocidade nativa (60 FPS reais)
+  if (k == "ppsspp_auto_frameskip") return "disabled";
   if (k == "ppsspp_frameskip") return "disabled";
   if (k == "ppsspp_frameskiptype") return "Number of frames";
 
@@ -1744,7 +1744,7 @@ const char* get_core_variable(const char* key) {
   if (k == "ppsspp_software_skinning") return "enabled";
   if (k == "ppsspp_lazy_texture_caching") return "enabled";
   if (k == "ppsspp_retain_changed_textures") return "enabled";
-  if (k == "ppsspp_sound_speedhack") return "enabled";
+  if (k == "ppsspp_sound_speedhack") return "disabled";
   if (k == "ppsspp_spline_quality") return "low";
   if (k == "ppsspp_force_max_fps") return "disabled";
   if (k == "ppsspp_separate_sas_thread") return "enabled";

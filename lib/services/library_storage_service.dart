@@ -130,6 +130,14 @@ class LibraryStorageService {
       }
       current = parent;
     }
+    // Pasta de dump de PS3 externa (`.../PS3_GAME/USRDIR/EBOOT.BIN`)
+    final normalized = romFile.path.replaceAll('\\', '/').toLowerCase();
+    if (normalized.endsWith('/ps3_game/usrdir/eboot.bin')) {
+      return romFile.parent.parent.parent;
+    }
+    if (normalized.endsWith('/usrdir/eboot.bin')) {
+      return romFile.parent.parent;
+    }
     return null;
   }
 
@@ -138,7 +146,9 @@ class LibraryStorageService {
       return true;
     }
     final normalized = localPath.replaceAll('\\', '/').toLowerCase();
-    return normalized.contains('/game_') || normalized.contains('/arcade_');
+    return normalized.contains('/game_') ||
+        normalized.contains('/arcade_') ||
+        normalized.endsWith('/usrdir/eboot.bin');
   }
 
   static Future<String> _uniqueFileKey(File file) async {
@@ -266,14 +276,17 @@ class LibraryStorageService {
     int fallbackBytes = 0,
   }) async {
     final safeFallback = fallbackBytes > 0 ? fallbackBytes : 0;
+    final isDir = await FileSystemEntity.isDirectory(localRomPath);
     final romFile = File(localRomPath);
-    if (!await romFile.exists()) {
+    if (!isDir && !await romFile.exists()) {
       return safeFallback;
     }
 
     int measuredBytes = 0;
     try {
-      final dedicatedFolder = _findDedicatedGameFolder(romFile);
+      final dedicatedFolder = isDir
+          ? Directory(localRomPath)
+          : _findDedicatedGameFolder(romFile);
       if (dedicatedFolder != null && await dedicatedFolder.exists()) {
         final mainBase = _basename(localRomPath).toLowerCase();
         final entities = await dedicatedFolder
@@ -283,7 +296,9 @@ class LibraryStorageService {
         final hasOtherFiles = regularFiles.any(
           (f) {
             final base = _basename(f.path).toLowerCase();
-            return base != 'neogeo.zip' && !base.endsWith('.part');
+            return base != 'neogeo.zip' &&
+                base != 'qsound.zip' &&
+                !base.endsWith('.part');
           },
         );
         final seenKeys = <String>{};
@@ -292,8 +307,8 @@ class LibraryStorageService {
           if (base.endsWith('.part') && !mainBase.endsWith('.part')) {
             continue;
           }
-          if (base == 'neogeo.zip' &&
-              mainBase != 'neogeo.zip' &&
+          if ((base == 'neogeo.zip' || base == 'qsound.zip') &&
+              mainBase != base &&
               hasOtherFiles) {
             continue;
           }
@@ -424,7 +439,8 @@ class LibraryStorageService {
             ? rawGenres.map((e) => e.toString()).toList()
             : const <String>[];
 
-        if (!await File(localPath).exists()) {
+        if (!await File(localPath).exists() &&
+            !await Directory(localPath).exists()) {
           continue;
         }
 
@@ -532,6 +548,32 @@ class LibraryStorageService {
         ),
       ];
 
+      await _writeManifestUnlocked(updated);
+    });
+  }
+
+  /// Atualiza metadados (como capas, banners e logotipos) de um jogo já salvo no manifesto.
+  Future<void> updateInstalledGameMetadata(EmulationGame game) {
+    return _synchronized(() async {
+      final existing =
+          await _loadPersistedLibraryUnlocked(persistRepairs: false);
+      final idx = existing.indexWhere((g) => g.igdbId == game.igdbId);
+      if (idx < 0) return;
+      final current = existing[idx];
+      final merged = current.copyWith(
+        gridCoverUrl: game.gridCoverUrl ?? current.gridCoverUrl,
+        heroBannerUrl: game.heroBannerUrl ?? current.heroBannerUrl,
+        logoUrl: game.logoUrl ?? current.logoUrl,
+        localRomPath: game.localRomPath ?? current.localRomPath,
+      );
+      if (merged.gridCoverUrl == current.gridCoverUrl &&
+          merged.heroBannerUrl == current.heroBannerUrl &&
+          merged.logoUrl == current.logoUrl &&
+          merged.localRomPath == current.localRomPath) {
+        return;
+      }
+      final updated = List<EmulationGame>.from(existing);
+      updated[idx] = merged;
       await _writeManifestUnlocked(updated);
     });
   }

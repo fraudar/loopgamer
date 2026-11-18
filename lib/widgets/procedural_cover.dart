@@ -1,11 +1,12 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
+import '../services/cover_cache_service.dart';
 import '../services/game_asset_service.dart';
 import '../theme/ps5_hydra_theme.dart';
 
-/// Capa 3:4 via [CachedNetworkImage] (cache apenas em memória da sessão)
-/// com fallback escuro (`obsidianGlass` -> `#000000`) e iniciais do jogo.
+/// Capa/Banner via cache persistente em disco ([CoverCacheService]) para jogos
+/// baixados e [CachedNetworkImage] com fallback escuro (`obsidianGlass` -> `#000000`).
 class ProceduralCover extends StatelessWidget {
   const ProceduralCover({
     super.key,
@@ -13,6 +14,8 @@ class ProceduralCover extends StatelessWidget {
     required this.platformName,
     this.accentColor = PS5HydraTheme.auroraSpringMint,
     this.imageUrl,
+    this.gameId,
+    this.isBanner = false,
     this.borderRadius = 12.0,
     this.showBottomLabel = true,
     this.compact = false,
@@ -25,6 +28,8 @@ class ProceduralCover extends StatelessWidget {
   final String platformName;
   final Color accentColor;
   final String? imageUrl;
+  final int? gameId;
+  final bool isBanner;
   final double borderRadius;
   final bool showBottomLabel;
   final bool compact;
@@ -69,8 +74,24 @@ class ProceduralCover extends StatelessWidget {
     );
 
     final trimmedUrl = imageUrl?.trim();
+    final diskFile = gameId != null
+        ? CoverCacheService.instance.getCachedMediaForGame(
+            gameId!,
+            imageUrl: trimmedUrl,
+            isBanner: isBanner,
+          )
+        : CoverCacheService.instance.getCachedFileFast(trimmedUrl);
+
     final Widget child;
-    if (trimmedUrl != null &&
+    if (diskFile != null) {
+      child = Image.file(
+        diskFile,
+        fit: fit,
+        cacheWidth: memCacheWidth,
+        cacheHeight: memCacheHeight,
+        errorBuilder: (_, __, ___) => fallback,
+      );
+    } else if (trimmedUrl != null &&
         trimmedUrl.isNotEmpty &&
         trimmedUrl.startsWith('http')) {
       child = CachedNetworkImage(

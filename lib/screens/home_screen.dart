@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:ui';
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -364,26 +363,15 @@ class _HomeScreenState extends State<HomeScreen> {
                 key: ValueKey<String>(
                   activeBannerUrl ?? activeGame.resolvedHeroBannerUrl,
                 ),
-                child: activeBannerUrl != null && activeBannerUrl.isNotEmpty
-                    ? CachedNetworkImage(
-                        imageUrl: activeBannerUrl,
-                        cacheManager: SessionMemoryCacheManager.instance,
-                        fit: BoxFit.cover,
-                        errorWidget: (_, __, ___) => ProceduralCover(
-                          title: activeGame.name,
-                          platformName: activeGame.platformName,
-                          imageUrl: activeGame.resolvedHeroBannerUrl,
-                          borderRadius: 0,
-                          showBottomLabel: false,
-                        ),
-                      )
-                    : ProceduralCover(
-                        title: activeGame.name,
-                        platformName: activeGame.platformName,
-                        imageUrl: activeGame.resolvedHeroBannerUrl,
-                        borderRadius: 0,
-                        showBottomLabel: false,
-                      ),
+                child: ProceduralCover(
+                  title: activeGame.name,
+                  platformName: activeGame.platformName,
+                  gameId: activeGame.igdbId,
+                  isBanner: true,
+                  imageUrl: activeBannerUrl ?? activeGame.resolvedHeroBannerUrl,
+                  borderRadius: 0,
+                  showBottomLabel: false,
+                ),
               ),
             ),
 
@@ -688,6 +676,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           cover: ProceduralCover(
                             title: game.name,
                             platformName: game.platformName,
+                            gameId: game.igdbId,
                             imageUrl: cachedCover ??
                                 game.gridCoverUrl ??
                                 game.resolvedGridCoverUrl,
@@ -1139,6 +1128,7 @@ class _HomeFavoriteCardState extends State<_HomeFavoriteCard> {
                       ProceduralCover(
                         title: widget.game.name,
                         platformName: widget.game.platformName,
+                        gameId: widget.game.igdbId,
                         imageUrl: resolvedCover,
                         borderRadius: 0,
                         compact: true,
@@ -1313,6 +1303,8 @@ class _GameHubLandscapeHeroCardState extends State<_GameHubLandscapeHeroCard> {
                   ProceduralCover(
                     title: widget.game.name,
                     platformName: widget.game.platformName,
+                    gameId: widget.game.igdbId,
+                    isBanner: true,
                     imageUrl:
                         widget.bannerUrl ?? widget.game.resolvedHeroBannerUrl,
                     borderRadius: 0,
@@ -1532,6 +1524,7 @@ class _GameHubLandscapeSecondaryCardState
                       ProceduralCover(
                         title: widget.game.name,
                         platformName: widget.game.platformName,
+                        gameId: widget.game.igdbId,
                         imageUrl: widget.coverUrl ??
                             widget.game.gridCoverUrl ??
                             widget.game.resolvedGridCoverUrl,
@@ -1721,6 +1714,7 @@ class _RommCoverGridCardState extends State<RommCoverGridCard> {
                     ProceduralCover(
                       title: game.name,
                       platformName: game.platformName,
+                      gameId: game.igdbId,
                       imageUrl: cachedCover ??
                           game.gridCoverUrl ??
                           game.resolvedGridCoverUrl,

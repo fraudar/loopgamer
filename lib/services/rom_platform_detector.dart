@@ -83,14 +83,24 @@ class RomPlatformDetector {
     caseSensitive: false,
   );
 
+  static final RegExp _ps3SerialPattern = RegExp(
+    r'\b(BLUS|BLES|BCUS|BCES|BLJM|BLJS|BCJS|BLAS|BCAS|NPUB|NPEB|NPJB|NPUA|NPEA)[\s._-]*([0-9]{4,})',
+    caseSensitive: false,
+  );
+
+  static final RegExp _pspSerialPattern = RegExp(
+    r'\b(ULUS|ULES|UCUS|UCES|ULJM|ULJS|NPUG|NPEG|NPUH)[\s._-]*([0-9]{4,})',
+    caseSensitive: false,
+  );
+
   static final RegExp _serialDigitsPattern = RegExp(r'\D');
 
   static final RegExp _bootAssignPattern = RegExp(r'BOOT\s*=');
 
-  /// Detecta a plataforma de um arquivo ROM/ISO.
+  /// Detecta a plataforma de um arquivo ROM/ISO ou pasta de dump.
   ///
-  /// [fileNameOrPath] pode ser só o nome; [filePath] é o arquivo real (usado
-  /// para ler conteúdo e tamanho). Retorna `null` quando nenhuma pista é
+  /// [fileNameOrPath] pode ser só o nome; [filePath] é o arquivo/diretório real
+  /// (usado para ler conteúdo e tamanho). Retorna `null` quando nenhuma pista é
   /// confiável — nesse caso o diálogo de importação exige que o usuário
   /// escolha o console manualmente.
   static Future<RomDetection?> detect(
@@ -100,10 +110,20 @@ class RomPlatformDetector {
     final lower = fileNameOrPath.trim().toLowerCase();
     final ext = _extensionOf(lower);
 
-    if (filePath != null && _sniffableExtensions.contains(ext)) {
-      final slug = await sniffContent(filePath);
-      if (slug != null) {
-        return RomDetection(slug: slug, source: RomDetectionSource.content);
+    if (filePath != null) {
+      if (await FileSystemEntity.isDirectory(filePath)) {
+        final slug = await sniffContent(filePath);
+        if (slug != null) {
+          return RomDetection(slug: slug, source: RomDetectionSource.content);
+        }
+      } else if (_sniffableExtensions.contains(ext) ||
+          ext == '.sfb' ||
+          ext == '.sfo' ||
+          ext == '.pkg') {
+        final slug = await sniffContent(filePath);
+        if (slug != null) {
+          return RomDetection(slug: slug, source: RomDetectionSource.content);
+        }
       }
     }
 
@@ -166,7 +186,9 @@ class RomPlatformDetector {
     if (lower.endsWith('.cso') || lower.endsWith('.pbp')) {
       return 'psp';
     }
-    if (lower.endsWith('.pkg')) {
+    if (lower.endsWith('.pkg') ||
+        lower.endsWith('.sfb') ||
+        lower.endsWith('.sfo')) {
       return 'ps3';
     }
     if (lower.endsWith('.nds')) return 'nds';
@@ -198,22 +220,32 @@ class RomPlatformDetector {
   /// (SLUS-20159). Também reconhece tokens como `(PS2)`, `PSX`, `Wii` e
   /// pastas como `/PS2/` no caminho.
   static String? fromFileName(String fileNameOrPath) {
-    final lower = fileNameOrPath.trim().toLowerCase();
-    final serial = _slugFromSerial(lower);
+    final normalized = fileNameOrPath.trim().replaceAll('\\', '/').toLowerCase();
+    if (normalized.contains('ps3_game/usrdir/eboot.bin') ||
+        normalized.endsWith('/ps3_game') ||
+        normalized.contains('/ps3_game/') ||
+        normalized.endsWith('/usrdir/eboot.bin') ||
+        normalized.endsWith('/ps3_disc.sfb') ||
+        normalized == 'ps3_disc.sfb') {
+      return 'ps3';
+    }
+    final serial = _slugFromSerial(normalized);
     if (serial != null) return serial;
-    if (RegExp(r'playstation\s*3|\bps3\b').hasMatch(lower)) return 'ps3';
-    if (RegExp(r'playstation\s*2|\bps2\b').hasMatch(lower)) return 'ps2';
-    if (RegExp(r'playstation\s*(portable|pocket)|\bpsp\b').hasMatch(lower)) {
+    if (RegExp(r'playstation\s*3|\bps3\b').hasMatch(normalized)) return 'ps3';
+    if (RegExp(r'playstation\s*2|\bps2\b').hasMatch(normalized)) return 'ps2';
+    if (RegExp(r'playstation\s*(portable|pocket)|\bpsp\b')
+        .hasMatch(normalized)) {
       return 'psp';
     }
-    if (RegExp(r'playstation(\s*(1|one))?|\bpsx\b|\bps1\b').hasMatch(lower)) {
+    if (RegExp(r'playstation(\s*(1|one))?|\bpsx\b|\bps1\b')
+        .hasMatch(normalized)) {
       return 'ps1';
     }
-    if (RegExp(r'\bwii\b').hasMatch(lower)) return 'wii';
-    if (lower.contains('gamecube')) return 'gamecube';
-    if (lower.contains('dreamcast')) return 'dreamcast';
-    if (RegExp(r'\bsaturn\b').hasMatch(lower)) return 'saturn';
-    if (RegExp(r'\b3ds\b').hasMatch(lower)) return '3ds';
+    if (RegExp(r'\bwii\b').hasMatch(normalized)) return 'wii';
+    if (normalized.contains('gamecube')) return 'gamecube';
+    if (normalized.contains('dreamcast')) return 'dreamcast';
+    if (RegExp(r'\bsaturn\b').hasMatch(normalized)) return 'saturn';
+    if (RegExp(r'\b3ds\b').hasMatch(normalized)) return '3ds';
     return null;
   }
 
@@ -230,16 +262,21 @@ class RomPlatformDetector {
     return null;
   }
 
-  /// Lê os primeiros bytes do arquivo e procura marcadores de disco.
+  /// Lê os primeiros bytes do arquivo (ou inspeciona diretório `PS3_GAME`) e
+  /// procura marcadores de disco.
   ///
   /// Para `.cue`, segue o `FILE` apontado e inspeciona o `.bin` irmão.
   /// Retorna `null` quando o formato é opaco ou nenhum marcador aparece.
   static Future<String?> sniffContent(String filePath) async {
     if (filePath.trim().isEmpty) return null;
-    final lower = filePath.toLowerCase();
-    if (_opaqueExtensions.contains(_extensionOf(lower))) return null;
-
     try {
+      if (await FileSystemEntity.isDirectory(filePath)) {
+        return await _sniffPs3Directory(Directory(filePath));
+      }
+
+      final lower = filePath.toLowerCase();
+      if (_opaqueExtensions.contains(_extensionOf(lower))) return null;
+
       var targetPath = filePath;
       if (lower.endsWith('.cue')) {
         final target = await _cueTargetFile(filePath);
@@ -248,6 +285,8 @@ class RomPlatformDetector {
       }
       final file = File(targetPath);
       if (!await file.exists()) return null;
+
+      final normalized = targetPath.replaceAll('\\', '/').toLowerCase();
       final raf = await file.open();
       late final Uint8List bytes;
       try {
@@ -255,10 +294,62 @@ class RomPlatformDetector {
       } finally {
         await raf.close();
       }
+
+      // EBOOT.BIN de PS3 dentro de USRDIR / PS3_GAME
+      if (normalized.endsWith('/eboot.bin') &&
+          (normalized.contains('/ps3_game/usrdir/') ||
+              normalized.contains('/usrdir/'))) {
+        if (bytes.length >= 4 &&
+            ((bytes[0] == 0x53 &&
+                    bytes[1] == 0x43 &&
+                    bytes[2] == 0x45 &&
+                    bytes[3] == 0x00) ||
+                (bytes[0] == 0x7F &&
+                    bytes[1] == 0x45 &&
+                    bytes[2] == 0x4C &&
+                    bytes[3] == 0x46))) {
+          return 'ps3';
+        }
+      }
+
+      // PKG de PS3 (\x7FPKG)
+      if (bytes.length >= 4 &&
+          bytes[0] == 0x7F &&
+          bytes[1] == 0x50 &&
+          bytes[2] == 0x4B &&
+          bytes[3] == 0x47) {
+        return 'ps3';
+      }
+
+      // PARAM.SFO (\0PSF)
+      if (bytes.length >= 4 &&
+          bytes[0] == 0x00 &&
+          bytes[1] == 0x50 &&
+          bytes[2] == 0x53 &&
+          bytes[3] == 0x46) {
+        final text = String.fromCharCodes(bytes);
+        if (text.contains('PS3') || _ps3SerialPattern.hasMatch(text)) {
+          return 'ps3';
+        }
+      }
+
       return _slugFromDiscBytes(bytes);
     } catch (_) {
       return null;
     }
+  }
+
+  static Future<String?> _sniffPs3Directory(Directory dir) async {
+    if (!await dir.exists()) return null;
+    final directCandidates = [
+      File('${dir.path}/PS3_GAME/USRDIR/EBOOT.BIN'),
+      File('${dir.path}/USRDIR/EBOOT.BIN'),
+      File('${dir.path}/PS3_DISC.SFB'),
+    ];
+    for (final c in directCandidates) {
+      if (await c.exists()) return 'ps3';
+    }
+    return null;
   }
 
   /// Resolve o primeiro `FILE` de um `.cue` para o binário irmão ao lado.
@@ -286,7 +377,9 @@ class RomPlatformDetector {
     final deep = String.fromCharCodes(bytes);
 
     if (deep.contains('PSP_GAME')) return 'psp';
-    if (deep.contains('PS3_DISC.SFB')) return 'ps3';
+    if (deep.contains('PS3_DISC.SFB') || deep.contains('PS3_GAME')) {
+      return 'ps3';
+    }
     // SYSTEM.CNF do PS2 usa `BOOT2 =` (o PS1 usa `BOOT =`).
     if (deep.contains('BOOT2')) return 'ps2';
 
@@ -311,6 +404,8 @@ class RomPlatformDetector {
   }
 
   static String? _slugFromSerial(String text) {
+    if (_ps3SerialPattern.hasMatch(text)) return 'ps3';
+    if (_pspSerialPattern.hasMatch(text)) return 'psp';
     final match = _serialPattern.firstMatch(text);
     if (match == null) return null;
     final digits =

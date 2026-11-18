@@ -511,11 +511,12 @@ class AppSettings {
         'ppsspp_depth_raster': lensFlare ? 'low' : 'off',
         'ppsspp_frame_duplication':
             frameDuplication ? 'enabled' : 'disabled',
-        'ppsspp_auto_frameskip':
-            (frameSkip > 0 || performanceBoost) ? 'enabled' : 'disabled',
-        'ppsspp_frameskip': frameSkip > 0
-            ? '$frameSkip'
-            : (performanceBoost && !frameDuplication ? '1' : 'disabled'),
+        'ppsspp_auto_frameskip': frameSkip > 0 ? 'enabled' : 'disabled',
+        'ppsspp_frameskip': frameSkip <= 0 ? 'disabled' : '$frameSkip',
+        'ppsspp_frameskiptype': 'Number of frames',
+        'ppsspp_force_max_fps': 'disabled',
+        'ppsspp_sound_speedhack': 'disabled',
+        'ppsspp_locked_cpu_speed': 'disabled',
         'ppsspp_inflight_frames': 'Up to 2',
         'ppsspp_cpu_core': 'JIT',
         'ppsspp_fast_memory': 'enabled',

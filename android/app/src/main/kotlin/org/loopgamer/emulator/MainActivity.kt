@@ -14,7 +14,9 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -82,6 +84,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         private const val REQ_READ_EXTERNAL_STORAGE = 4106
         private const val REQ_MANAGE_ALL_FILES = 4107
         private const val REQ_PICK_EXTERNAL_ROM = 4108
+        private const val REQ_PICK_EXTERNAL_ROM_DIR = 9412
         private const val GAMEPAD_ACTIVE_THROTTLE_MS = 400L
         private const val UI_MOTION_REPEAT_MS = 180L
         private const val SELECT_HOLD_FAST_FORWARD_MS = 320L
@@ -154,11 +157,64 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private var methodChannel: MethodChannel? = null
     private var eventChannel: EventChannel? = null
     private var inputManager: InputManager? = null
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallbackRegistered: Boolean = false
     private val lastGamepadActiveEmitMs = AtomicLong(-GAMEPAD_ACTIVE_THROTTLE_MS)
     @Volatile private var lastReportedGamepadConnected: Boolean? = null
     private var notificationPermissionRequestedThisSession: Boolean = false
     private var pendingStoragePermissionResult: MethodChannel.Result? = null
     private var pendingPickRomResult: MethodChannel.Result? = null
+    private var pendingPickRomDirResult: MethodChannel.Result? = null
+
+    private fun currentNetworkStatusMap(): Map<String, Any> {
+        val cm = connectivityManager
+            ?: (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
+        val caps = cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+        val hasWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        val hasTransport = hasWifi ||
+            caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true ||
+            caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true
+        val hasInternet = hasTransport &&
+            (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true ||
+                hasWifi)
+        return mapOf(
+            "connected" to hasInternet,
+            "wifi" to hasWifi
+        )
+    }
+
+    private fun emitNetworkStatusEvent() {
+        val status = currentNetworkStatusMap()
+        mainHandler.post {
+            try {
+                eventSink?.success(
+                    mapOf(
+                        "event" to "networkStatusChanged",
+                        "connected" to (status["connected"] ?: false),
+                        "wifi" to (status["wifi"] ?: false)
+                    )
+                )
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            emitNetworkStatusEvent()
+        }
+
+        override fun onCapabilitiesChanged(
+            network: Network,
+            networkCapabilities: NetworkCapabilities
+        ) {
+            emitNetworkStatusEvent()
+        }
+
+        override fun onLost(network: Network) {
+            emitNetworkStatusEvent()
+        }
+    }
 
     private var currentUiDirection: String? = null
     private var uiLeftTriggerPressed: Boolean = false
@@ -219,6 +275,20 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         applyEdgeToEdgeAndCutout()
         inputManager = getSystemService(Context.INPUT_SERVICE) as? InputManager
         inputManager?.registerInputDeviceListener(inputDeviceListener, mainHandler)
+        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        try {
+            val cm = connectivityManager
+            if (cm != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    cm.registerDefaultNetworkCallback(networkCallback)
+                } else {
+                    cm.registerNetworkCallback(NetworkRequest.Builder().build(), networkCallback)
+                }
+                networkCallbackRegistered = true
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Falha ao registrar NetworkCallback: ${t.message}")
+        }
     }
 
     private fun applyEdgeToEdgeAndCutout(touchDecorView: Boolean = true) {
@@ -685,21 +755,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             }
 
             "getNetworkStatus" -> {
-                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                val caps = cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) }
-                val hasWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
-                val hasTransport = hasWifi ||
-                    caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true ||
-                    caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true
-                val hasInternet = hasTransport &&
-                    (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true ||
-                        hasWifi)
-                result.success(
-                    mapOf(
-                        "connected" to hasInternet,
-                        "wifi" to hasWifi
-                    )
-                )
+                result.success(currentNetworkStatusMap())
             }
 
             "hasDirectStorageAccess" -> {
@@ -712,6 +768,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
             "pickExternalRomFile" -> {
                 launchExternalRomPicker(result)
+            }
+
+            "pickExternalRomDirectory" -> {
+                launchExternalRomDirectoryPicker(result)
             }
 
             else -> result.notImplemented()
@@ -1479,13 +1539,17 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 } catch (_: Throwable) {
                 }
 
-                val baseTargetFps = nativeGetTargetFps().takeIf { it > 10.0 } ?: 60.0
+                var baseTargetFps = nativeGetTargetFps().takeIf { it in 10.0..240.0 } ?: 60.0
                 val pcmBuffer = ShortArray(4096)
                 var frames = 0
                 var lastFpsTimestamp = System.nanoTime()
                 var nextFrameDeadline = System.nanoTime()
 
                 while (isRunning.get()) {
+                    val liveFps = nativeGetTargetFps()
+                    if (liveFps in 10.0..240.0) {
+                        baseTargetFps = liveFps
+                    }
                     val currentFf = fastForwardMultiplier
                     val effectiveTargetFps = (baseTargetFps * currentFf).coerceIn(10.0, 480.0)
                     val targetFrameNs = (1_000_000_000.0 / effectiveTargetFps).toLong().coerceAtLeast(300_000L)
@@ -1558,11 +1622,24 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     }
 
                     nextFrameDeadline += targetFrameNs
-                    val remainingNs = nextFrameDeadline - System.nanoTime()
-                    if (remainingNs > 800_000L) {
-                        LockSupport.parkNanos(remainingNs - 300_000L)
-                    } else if (remainingNs <= 0L) {
-                        nextFrameDeadline = System.nanoTime()
+                    var paceNow = System.nanoTime()
+                    val remainingNs = nextFrameDeadline - paceNow
+                    if (remainingNs > 0L) {
+                        if (remainingNs > 1_200_000L) {
+                            LockSupport.parkNanos(remainingNs - 600_000L)
+                        }
+                        while (isRunning.get() && !isPaused.get()) {
+                            paceNow = System.nanoTime()
+                            val left = nextFrameDeadline - paceNow
+                            if (left <= 0L) break
+                            if (left > 150_000L) {
+                                LockSupport.parkNanos(100_000L)
+                            } else {
+                                Thread.yield()
+                            }
+                        }
+                    } else if (remainingNs < -targetFrameNs * 2) {
+                        nextFrameDeadline = paceNow
                     }
                 }
             } finally {
@@ -1691,6 +1768,14 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         cancelHardwareSelectFastForward()
         inputManager?.unregisterInputDeviceListener(inputDeviceListener)
         inputManager = null
+        if (networkCallbackRegistered) {
+            networkCallbackRegistered = false
+            try {
+                connectivityManager?.unregisterNetworkCallback(networkCallback)
+            } catch (_: Throwable) {
+            }
+        }
+        connectivityManager = null
         EmulationForegroundService.stop(this)
 
         methodChannel?.setMethodCallHandler(null)
@@ -1807,6 +1892,31 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         }
     }
 
+    private fun launchExternalRomDirectoryPicker(result: MethodChannel.Result) {
+        pendingPickRomDirResult?.let { previous ->
+            try {
+                previous.success(null)
+            } catch (_: Throwable) {
+            }
+            pendingPickRomDirResult = null
+        }
+        pendingPickRomDirResult = result
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            putExtra(Intent.EXTRA_LOCAL_ONLY, true)
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            )
+        }
+        try {
+            startActivityForResult(intent, REQ_PICK_EXTERNAL_ROM_DIR)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Falha ao abrir seletor nativo de pasta: ${t.message}")
+            pendingPickRomDirResult = null
+            result.success(null)
+        }
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
@@ -1848,7 +1958,110 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     }
                 }
             }
+
+            REQ_PICK_EXTERNAL_ROM_DIR -> {
+                val pending = pendingPickRomDirResult
+                pendingPickRomDirResult = null
+                if (pending == null) return
+                val uri = if (resultCode == Activity.RESULT_OK) data?.data else null
+                if (uri == null) {
+                    pending.success(null)
+                    return
+                }
+                nativeExecutor.execute {
+                    val resolvedDir = resolveDirectoryPathFromTreeUri(uri)
+                    mainHandler.post {
+                        pending.success(resolvedDir)
+                    }
+                }
+            }
         }
+    }
+
+    private fun resolveDirectoryPathFromTreeUri(treeUri: Uri): String? {
+        try {
+            contentResolver.takePersistableUriPermission(
+                treeUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        } catch (_: Throwable) {
+        }
+
+        try {
+            val docId = DocumentsContract.getTreeDocumentId(treeUri)
+            val splitIdx = docId.indexOf(':')
+            val type = if (splitIdx >= 0) docId.substring(0, splitIdx) else docId
+            val relPath = if (splitIdx >= 0) docId.substring(splitIdx + 1) else ""
+
+            val candidates = ArrayList<File>()
+            if ("primary".equals(type, ignoreCase = true)) {
+                @Suppress("DEPRECATION")
+                candidates.add(File(Environment.getExternalStorageDirectory(), relPath))
+            } else if ("home".equals(type, ignoreCase = true)) {
+                @Suppress("DEPRECATION")
+                val docsDir = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOCUMENTS
+                )
+                candidates.add(File(docsDir, relPath))
+            } else if ("raw".equals(type, ignoreCase = true) || docId.startsWith("/")) {
+                candidates.add(File(if (docId.startsWith("raw:")) docId.removePrefix("raw:") else docId))
+            } else if (type.isNotBlank()) {
+                candidates.add(File("/storage/$type/$relPath"))
+                for (root in mountedExternalRoots()) {
+                    candidates.add(File(root, relPath))
+                }
+            }
+
+            for (dir in candidates) {
+                if (dir.exists() && dir.isDirectory && dir.canRead()) {
+                    return dir.absolutePath
+                }
+            }
+
+            // Fallback SAF: copia a arvore selecionada para o cache local se o POSIX nao estiver legivel
+            val destRoot = File(filesDir, "imported_dirs/${System.currentTimeMillis()}")
+            if (copyDocumentTreeToDirectory(treeUri, docId, destRoot)) {
+                return destRoot.absolutePath
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Falha ao resolver pasta selecionada ($treeUri): ${t.message}")
+        }
+        return null
+    }
+
+    private fun copyDocumentTreeToDirectory(
+        treeUri: Uri,
+        parentDocId: String,
+        destDir: File
+    ): Boolean {
+        if (!destDir.exists() && !destDir.mkdirs()) return false
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE
+        )
+        contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+            val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            while (cursor.moveToNext()) {
+                val childId = if (idIdx >= 0) cursor.getString(idIdx) else continue
+                val name = (if (nameIdx >= 0) cursor.getString(nameIdx) else null) ?: continue
+                val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) else ""
+                if (DocumentsContract.Document.MIME_TYPE_DIR == mime) {
+                    copyDocumentTreeToDirectory(treeUri, childId, File(destDir, name))
+                } else {
+                    val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
+                    contentResolver.openInputStream(fileUri)?.use { input ->
+                        File(destDir, name).outputStream().use { out ->
+                            input.copyTo(out, bufferSize = 64 * 1024)
+                        }
+                    }
+                }
+            }
+        }
+        return destDir.exists()
     }
 
     private fun resolvePickedExternalRomPayload(uri: Uri): Map<String, Any> {
