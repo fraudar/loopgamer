@@ -123,15 +123,59 @@ class PcPortCatalog {
       minRamMb: 1024,
     ),
     PcPortEntry(
-      id: 'hollow-knight',
-      title: 'Hollow Knight',
+      id: 'cuphead-mobile',
+      title: 'Cuphead',
+      developer: 'Studio MDHR (Port Mobile)',
+      genre: 'Run and Gun / Boss Rush',
+      description:
+          'Port não oficial completo para Android com batalhas de chefes, '
+          'animações clássicas estilo anos 30 e controles touch/gamepad.',
+      license: 'Port Android APK (238 MB)',
+      source: PcPortSource.directApk,
+      directApkUrl:
+          'https://archive.org/download/cuphead-mobile-v-0.6.1/Cuphead%20Mobile%20v0.6.1.apk',
+      archNote: 'APK Android direto via Internet Archive (~238 MB).',
+      minRamMb: 2048,
+    ),
+    PcPortEntry(
+      id: 'hollow-knight-vulkan',
+      title: 'Hollow Knight (Port Mobile Vulkan)',
+      developer: 'Team Cherry (Port Android)',
+      genre: 'Metroidvania / Ação',
+      description:
+          'Port completo de Android (Vulkan) de Hollow Knight com suporte nativo '
+          'a controle Bluetooth/USB e resolução em tela cheia.',
+      license: 'Port Android APK (931 MB)',
+      source: PcPortSource.directApk,
+      directApkUrl:
+          'https://archive.org/download/hollow-knight-android/Hollow_Knight_22.10.2022_Vulkan.apk',
+      archNote: 'APK Android Vulkan direto via Internet Archive (~931 MB).',
+      minRamMb: 3072,
+    ),
+    PcPortEntry(
+      id: 'hollow-knight-silksong',
+      title: 'Hollow Knight: Silksong',
       developer: 'Team Cherry',
       genre: 'Metroidvania / Ação',
       description:
-          'Port oficial de Android do aclamado metroidvania de PC. '
-          'Jogo comercial — disponível na Google Play Store. '
-          'Este app apenas abre a página oficial; a compra é feita '
-          'diretamente na loja.',
+          'Sequência oficial de Hollow Knight protagonizada por Hornet. '
+          'Título nativo de PC/Consoles sem versão de emulador Android; '
+          'abra a página oficial para acompanhar lançamentos.',
+      license: 'Comercial (Team Cherry)',
+      source: PcPortSource.external,
+      externalUrl:
+          'https://store.steampowered.com/app/1030300/Hollow_Knight_Silksong/',
+      externalLabel: 'Abrir página oficial (Steam)',
+      minRamMb: 4096,
+    ),
+    PcPortEntry(
+      id: 'hollow-knight',
+      title: 'Hollow Knight (Play Store)',
+      developer: 'Team Cherry',
+      genre: 'Metroidvania / Ação',
+      description:
+          'Página oficial de Hollow Knight na loja. '
+          'Este atalho abre a loja oficial do desenvolvedor.',
       license: 'Comercial (Team Cherry)',
       source: PcPortSource.external,
       externalUrl:

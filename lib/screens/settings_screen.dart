@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:phosphor_flutter/phosphor_flutter.dart';
 
 import '../models/app_settings.dart';
+import '../services/diagnostic_log_service.dart';
 import '../services/emulator_service.dart';
 import '../services/gpu_driver_service.dart';
 import '../services/rom_download_service.dart';
@@ -60,6 +61,7 @@ class _SettingsScreenState extends State<SettingsScreen>
   bool _removingPs3Firmware = false;
   bool _isCleaningStorage = false;
   bool _isCleaningSavesAndCovers = false;
+  bool _isSavingErrorReport = false;
   int _selectedCategory = 0;
   int _focusedCategoryIndex = -1;
 
@@ -453,6 +455,109 @@ class _SettingsScreenState extends State<SettingsScreen>
     } finally {
       if (mounted) {
         setState(() => _isCleaningSavesAndCovers = false);
+      }
+    }
+  }
+
+  Future<void> _handleSaveErrorReport() async {
+    if (_isSavingErrorReport) return;
+    setState(() => _isSavingErrorReport = true);
+    try {
+      await _refreshAllDiskState();
+      final result = await DiagnosticLogService.instance.saveReportToDisk(
+        storage: _storageBreakdown,
+        downloadService: widget.downloadService,
+      );
+      if (!mounted) return;
+      final preview = result.reportText.length > 6000
+          ? result.reportText.substring(result.reportText.length - 6000)
+          : result.reportText;
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: HydraTokens.bgNearBlack,
+          shape: HydraTokens.dialogShape,
+          title: Text(
+            'Relatório de Erros Salvo',
+            style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
+          ),
+          content: SizedBox(
+            width: 520,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Salvo em:\n${result.file.path}',
+                  style: const TextStyle(
+                    fontFamily: 'JetBrainsMono',
+                    fontSize: 11,
+                    color: HydraTokens.primaryAurora,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Flexible(
+                  child: Container(
+                    constraints: const BoxConstraints(maxHeight: 220),
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: HydraTokens.bgPureBlack,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: HydraTokens.borderSubtle8),
+                    ),
+                    child: SingleChildScrollView(
+                      child: SelectableText(
+                        preview,
+                        style: const TextStyle(
+                          fontFamily: 'JetBrainsMono',
+                          fontSize: 10.5,
+                          height: 1.35,
+                          color: HydraTokens.textSecondary,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              style: TextButton.styleFrom(minimumSize: const Size(48, 48)),
+              onPressed: () {
+                unawaited(
+                  Clipboard.setData(ClipboardData(text: result.reportText)),
+                );
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Relatório copiado para a área de transferência.'),
+                  ),
+                );
+              },
+              child: const Text('Copiar'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: HydraTokens.primaryAurora,
+                foregroundColor: HydraTokens.bgPureBlack,
+                minimumSize: const Size(48, 48),
+              ),
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Fechar'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Falha ao salvar relatório de erros: $e')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isSavingErrorReport = false);
       }
     }
   }
@@ -1442,6 +1547,38 @@ class _SettingsScreenState extends State<SettingsScreen>
                         : _storageBreakdown.savesAndCoversBytes > 0
                             ? 'Limpar capas e saves (${_formatStorage(_storageBreakdown.savesAndCoversBytes)})'
                             : 'Limpar capas e saves',
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: _isSavingErrorReport
+                      ? null
+                      : () => unawaited(_handleSaveErrorReport()),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: HydraTokens.primaryAurora,
+                    minimumSize: const Size(48, 48),
+                    side: const BorderSide(color: HydraTokens.borderSubtle10),
+                  ),
+                  icon: _isSavingErrorReport
+                      ? const SizedBox(
+                          width: 15,
+                          height: 15,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: HydraTokens.primaryAurora,
+                          ),
+                        )
+                      : PhosphorIcon(
+                          PhosphorIcons.fileText(PhosphorIconsStyle.bold),
+                          size: 17,
+                        ),
+                  label: Text(
+                    _isSavingErrorReport
+                        ? 'Gerando relatório...'
+                        : 'Salvar relatório de erros',
                   ),
                 ),
               ),

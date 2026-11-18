@@ -11,6 +11,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:loopgamer/models/app_settings.dart';
 import 'package:loopgamer/models/emulation_game.dart';
 import 'package:loopgamer/services/cover_cache_service.dart';
+import 'package:loopgamer/services/diagnostic_log_service.dart';
+import 'package:loopgamer/services/game_asset_service.dart';
 import 'package:loopgamer/services/rom_download_service.dart';
 import 'package:loopgamer/services/rom_platform_detector.dart';
 import 'package:loopgamer/widgets/procedural_cover.dart';
@@ -647,5 +649,138 @@ void main() {
         await tester.pumpWidget(const SizedBox.shrink());
       },
     );
+  });
+
+  group('Extração streaming .zip, bloqueio de PC .exe, capas e relatório', () {
+    test('extrai .zip DEFLATE com nomes Latin-1 não-UTF8 em streaming sem OOM',
+        () async {
+      final tempDir = _setupMockEnvironment();
+      final payload = Uint8List.fromList(
+        List<int>.generate(16 * 1024, (i) => (i * 13 + 7) & 0xFF),
+      );
+      final arc = Archive()
+        ..addFile(ArchiveFile('game_XX.gba', payload.length, payload));
+      final zipBytes = Uint8List.fromList(ZipEncoder().encode(arc)!);
+
+      // Substitui 'XX' por bytes inválidos em UTF-8 ([0xE7, 0xE3]) nos registros
+      final marker = ascii.encode('game_XX.gba');
+      for (var i = 0; i <= zipBytes.length - marker.length; i++) {
+        var match = true;
+        for (var j = 0; j < marker.length; j++) {
+          if (zipBytes[i + j] != marker[j]) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          zipBytes[i + 5] = 0xE7;
+          zipBytes[i + 6] = 0xE3;
+        }
+      }
+
+      final zipFile = File('${tempDir.path}/latin1.zip')
+        ..writeAsBytesSync(zipBytes);
+      final extractDir = Directory('${tempDir.path}/out_stream');
+      final outFiles = <String>[];
+      final progress = <double>[];
+
+      await StreamingZipArchiveExtractor.extractToDisk(
+        zipPath: zipFile.path,
+        extractPath: extractDir.path,
+        platformSlug: 'gba',
+        onProgress: (p, _) => progress.add(p),
+        outFiles: outFiles,
+      );
+
+      expect(progress, isNotEmpty);
+      expect(outFiles, hasLength(1));
+      expect(File(outFiles.first).readAsBytesSync(), equals(payload));
+    });
+
+    test('rejeita arquivo PC .exe com ALIVE.BIN disfarçado de ROM de console',
+        () {
+      final pickedPs3 = RomDownloadService.pickPreferredExtractedRom(
+        const [
+          'Catherine.Classic/Catherine.exe',
+          'Catherine.Classic/data/lounge/ALIVE.BIN',
+        ],
+        platformSlug: 'ps3',
+      );
+      final pickedWii = RomDownloadService.pickPreferredExtractedRom(
+        const [
+          'Catherine.Classic/Catherine.exe',
+          'Catherine.Classic/data/lounge/ALIVE.BIN',
+        ],
+        platformSlug: 'wii',
+      );
+      expect(pickedPs3, isNull);
+      expect(pickedWii, isNull);
+    });
+
+    test('evita capa cruzada entre versões de Resident Evil e corrige playlist CPS1/CPS2',
+        () {
+      expect(
+        GameAssetService.titleSimilarityScore(
+          'Resident Evil',
+          'Resident Evil 4',
+        ),
+        0.0,
+      );
+      expect(
+        GameAssetService.titleSimilarityScore(
+          'Resident Evil Gaiden',
+          'Resident Evil 2',
+        ),
+        0.0,
+      );
+      expect(
+        GameAssetService.titleSimilarityScore(
+          'Chrono Trigger',
+          'CHRONO TRIGGER',
+        ),
+        1.0,
+      );
+
+      const sfa3 = EmulationGame(
+        igdbId: 65101,
+        name: 'Street Fighter Alpha 3',
+        canonicalNoIntroName: 'Street Fighter Alpha 3 (Euro 980904)',
+        summary: '',
+        genres: ['Luta'],
+        developer: 'Capcom',
+        releaseYear: 1998,
+        rating: 94,
+        platformName: 'CPS1 / CPS2',
+        platformSlug: 'cps1',
+        directRomUrl: 'retroapi://cps1/sfa3.zip',
+      );
+      expect(sfa3.libretroPlaylistName, 'FBNeo - Arcade Games');
+    });
+
+    test('DiagnosticLogService grava relatório completo de erros e armazenamento',
+        () async {
+      _setupMockEnvironment();
+      DiagnosticLogService.instance.record(
+        'Erro simulado de teste na extração',
+        level: 'ERROR',
+      );
+
+      final saved = await DiagnosticLogService.instance.saveReportToDisk(
+        storage: const AppStorageBreakdown(
+          readyRomsBytes: 1024 * 1024 * 512,
+          partialDownloadsBytes: 1024 * 1024 * 10,
+          tempCacheBytes: 4096,
+        ),
+        libraryGames: const [],
+      );
+
+      expect(await saved.file.exists(), isTrue);
+      expect(saved.reportText, contains('RELATÓRIO DE ERROS'));
+      expect(saved.reportText, contains('ARMAZENAMENTO'));
+      expect(
+        saved.reportText,
+        contains('Erro simulado de teste na extração'),
+      );
+    });
   });
 }
