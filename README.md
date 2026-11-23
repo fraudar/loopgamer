@@ -1,44 +1,66 @@
-# LoopGamer
+<h1 align="center">loopgamer <sub>v2.6.0</sub></h1>
+
+<p align="center">Emulador de consoles retro para Android construído em Flutter, com frontend</p>
+
+<p align="center">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-7C8CFF?style=flat-square&labelColor=201912" />
+  <img alt="version" src="https://img.shields.io/badge/version-v2.6.0-A5834F?style=flat-square&labelColor=201912" />
+  <img alt="status" src="https://img.shields.io/badge/status-stable-9DB8A2?style=flat-square&labelColor=201912" />
+  <img alt="stars" src="https://img.shields.io/badge/stars-0-989AA3?style=flat-square&labelColor=201912" />
+  <img alt="Dart" src="https://img.shields.io/badge/Dart-84%25-00B4AB?style=flat-square&labelColor=201912" />
+</p>
+
+<p align="center"><img src="./assets/hero.svg" alt="loopgamer" width="100%" /></p>
+
+## About
 
 Emulador de consoles retro para Android construído em Flutter, com frontend
-nativo Kotlin/C++/JNI rodando cores **libretro** (`.so`) — PPSSPP (PSP),
-PCSX-ReARMed (PS1), mGBA (GBA), Snes9x, Genesis Plus GX, Mupen64Plus, FBNeo,
-Dolphin etc.
 
-## Destaques
+## Estrutura
 
-- **Backend Vulkan** (`v5` + negotiation `v2` próprio em `libretro_vulkan.cpp`,
-  padrão/experimental em device) com suporte a drivers **Adreno Turnip** via
-  **AdrenoTools** (`arm64-v8a`), além de **OpenGL ES** e **software CPU** como
-  fallback.
-- **Renderer EGL/GLES** próprio + HW render com FBO e depth/stencil, além de
-  ciclo de vida integrado ao `EmulationForegroundService` (`mediaPlayback`).
-- **Configurações estilo PPSSPP**: resolução de render 1x–10x/1080p/4K, MSAA,
-  escala de tela, filtros, substituição de texturas, presets Freedreno e
-  layout touch customizável isolado em `ValueNotifier` + `RepaintBoundary`.
-- **Catálogo, downloads e biblioteca**: integração REST com servidor **RomM**,
-  downloads com retomada e validação CRC32, cache de capas SteamGridDB em disco
-  e persistência atômica (`.tmp` + `rename` com backup `.corrupt.bak`).
-- **Jogabilidade e segurança**: save states atômicos por slot com preview,
-  turbo/fast-forward, gamepad Bluetooth/USB, telemetria de FPS/frame-time e
-  `networkSecurityConfig` com HTTPS padrão.
+Arquivos relevantes identificados na varredura. Use esta visão para localizar entrypoints, configuração, rotas e documentação.
 
-## Documentação
-
-- [`docs/BACKEND.md`](docs/BACKEND.md) — Kotlin + JNI + C++ (libretro,
-  EGL/GLES, Vulkan/AdrenoTools, áudio, save states, FGS e build nativo).
-- [`docs/FRONTEND.md`](docs/FRONTEND.md) — Flutter/Dart (telas, widgets
-  compartilhados, serviços, `AppSettings`, persistência e canais nativos).
-- [`docs/AGENTS.md`](docs/AGENTS.md) — contexto rápido, regras de arquitetura e
-  comandos de build/teste para agentes de IA continuarem o trabalho.
-
-## Build e verificação
-
-```bash
-./build-apk.sh    # gera loopgamer-release.apk (arm64-v8a + R8 minify/shrink)
-flutter analyze   # lint estrito (analysis_options.yaml)
-flutter test      # suíte de testes unitários e de widgets (32 testes)
+```text
+loopgamer/
+├── pubspec.yaml
+├── .github/workflows/build-apk.yml
+├── .gitignore
+├── .metadata
+├── DESIGN.md
+├── PRODUCT.md
+├── README.md
+├── UI-REDESIGN.md
+├── analysis_options.yaml
+├── android/.gitignore
+├── android/app/build.gradle
+└── android/app/proguard-rules.pro
 ```
 
-Toolchain portátil em `~/.local/share/loopgamer-toolchain`
-(Flutter + JDK 17 + Android SDK); NDK 27 em `/opt/android-ndk` (e no SDK portátil).
+<img src="./assets/terminal.svg" alt="terminal" width="100%" />
+
+## Languages
+
+<img src="./assets/languages.svg" alt="languages" width="100%" />
+
+| Language | Share |
+|:--|--:|
+| Dart | 83.9% |
+| C++ | 9.4% |
+| Kotlin | 6.5% |
+| Shell | 0.1% |
+| CMake | 0.1% |
+
+## Metrics
+
+<img src="./assets/stats.svg" alt="metrics" width="100%" />
+
+| Metric | Value | Note |
+|:--|:--|:--|
+| Stars | **0** | no GitHub |
+| Forks | **0** | no GitHub |
+| APIs | **0** | rotas detectadas |
+| Linguagens | **5** | no repositório |
+
+## Stack
+
+`Dart`
