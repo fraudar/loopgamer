@@ -1028,7 +1028,8 @@ class RomDownloadService {
         final entities = await gameDir.list(recursive: true).toList();
         final filePaths = <String>[];
         for (final entity in entities) {
-          if (entity is File && !entity.path.endsWith('.part')) {
+          if (entity is File &&
+              !_isPartFileName(_basename(entity.path).toLowerCase())) {
             filePaths.add(entity.path);
           }
         }
@@ -1053,7 +1054,8 @@ class RomDownloadService {
       if (await arcadeDir.exists()) {
         final arcadeFiles = await arcadeDir.list().toList();
         for (final entity in arcadeFiles) {
-          if (entity is File && !entity.path.endsWith('.part')) {
+          if (entity is File &&
+              !_isPartFileName(_basename(entity.path).toLowerCase())) {
             final baseName = entity.path
                 .split(Platform.pathSeparator)
                 .last
@@ -1082,7 +1084,7 @@ class RomDownloadService {
       for (final entity in files) {
         if (entity is File &&
             entity.path.contains('rom_${igdbId}_') &&
-            !entity.path.endsWith('.part')) {
+            !_isPartFileName(_basename(entity.path).toLowerCase())) {
           final lower = entity.path.toLowerCase();
           if (lower.endsWith('_jp2.zip')) {
             continue;
@@ -1161,7 +1163,7 @@ class RomDownloadService {
             continue;
           }
         } else if (entity is File &&
-            !lowerName.endsWith('.part') &&
+            !_isPartFileName(lowerName) &&
             !lowerName.endsWith('_jp2.zip')) {
           final rm = romFilePrefix.firstMatch(name);
           if (rm != null) {
@@ -1190,7 +1192,7 @@ class RomDownloadService {
     if (await arcadeDir.exists()) {
       final arcadeFiles = await arcadeDir.list().toList();
       for (final entity in arcadeFiles) {
-        if (entity is File && entity.path.endsWith('.part')) {
+        if (entity is File && _isPartFileName(_basename(entity.path).toLowerCase())) {
           return entity;
         }
       }
@@ -1199,7 +1201,7 @@ class RomDownloadService {
     for (final entity in files) {
       if (entity is File &&
           entity.path.contains('rom_${igdbId}_') &&
-          entity.path.endsWith('.part')) {
+          _isPartFileName(_basename(entity.path).toLowerCase())) {
         return entity;
       }
     }
@@ -1230,7 +1232,7 @@ class RomDownloadService {
 
   static bool _isValidExtractedRomFileName(String lowerName, int byteLength) {
     if (byteLength <= 0) return false;
-    if (lowerName.endsWith('.part') ||
+    if (_isPartFileName(lowerName) ||
         lowerName.contains('.tmp_') ||
         lowerName.endsWith('.tmp') ||
         _isCompressedArchiveName(lowerName)) {
@@ -1385,7 +1387,7 @@ class RomDownloadService {
       int total = 0;
       for (final entity in files) {
         if (entity is File &&
-            !entity.path.endsWith('.part') &&
+            !_isPartFileName(_basename(entity.path).toLowerCase()) &&
             _basename(entity.path).toLowerCase() != 'neogeo.zip') {
           total += await entity.length();
         }
@@ -1441,11 +1443,14 @@ class RomDownloadService {
     return false;
   }
 
+  /// Nome de arquivo de download parcial: `*.part` e os metadados de retomada `*.part.pmeta`.
+  static bool _isPartFileName(String base) =>
+      base.endsWith('.part') || base.endsWith('.part.pmeta');
+
   bool _isTempLikeFileName(String baseLower) {
     return baseLower.contains('.tmp_') ||
         baseLower.endsWith('.tmp') ||
-        baseLower.endsWith('.part') ||
-        baseLower.contains('.part_') ||
+        _isPartFileName(baseLower) ||
         baseLower.endsWith('.log') ||
         baseLower.endsWith('.cache');
   }
@@ -1481,7 +1486,7 @@ class RomDownloadService {
           if (!countedKeys.add(key)) continue;
           final len = await entity.length();
           final base = _basename(entity.path).toLowerCase();
-          if (base.endsWith('.part')) {
+          if (_isPartFileName(base)) {
             partialDownloadsBytes += len;
             if (!_isActiveOrPausedPartFile(entity.path)) {
               orphanPartCount++;
@@ -1577,7 +1582,7 @@ class RomDownloadService {
         where: (_, baseLower) =>
             baseLower.contains('.tmp_') ||
             baseLower.contains('.part_') ||
-            baseLower.endsWith('.part'),
+            _isPartFileName(baseLower),
       );
     }
 
@@ -1639,7 +1644,7 @@ class RomDownloadService {
         if (entity is! File) continue;
         final base = _basename(entity.path).toLowerCase();
         if (base.contains('.tmp_') ||
-            base.endsWith('.part') ||
+            _isPartFileName(base) ||
             base.contains('.part_')) {
           tempCacheBytes += await _sumFileUnique(entity, countedKeys);
         }
@@ -1671,7 +1676,7 @@ class RomDownloadService {
             if (entity is! File) continue;
             final base = _basename(entity.path).toLowerCase();
             if ((base.endsWith('.zip') && base != 'neogeo.zip') ||
-                base.endsWith('.part') ||
+                _isPartFileName(base) ||
                 base.contains('.tmp_')) {
               tempCacheBytes += await _sumFileUnique(entity, countedKeys);
             }
@@ -1877,7 +1882,7 @@ class RomDownloadService {
           for (final entity in entities) {
             if (entity is! File) continue;
             final base = _basename(entity.path).toLowerCase();
-            if (base.endsWith('.part')) {
+            if (_isPartFileName(base)) {
               if (!_isActiveOrPausedPartFile(entity.path)) {
                 await deleteFileMeasuring(entity);
               }
@@ -1920,7 +1925,7 @@ class RomDownloadService {
           final base = _basename(entity.path).toLowerCase();
           if (base.contains('.tmp_') ||
               base.contains('.part_') ||
-              base.endsWith('.part')) {
+              _isPartFileName(base)) {
             await deleteFileMeasuring(entity);
           }
         }
@@ -1941,7 +1946,7 @@ class RomDownloadService {
             final base = _basename(entity.path).toLowerCase();
             if (base.contains('.tmp_') ||
                 base.contains('.part_') ||
-                base.endsWith('.part')) {
+                _isPartFileName(base)) {
               await deleteFileMeasuring(entity);
             }
           }
@@ -2043,7 +2048,7 @@ class RomDownloadService {
             if (entity is! File) continue;
             final base = _basename(entity.path).toLowerCase();
             if (base.endsWith('.zip') ||
-                base.endsWith('.part') ||
+                _isPartFileName(base) ||
                 base.contains('.part_') ||
                 base.contains('.tmp_')) {
               await deleteFileMeasuring(entity);
@@ -2054,7 +2059,7 @@ class RomDownloadService {
             if (entity is! File) continue;
             final base = _basename(entity.path).toLowerCase();
             if ((base.endsWith('.zip') && base != 'neogeo.zip') ||
-                base.endsWith('.part') ||
+                _isPartFileName(base) ||
                 base.contains('.part_') ||
                 base.contains('.tmp_')) {
               await deleteFileMeasuring(entity);
@@ -2873,7 +2878,7 @@ class RomDownloadService {
           if (expectedSeq != null && _operationSeq[igdbId] != expectedSeq) {
             return;
           }
-          if (f is File && f.path.endsWith('.part')) {
+          if (f is File && _isPartFileName(_basename(f.path).toLowerCase())) {
             await f.delete();
           }
         }
@@ -2883,7 +2888,7 @@ class RomDownloadService {
         if (expectedSeq != null && _operationSeq[igdbId] != expectedSeq) return;
         if (f is File &&
             f.path.contains('rom_${igdbId}_') &&
-            f.path.endsWith('.part')) {
+            _isPartFileName(_basename(f.path).toLowerCase())) {
           await f.delete();
         }
       }
@@ -5379,7 +5384,7 @@ class RomDownloadService {
       for (final entity in pendingEntries) {
         if (entity is! File) continue;
         final base = _basename(entity.path);
-        if (base.toLowerCase().endsWith('.part')) continue;
+        if (_isPartFileName(base.toLowerCase())) continue;
         final match = archiveRegex.firstMatch(base);
         if (match == null) continue;
         final igdbId = int.tryParse(match.group(1) ?? '');
