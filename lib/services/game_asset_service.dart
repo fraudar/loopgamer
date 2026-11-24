@@ -31,7 +31,8 @@ class SessionMemoryCacheManager extends BaseCacheManager
                 maxRedirects: 5,
                 // Retorna a resposta mesmo para erros HTTP: o tratamento de
                 // status fica em _performDownload, evitando exceções espelhadas.
-                validateStatus: (status) => status >= 200 && status < 300,
+                validateStatus: (status) =>
+                    status != null && status >= 200 && status < 300,
                 headers: const {
                   'User-Agent':
                       'LoopGamer/2.3 (https://github.com/fraudar/loopgamer)',
