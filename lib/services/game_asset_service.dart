@@ -29,6 +29,9 @@ class SessionMemoryCacheManager extends BaseCacheManager
                 responseType: ResponseType.bytes,
                 followRedirects: true,
                 maxRedirects: 5,
+                // Retorna a resposta mesmo para erros HTTP: o tratamento de
+                // status fica em _performDownload, evitando exceções espelhadas.
+                validateStatus: (status) => status >= 200 && status < 300,
                 headers: const {
                   'User-Agent':
                       'LoopGamer/2.3 (https://github.com/fraudar/loopgamer)',
@@ -140,12 +143,21 @@ class SessionMemoryCacheManager extends BaseCacheManager
       yield DownloadProgress(url, null, 0);
     }
 
-    final info = await downloadFile(
-      url,
-      key: effectiveKey,
-      authHeaders: headers,
-    );
-    yield info;
+    try {
+      final info = await downloadFile(
+        url,
+        key: effectiveKey,
+        authHeaders: headers,
+      );
+      yield info;
+    } catch (e) {
+      // URLs que respondem 404 são esperados para mídias que não existem
+      // (ex.: thumbnails): conclui o stream sem gerar erro visível.
+      if (e is HttpException && RegExp(r'\(\d{3}\)').hasMatch(e.message)) {
+        return;
+      }
+      rethrow;
+    }
   }
 
   @override

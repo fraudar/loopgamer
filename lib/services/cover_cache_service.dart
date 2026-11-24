@@ -32,6 +32,7 @@ class CoverCacheService {
 
   final Map<String, Completer<File?>> _inFlightDownloads = {};
   final Set<String> _cachedUrlKeys = {};
+  final Set<String> _failedUrls = <String>{};
   bool _isPrecacheRunning = false;
   int _lifecycleEpoch = 0;
   int _tempFileSequence = 0;
@@ -153,6 +154,10 @@ class CoverCacheService {
   }) async {
     if (url.trim().isEmpty) return null;
 
+    // URLs que já falharam (404 de capa inexistente) não são reativadas
+    // dentro da sessão.
+    if (_failedUrls.contains(url)) return null;
+
     final cachedFast = getCachedFileFast(url);
     if (cachedFast != null) {
       if (gameId != null && _cacheDir != null) {
@@ -249,10 +254,16 @@ class CoverCacheService {
       }
       if (!completer.isCompleted) completer.complete(null);
     } on DioException catch (e) {
+      final statusCode = e.response?.statusCode;
       if (e.type != DioExceptionType.cancel) {
-        debugPrint(
-          '[CoverCacheService] Cover download failed (${e.response?.statusCode}): $url',
-        );
+        if (statusCode == 404) {
+          debugPrint('[CoverCacheService] Capa não encontrada (404): $url');
+          _failedUrls.add(url);
+        } else {
+          debugPrint(
+            '[CoverCacheService] Cover download failed ($statusCode): $url',
+          );
+        }
       }
       await _safeDeleteTemp(tempFile);
       if (!completer.isCompleted) completer.complete(null);
@@ -359,6 +370,7 @@ class CoverCacheService {
   void dispose() {
     _lifecycleEpoch++;
     _isPrecacheRunning = false;
+    _failedUrls.clear();
 
     for (final completer in _inFlightDownloads.values) {
       if (!completer.isCompleted) {

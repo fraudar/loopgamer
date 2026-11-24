@@ -298,13 +298,15 @@ class LibraryStorageService {
             final base = _basename(f.path).toLowerCase();
             return base != 'neogeo.zip' &&
                 base != 'qsound.zip' &&
-                !base.endsWith('.part');
+                !base.endsWith('.part') &&
+                !base.endsWith('.part.pmeta');
           },
         );
         final seenKeys = <String>{};
         for (final f in regularFiles) {
           final base = _basename(f.path).toLowerCase();
-          if (base.endsWith('.part') && !mainBase.endsWith('.part')) {
+          if ((base.endsWith('.part') || base.endsWith('.part.pmeta')) &&
+              !mainBase.endsWith('.part')) {
             continue;
           }
           if ((base == 'neogeo.zip' || base == 'qsound.zip') &&

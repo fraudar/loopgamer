@@ -229,10 +229,18 @@ class DiagnosticLogService {
       final romsDir = Directory('${supportDir.path}/roms');
       sb.writeln('--- ARQUIVOS EM ${romsDir.path} ---');
       if (await romsDir.exists()) {
-        await for (final entity in romsDir.list(followLinks: false)) {
+        final entities = await romsDir.list(followLinks: false).toList();
+        entities.sort(
+          (a, b) => a.path.toLowerCase().compareTo(b.path.toLowerCase()),
+        );
+        for (final entity in entities) {
           final size = await _measureEntity(entity);
-          final kind = entity is Directory ? 'DIR ' : 'FILE';
-          final name = entity.path.split('/').last;
+          final kind = entity is Directory
+              ? 'DIR '
+              : entity is File
+                  ? 'FILE'
+                  : 'LINK';
+          final name = entity.path.replaceAll('\\', '/').split('/').last;
           sb.writeln('• [$kind] $name (${_formatBytes(size)})');
         }
       } else {
