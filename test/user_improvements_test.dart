@@ -16,6 +16,7 @@ import 'package:loopgamer/services/game_asset_service.dart';
 import 'package:loopgamer/services/rom_download_service.dart';
 import 'package:loopgamer/services/rom_platform_detector.dart';
 import 'package:loopgamer/widgets/procedural_cover.dart';
+import 'test_temp_utils.dart';
 
 Directory _setupMockEnvironment({bool Function()? isConnected}) {
   final tempDir =
@@ -44,7 +45,7 @@ Directory _setupMockEnvironment({bool Function()? isConnected}) {
     messenger.setMockMethodCallHandler(pathProviderChannel, null);
     messenger.setMockMethodCallHandler(methodsChannel, null);
     if (tempDir.existsSync()) {
-      tempDir.deleteSync(recursive: true);
+      deleteTempDirQuietly(tempDir);
     }
   });
 

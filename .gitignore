@@ -47,3 +47,42 @@ app.*.map.json
 
 # Android APKs (distribuídos via GitHub Releases)
 *.apk
+*.aab
+*.ap_
+*.dex
+
+# Logs, relatórios e saídas locais (qualquer profundidade)
+*.log
+*.log.*
+logs/
+reports/
+test-results/
+coverage/
+
+# Config local e segredos (nunca versionar)
+.env
+.env.*
+!.env.example
+*.part
+*.tmp
+*.swp
+*.swo
+*.bak
+*.orig
+
+# Ferramentas e caches locais
+.toolchain/
+loopgamer-toolchain/
+*.iml
+*.ipr
+*.iws
+.idea/
+.vscode/
+gradle-daemon.log
+
+# Artefatos de build em qualquer módulo
+**/build/
+**/.gradle/
+**/.kotlin/
+**/.cxx/
+**/generated/

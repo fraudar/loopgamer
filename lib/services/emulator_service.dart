@@ -344,21 +344,30 @@ class EmulatorService {
     return dotIndex > 0 ? fileName.substring(0, dotIndex) : fileName;
   }
 
-  Future<File> _slotFile(String romPath, int slot) async {
+  /// Chave estável do namespace de saves. Dumps de pasta/ISO de PS3 resolvem
+  /// todos para `EBOOT.BIN`; sem uma chave explícita os jogos colidem.
+  String _effectiveSaveKey(String romPath, String? saveKey) {
+    final raw = (saveKey ?? _romBaseName(romPath)).trim();
+    final safe = raw.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    return safe.isEmpty ? 'slot' : safe;
+  }
+
+  Future<File> _slotFile(String romPath, int slot, {String? saveKey}) async {
     final savesDir = await _savesDirectory();
-    final base = _romBaseName(romPath);
+    final base = _effectiveSaveKey(romPath, saveKey);
     return File('${savesDir.path}/${base}_slot$slot.state');
   }
 
-  Future<File> _slotPreviewFile(String romPath, int slot) async {
+  Future<File> _slotPreviewFile(String romPath, int slot,
+      {String? saveKey}) async {
     final savesDir = await _savesDirectory();
-    final base = _romBaseName(romPath);
+    final base = _effectiveSaveKey(romPath, saveKey);
     return File('${savesDir.path}/${base}_slot$slot.png');
   }
 
-  Future<File> _slotMetaFile(String romPath, int slot) async {
+  Future<File> _slotMetaFile(String romPath, int slot, {String? saveKey}) async {
     final savesDir = await _savesDirectory();
-    final base = _romBaseName(romPath);
+    final base = _effectiveSaveKey(romPath, saveKey);
     return File('${savesDir.path}/${base}_slot$slot.json');
   }
 
@@ -366,15 +375,17 @@ class EmulatorService {
   Future<List<SaveStateSlotInfo>> listSaveSlots(
     String romPath, {
     String? defaultGameTitle,
+    String? saveKey,
   }) async {
     final List<SaveStateSlotInfo> slots = [];
     for (int slot = 0; slot <= 5; slot++) {
-      final file = await _slotFile(romPath, slot);
+      final file = await _slotFile(romPath, slot, saveKey: saveKey);
       if (await file.exists()) {
         final stat = await file.stat();
         if (stat.size > 0) {
-          final previewFile = await _slotPreviewFile(romPath, slot);
-          final metaFile = await _slotMetaFile(romPath, slot);
+          final previewFile =
+              await _slotPreviewFile(romPath, slot, saveKey: saveKey);
+          final metaFile = await _slotMetaFile(romPath, slot, saveKey: saveKey);
           String? savedTitle = defaultGameTitle;
           if (await metaFile.exists()) {
             try {
@@ -1417,6 +1428,7 @@ class EmulatorService {
     String freedrenoPreset = '',
     bool? singleTrigger,
     Map<String, String>? coreOptions,
+    String? saveKey,
     void Function(double coreProgress)? onCoreDownloadProgress,
   }) async {
     final serializedCoreOptions = serializeCoreOptions(coreOptions);
@@ -1558,6 +1570,7 @@ SoundSpeedHack = False
           'freedrenoPreset': freedrenoPreset,
           if (singleTrigger != null) 'singleTrigger': singleTrigger,
           'coreOptions': serializedCoreOptions,
+          'saveKey': _effectiveSaveKey(romPath, saveKey),
         },
       );
     } on PlatformException catch (e) {
@@ -1662,6 +1675,7 @@ SoundSpeedHack = False
     int slot, {
     String? romPath,
     String? gameTitle,
+    String? saveKey,
     Uint8List? previewPngBytes,
   }) async {
     _lastError = null;
@@ -1693,11 +1707,12 @@ SoundSpeedHack = False
     if (romPath != null) {
       try {
         if (previewPngBytes != null && previewPngBytes.isNotEmpty) {
-          final previewFile = await _slotPreviewFile(romPath, slot);
+          final previewFile =
+              await _slotPreviewFile(romPath, slot, saveKey: saveKey);
           await previewFile.writeAsBytes(previewPngBytes, flush: true);
         }
 
-        final metaFile = await _slotMetaFile(romPath, slot);
+        final metaFile = await _slotMetaFile(romPath, slot, saveKey: saveKey);
         await metaFile.writeAsString(
           jsonEncode({
             'gameTitle': gameTitle ?? _romBaseName(romPath),
@@ -1717,10 +1732,10 @@ SoundSpeedHack = False
 
   /// Carrega o estado salvo do jogo a partir do slot indicado.
   /// Retorna estritamente o resultado real da camada nativa.
-  Future<bool> loadState(int slot, {String? romPath}) async {
+  Future<bool> loadState(int slot, {String? romPath, String? saveKey}) async {
     _lastError = null;
     if (romPath != null) {
-      final file = await _slotFile(romPath, slot);
+      final file = await _slotFile(romPath, slot, saveKey: saveKey);
       if (!await file.exists() || await file.length() == 0) {
         _lastError = 'Nenhum save state encontrado neste slot.';
         return false;
@@ -1749,16 +1764,17 @@ SoundSpeedHack = False
   }
 
   /// Remove um save state e seu preview de um slot específico.
-  Future<void> deleteSaveState(int slot, {required String romPath}) async {
-    final file = await _slotFile(romPath, slot);
+  Future<void> deleteSaveState(int slot,
+      {required String romPath, String? saveKey}) async {
+    final file = await _slotFile(romPath, slot, saveKey: saveKey);
     if (await file.exists()) {
       await file.delete();
     }
-    final preview = await _slotPreviewFile(romPath, slot);
+    final preview = await _slotPreviewFile(romPath, slot, saveKey: saveKey);
     if (await preview.exists()) {
       await preview.delete();
     }
-    final meta = await _slotMetaFile(romPath, slot);
+    final meta = await _slotMetaFile(romPath, slot, saveKey: saveKey);
     if (await meta.exists()) {
       await meta.delete();
     }

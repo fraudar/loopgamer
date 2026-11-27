@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:loopgamer/models/emulation_game.dart';
 import 'package:loopgamer/services/rom_download_service.dart';
+import 'test_temp_utils.dart';
 
 /// Servidor HTTP falso com suporte opcional a `Range`.
 class _FakeRangeAdapter implements HttpClientAdapter {
@@ -121,7 +122,7 @@ Directory _setupTempSupportDir() {
     messenger.setMockMethodCallHandler(pathProviderChannel, null);
     messenger.setMockMethodCallHandler(methodsChannel, null);
     if (tempDir.existsSync()) {
-      tempDir.deleteSync(recursive: true);
+      deleteTempDirQuietly(tempDir);
     }
   });
   return tempDir;

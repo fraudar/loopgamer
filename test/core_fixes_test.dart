@@ -11,6 +11,7 @@ import 'package:loopgamer/models/emulation_game.dart';
 import 'package:loopgamer/screens/settings_screen.dart';
 import 'package:loopgamer/services/igdb_steamgriddb_service.dart';
 import 'package:loopgamer/services/rom_download_service.dart';
+import 'test_temp_utils.dart';
 
 typedef _RouteResponder = ResponseBody Function(RequestOptions options);
 
@@ -378,7 +379,7 @@ void main() {
           TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
               .setMockMethodCallHandler(pathProviderChannel, null);
           if (tempDir.existsSync()) {
-            tempDir.deleteSync(recursive: true);
+            deleteTempDirQuietly(tempDir);
           }
         });
 

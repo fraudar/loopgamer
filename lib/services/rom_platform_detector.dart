@@ -249,14 +249,19 @@ class RomPlatformDetector {
     return null;
   }
 
-  /// Estimativa grosseira de PS1/PS2 pelo tamanho (apenas `.iso`/`.img`).
+  /// Estimativa grosseira de PS1/PS2/PS3 pelo tamanho (apenas `.iso`/`.img`).
   ///
   /// Réplica da heurística já usada em `IgdbSteamGridService`: PS1 cabe em
   /// CD (~700 MB) e PS2 em DVD (> 900 MB). Imagens GameCube/Wii/PSP/PS3 são
   /// resolvidas pelo conteúdo antes de chegar aqui; o resultado é sempre
   /// rotulado como estimativa no diálogo de importação.
+  ///
+  /// Acima de 10 GB nenhum disco de PS2 cabe (DVD dupla camada = 8.5 GB), então
+  /// a única imagem plausível é PS3 — ISOs criptografadas de PS3 não expõem
+  /// marcador no cabeçalho e antes caíam em `ps2`, abrindo no core errado.
   static String? fromSize(int bytes) {
     if (bytes <= 0) return null;
+    if (bytes > 10 * 1024 * 1024 * 1024) return 'ps3';
     if (bytes > 900 * 1024 * 1024) return 'ps2';
     if (bytes >= 80 * 1024 * 1024) return 'ps1';
     return null;

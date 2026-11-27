@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:loopgamer/models/emulation_game.dart';
 import 'package:loopgamer/services/rom_download_service.dart';
+import 'test_temp_utils.dart';
 
 /// Entrega sempre o arquivo inteiro (sem Range), como um servidor comum.
 class _FullBodyAdapter implements HttpClientAdapter {
@@ -56,7 +57,7 @@ Directory _setupTempSupportDir() {
     messenger.setMockMethodCallHandler(pathProviderChannel, null);
     messenger.setMockMethodCallHandler(methodsChannel, null);
     if (tempDir.existsSync()) {
-      tempDir.deleteSync(recursive: true);
+      deleteTempDirQuietly(tempDir);
     }
   });
   return tempDir;

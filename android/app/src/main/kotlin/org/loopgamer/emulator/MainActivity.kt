@@ -376,6 +376,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 val freedrenoPreset = call.argument<String>("freedrenoPreset") ?: ""
                 val platform = call.argument<String>("platform")?.trim()?.lowercase() ?: ""
                 val explicitSingleTrigger = call.argument<Boolean>("singleTrigger")
+                val saveKeyArg = call.argument<String>("saveKey")?.trim().orEmpty()
 
                 if (corePath.isNullOrEmpty() || romPath.isNullOrEmpty()) {
                     result.error("INVALID_ARGS", "corePath e romPath são obrigatórios.", null)
@@ -470,7 +471,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     surfaceTexture = st
                     renderSurface = surface
                     currentSavesDir = savesDir
-                    val romBase = File(romPath).nameWithoutExtension
+                    val romBase = saveKeyArg.ifBlank {
+                        File(romPath).nameWithoutExtension
+                    }
                     currentRomBaseName = romBase
                     currentSessionTitle = romBase.ifBlank { File(corePath).name }
 

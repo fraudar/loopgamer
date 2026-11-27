@@ -7,6 +7,14 @@
 
 # The following line activates a set of recommended lints for Flutter apps,
 # packages, and plugins designed to encourage good coding practices.
+analyzer:
+  exclude:
+    - build/**
+    - android/**
+  errors:
+    # Flutter 3.50 marcou material.dart/withOpacity como depreciados em massa.
+    # A base foi escrita contra 3.2x; migrar 170 chamadas não muda runtime.
+    deprecated_member_use: ignore
 include: package:flutter_lints/flutter.yaml
 
 linter:
