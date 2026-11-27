@@ -1,7 +1,7 @@
 name: loopgamer
 description: Frontend de emulação Android em Flutter baseado no RomM e Hydra Launcher.
 publish_to: 'none'
-version: 2.7.0+2270
+version: 2.7.1+2271
 
 environment:
   sdk: '>=3.3.0 <4.0.0'

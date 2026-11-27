@@ -1,10 +1,10 @@
-<h1 align="center">loopgamer <sub>v2.7.0</sub></h1>
+<h1 align="center">loopgamer <sub>v2.7.1</sub></h1>
 
 <p align="center">Emulação retrô no Android</p>
 
 <p align="center">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-FFFFFF?style=flat-square&labelColor=0A0A0A" />
-  <img alt="version" src="https://img.shields.io/badge/version-v2.7.0-F5F5F5?style=flat-square&labelColor=0A0A0A" />
+  <img alt="version" src="https://img.shields.io/badge/version-v2.7.1-F5F5F5?style=flat-square&labelColor=0A0A0A" />
   <img alt="status" src="https://img.shields.io/badge/status-stable-F5F5F5?style=flat-square&labelColor=0A0A0A" />
   <img alt="stars" src="https://img.shields.io/badge/stars-0-F5F5F5?style=flat-square&labelColor=0A0A0A" />
   <img alt="Dart" src="https://img.shields.io/badge/Dart-84%25-F5F5F5?style=flat-square&labelColor=0A0A0A" />

@@ -142,7 +142,7 @@ class _PS5DashboardScreenState extends State<PS5DashboardScreen> {
         const SnackBar(content: Text('Verificando atualizações...')),
       );
     }
-    final result = await UpdateService.checkForUpdate();
+    final result = await UpdateService.instance.checkForUpdate();
     if (!mounted) return;
 
     if (result.error != null) {
@@ -210,7 +210,7 @@ class _PS5DashboardScreenState extends State<PS5DashboardScreen> {
       const SnackBar(content: Text('Baixando atualização...')),
     );
     try {
-      final apk = await UpdateService.downloadLatestApk(
+      final apk = await UpdateService.instance.downloadLatestApk(
         onProgress: (received, total) {
           if (total > 0 && received % (8 * 1024 * 1024) < 256 * 1024) {
             debugPrint(
@@ -220,7 +220,7 @@ class _PS5DashboardScreenState extends State<PS5DashboardScreen> {
         },
       );
       if (!mounted) return;
-      final opened = await UpdateService.openApkInstaller(apk);
+      final opened = await UpdateService.instance.installApk(apk);
       if (!opened && mounted) {
         messenger.showSnackBar(
           const SnackBar(

@@ -38,6 +38,7 @@ import android.view.Surface
 import android.view.WindowManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import io.flutter.embedding.android.FlutterActivity
@@ -775,6 +776,81 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
             "pickExternalRomDirectory" -> {
                 launchExternalRomDirectoryPicker(result)
+            }
+
+            "canRequestPackageInstalls" -> {
+                val allowed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    packageManager.canRequestPackageInstalls()
+                } else {
+                    true
+                }
+                result.success(allowed)
+            }
+
+            "openInstallPermissionSettings" -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    try {
+                        val intent = Intent(
+                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            Uri.parse("package:$packageName")
+                        )
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(intent)
+                        result.success(true)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "Falha ao abrir permissão de instalação: ${t.message}")
+                        result.success(false)
+                    }
+                } else {
+                    result.success(false)
+                }
+            }
+
+            "installApk" -> {
+                val path = call.argument<String>("path")
+                if (path.isNullOrEmpty()) {
+                    result.error("INVALID_APK_PATH", "Caminho do APK vazio.", null)
+                    return
+                }
+                val file = File(path)
+                if (!file.exists() || file.length() < 1024L * 1024L) {
+                    result.error("APK_NOT_FOUND", "APK inválido ou ausente: $path", null)
+                    return
+                }
+                try {
+                    val uri = FileProvider.getUriForFile(
+                        this,
+                        "$packageName.fileprovider",
+                        file
+                    )
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, "application/vnd.android.package-archive")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    startActivity(intent)
+                    result.success(true)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Falha ao abrir instalador do APK", t)
+                    result.error("INSTALL_OPEN_FAILED", t.message ?: "erro desconhecido", null)
+                }
+            }
+
+            "openUrl" -> {
+                val url = call.argument<String>("url")
+                if (url.isNullOrEmpty()) {
+                    result.success(false)
+                    return
+                }
+                try {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(intent)
+                    result.success(true)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Falha ao abrir URL: ${t.message}")
+                    result.success(false)
+                }
             }
 
             else -> result.notImplemented()

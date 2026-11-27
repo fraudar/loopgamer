@@ -24,6 +24,7 @@ import 'services/library_storage_service.dart';
 import 'services/rom_download_service.dart';
 import 'services/rom_platform_detector.dart';
 import 'services/settings_storage_service.dart';
+import 'services/update_coordinator.dart';
 import 'theme/hydra_tokens.dart';
 import 'theme/ps5_hydra_theme.dart';
 import 'widgets/loop_common_widgets.dart';
@@ -65,6 +66,9 @@ class _LoopGamerAppState extends State<LoopGamerApp>
   final RomDownloadService _downloadService = RomDownloadService();
   final LibraryStorageService _libraryStorage = LibraryStorageService();
   final SettingsStorageService _settingsStorage = SettingsStorageService();
+  late final UpdateCoordinator _updateCoordinator = UpdateCoordinator(
+    navigatorKey: _navigatorKey,
+  );
   late final EmulatorService _emulatorService =
       widget.emulatorService ?? EmulatorService();
   final CoverCacheService _coverCacheService = CoverCacheService.instance;
@@ -141,6 +145,10 @@ class _LoopGamerAppState extends State<LoopGamerApp>
       );
     }
     unawaited(_restoreState());
+    // A checagem de update precisa viver no app, não em uma tela específica.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_updateCoordinator.runStartupCheck());
+    });
   }
 
   @override
@@ -1637,6 +1645,8 @@ class _LoopGamerAppState extends State<LoopGamerApp>
                           emulatorService: _emulatorService,
                           isActive: _selectedTab == 3,
                           libraryCount: libraryCount,
+                          onCheckForUpdates: () =>
+                              _updateCoordinator.runStartupCheck(force: true),
                         ),
                       ),
                     ],
