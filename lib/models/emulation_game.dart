@@ -381,6 +381,7 @@ class EmulationGame {
     this.logoUrl,
     this.estimatedSizeBytes = 0,
     this.localRomPath,
+    this.missingRomPath = false,
   });
 
   final int igdbId;
@@ -401,6 +402,11 @@ class EmulationGame {
   final String? logoUrl;
   final int estimatedSizeBytes;
   final String? localRomPath;
+
+  /// Arquivo local ausente no momento da leitura do manifesto (SD removido,
+  /// permissão transitória). A entrada é preservada com este flag em vez de
+  /// ser descartada.
+  final bool missingRomPath;
 
   factory EmulationGame.empty() => const EmulationGame(
         igdbId: 0,
@@ -760,6 +766,7 @@ class EmulationGame {
     String? logoUrl,
     int? estimatedSizeBytes,
     String? localRomPath,
+    bool? missingRomPath,
   }) {
     return EmulationGame(
       igdbId: igdbId,
@@ -780,6 +787,7 @@ class EmulationGame {
       logoUrl: logoUrl ?? this.logoUrl,
       estimatedSizeBytes: estimatedSizeBytes ?? this.estimatedSizeBytes,
       localRomPath: localRomPath ?? this.localRomPath,
+      missingRomPath: missingRomPath ?? this.missingRomPath,
     );
   }
 }

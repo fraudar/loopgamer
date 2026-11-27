@@ -1,15 +1,109 @@
 import '../models/pc_port.dart';
 
-/// Catálogo curado de ports de PC gratuitos/legalmente distribuíveis para
-/// Android. Todos os APKs apontam para fontes oficiais (GitHub Releases dos
-/// próprios projetos ou lojas oficiais).
+/// Catálogo curado de ports Android de jogos de PC/console e projetos
+/// open-source. Cada item aponta para o release oficial do projeto ou para a
+/// loja oficial — nunca para mirror ou APK de terceiros.
 ///
-/// Jogos comerciais (ex.: Hollow Knight) não são distribuídos aqui — usamos
-/// apenas o link oficial da loja, respeitando a compra do usuário.
+/// Jogos comerciais recompilados (GTA IV, RE4, God of War, Megabonk) exigem
+/// os arquivos originais do próprio usuário; o item declara isso em
+/// [PcPortEntry.requiresGameFiles] e o cartão destaca o requisito.
 class PcPortCatalog {
   PcPortCatalog._();
 
   static const List<PcPortEntry> entries = [
+    // ---------------------------------------------------------------------
+    // Ports nativos de jogos 3D de PC/console (recompilação estática ou
+    // reimplementação). Todos exigem os arquivos do jogo original do próprio
+    // usuário — o APK é só o motor, nunca o jogo completo.
+    // ---------------------------------------------------------------------
+    PcPortEntry(
+      id: 'openbonk',
+      title: 'OpenBonk (Megabonk)',
+      developer: 'martin2844 / comunidade',
+      genre: 'Roguelike / Survivors 3D',
+      description:
+          'Port Android não oficial do Megabonk (C#), com controles touch '
+          'customizáveis, suporte a controle e opções gráficas. Beta ativo — '
+          'releases semanais no GitHub.',
+      license: 'Port comunitário (beta)',
+      source: PcPortSource.githubRelease,
+      githubRepo: 'martin2844/OpenBonk',
+      apkAssetPrefix: 'OpenBonk',
+      apkAssetSuffix: '.apk',
+      requiresGameFiles:
+          'Requer os assets do Megabonk original (Steam) na pasta de dados do '
+          'app. Sem eles o port abre, mas não carrega nenhum personagem/fase.',
+      archNote: 'APK único (~57 MB). Beta: saves podem quebrar entre versões.',
+      minRamMb: 3072,
+    ),
+    PcPortEntry(
+      id: 'xhyn-iv-recomp',
+      title: 'XHYN IV (GTA IV)',
+      developer: 'XHYN-PH / LibertyRecompAndroid',
+      genre: 'Mundo aberto / Ação',
+      description:
+          'Port Android não oficial do GTA IV via recompilação estática da '
+          'versão Xbox 360. Controles touch customizáveis, suporte a controle '
+          'e ajustes gráficos.',
+      license: 'GPL-3.0 (motor) + jogo comercial',
+      source: PcPortSource.githubRelease,
+      githubRepo: 'XHYN-PH/XHYN-IV-recomp',
+      apkAssetPrefix: 'XHYN-IV-',
+      apkAssetSuffix: '.apk',
+      requiresGameFiles:
+          'Requer os arquivos do GTA IV de Xbox 360 (USA) + Title Update 8, '
+          'copiados para a pasta do port. Sem o dump o jogo não inicia.',
+      archNote:
+          'APK ~112 MB. Exige Vulkan e ~8 GB livres; espere 15–25 fps em '
+          'Snapdragon 8 Gen 2 / Adreno 740 com Turnip.',
+      minRamMb: 8192,
+    ),
+    PcPortEntry(
+      id: 'gow-hd-collection',
+      title: 'God of War HD Collection',
+      developer: 'luisxl15 / comunidade',
+      genre: 'Hack and slash / Ação',
+      description:
+          'Port Android não oficial da God of War Collection (God of War I e '
+          'II em HD), com renderização nativa GLES/Vulkan e controle suportado. '
+          'Release atual é demonstração (v0.1.2).',
+      license: 'Demo comunitária',
+      source: PcPortSource.githubRelease,
+      githubRepo: 'luisxl15/GOD-OF-WAR-HD-COLLECTION-ANDROID-PORT',
+      apkAssetPrefix: 'GodOfWarCollection-Android-',
+      apkAssetSuffix: '.apk',
+      requiresGameFiles:
+          'Além do APK, baixe na página de releases os pacotes de dados '
+          '(dados__gow-01.bin ~2 GB, dados__gow-02.bin, dados__manifesto.bin) e '
+          'o opcional de texturas HD (~1.7 GB), e coloque na pasta de dados do '
+          'app mantendo os nomes. Sem os pacotes só roda o menu.',
+      extraAssetPrefixes: ['dados__'],
+      archNote:
+          'APK ~32 MB + ~2 GB de dados obrigatórios. Demo: só o início do '
+          'jogo é jogável nesta versão.',
+      minRamMb: 4096,
+    ),
+    PcPortEntry(
+      id: 'cubeevil4',
+      title: 'CubeEvil4 (Resident Evil 4)',
+      developer: 'Andiweli / adonis-singh',
+      genre: 'Survival horror',
+      description:
+          'Port nativo Android do protótipo de GameCube de Resident Evil 4 '
+          '(build de debug G4BE08, nov/2004), derivado da decompilação '
+          'byte-idêntica. OpenGL ES 3 e Vulkan, suporte a controle.',
+      license: 'Decompilação (uso pessoal)',
+      source: PcPortSource.githubRelease,
+      githubRepo: 'Andiweli/CubeEvil4-Android',
+      apkAssetPrefix: 'CubeEvil4-',
+      apkAssetSuffix: '.apk',
+      requiresGameFiles:
+          'Requer o dump de GameCube da build G4BE08 (nov/2004) do seu próprio '
+          'disco, convertido para a pasta de dados do port. Sem o dump o app '
+          'não passa da tela inicial.',
+      archNote: 'APK ~24 MB. OpenGL ES 3.2 mínimo; Vulkan recomendado.',
+      minRamMb: 4096,
+    ),
     PcPortEntry(
       id: 'luanti',
       title: 'Luanti',

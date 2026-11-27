@@ -441,26 +441,33 @@ class LibraryStorageService {
             ? rawGenres.map((e) => e.toString()).toList()
             : const <String>[];
 
-        if (!await File(localPath).exists() &&
-            !await Directory(localPath).exists()) {
-          continue;
-        }
+        // Caminho ausente (SD desmontado, permissão transitória) não apaga
+        // a entrada: preservar o registro e sinalizar a ausência mantém o
+        // progresso do usuário quando o armazenamento volta.
+        final pathExists = await File(localPath).exists() ||
+            await Directory(localPath).exists();
+        final isMissing = !pathExists;
 
         final canonical = item['canonicalNoIntroName'];
         final regionRaw = item['region'];
         final savedSize = (item['estimatedSizeBytes'] as num?)?.toInt() ?? 0;
         final lowerPath = localPath.toLowerCase();
-        final shouldRecomputeSize = savedSize < 1024 ||
-            lowerPath.endsWith('.cue') ||
-            lowerPath.endsWith('.m3u') ||
-            lowerPath.endsWith('.gdi') ||
-            _isInsideGameOrArcadeFolder(localPath);
+        final shouldRecomputeSize = pathExists &&
+            (savedSize < 1024 ||
+                lowerPath.endsWith('.cue') ||
+                lowerPath.endsWith('.m3u') ||
+                lowerPath.endsWith('.gdi') ||
+                _isInsideGameOrArcadeFolder(localPath));
         final resolvedSize = shouldRecomputeSize
             ? await resolveInstalledRomSizeBytes(
                 localPath,
                 fallbackBytes: savedSize,
               )
             : savedSize;
+        final wasMissing = item['missingRomPath'] == true;
+        if (isMissing != wasMissing) {
+          repairedAnySize = true;
+        }
         if (resolvedSize != savedSize) {
           repairedAnySize = true;
         }
@@ -497,6 +504,7 @@ class LibraryStorageService {
                 item['crc32'] is String ? item['crc32'] as String : '00000000',
             estimatedSizeBytes: resolvedSize,
             localRomPath: localPath,
+            missingRomPath: isMissing,
           ),
         );
       } catch (e) {
@@ -611,6 +619,7 @@ class LibraryStorageService {
             'crc32': g.crc32,
             'estimatedSizeBytes': g.estimatedSizeBytes,
             'localRomPath': g.localRomPath,
+            'missingRomPath': g.missingRomPath,
           },
         )
         .toList();

@@ -138,9 +138,19 @@ class CoverCacheService {
       final aliasKey = _gameMediaFileName(gameId, isBanner: isBanner);
       final aliasFile = File('${dir.path}/$aliasKey');
       if (!await aliasFile.exists() || await aliasFile.length() <= 100) {
-        await sourceFile.copy(aliasFile.path);
+        final tmp = File('${aliasFile.path}.tmp_${DateTime.now().microsecondsSinceEpoch}');
+        try {
+          await sourceFile.copy(tmp.path);
+          if (await tmp.length() > 100) {
+            await tmp.rename(aliasFile.path);
+          }
+        } finally {
+          await _safeDeleteTemp(tmp);
+        }
       }
-      _cachedUrlKeys.add(aliasKey);
+      if (await aliasFile.exists() && await aliasFile.length() > 100) {
+        _cachedUrlKeys.add(aliasKey);
+      }
     } catch (e) {
       debugPrint('[CoverCacheService] Falha ao vincular mídia por gameId ($gameId): $e');
     }
@@ -252,6 +262,7 @@ class CoverCacheService {
           return targetFile;
         }
       }
+      await _safeDeleteTemp(tempFile);
       if (!completer.isCompleted) completer.complete(null);
     } on DioException catch (e) {
       final statusCode = e.response?.statusCode;

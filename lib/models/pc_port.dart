@@ -19,6 +19,8 @@ class PcPortEntry {
     this.externalUrl,
     this.externalLabel,
     this.archNote,
+    this.requiresGameFiles,
+    this.extraAssetPrefixes = const <String>[],
     this.minRamMb = 0,
   });
 
@@ -50,7 +52,24 @@ class PcPortEntry {
 
   /// Aviso de arquitetura/requisito exibido ao usuário.
   final String? archNote;
+
+  /// Arquivos originais que o port exige (dump do próprio usuário). Quando
+  /// preenchido, o cartão exibe um aviso destacado — o APK sozinho não roda.
+  final String? requiresGameFiles;
+
+  /// Prefixos de assets extras (pacotes de dados) publicados no mesmo release
+  /// do APK. Baixados para `<docs>/pc_ports/<id>_data/` com o nome original.
+  final List<String> extraAssetPrefixes;
+
   final int minRamMb;
+
+  /// Página de releases no GitHub (todos os assets, não só o APK).
+  String? get releasesPageUrl =>
+      githubRepo == null ? null : 'https://github.com/$githubRepo/releases';
+
+  /// Há download direto dentro do app (APK via release ou URL fixa).
+  bool get hasDirectDownload =>
+      source == PcPortSource.githubRelease || source == PcPortSource.directApk;
 }
 
 enum PcPortSource {

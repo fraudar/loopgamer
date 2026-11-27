@@ -192,7 +192,7 @@ class HydraTokens {
         color: borderSubtle8,
         thickness: 1,
       ),
-      dialogTheme: const DialogTheme(
+      dialogTheme: const DialogThemeData(
         backgroundColor: bgNearBlack,
         shape: dialogShape,
         titleTextStyle: TextStyle(

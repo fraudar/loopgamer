@@ -1326,7 +1326,7 @@ class _SettingsScreenState extends State<SettingsScreen>
               _SettingsSwitchTile(
                 title: 'Salvar Automaticamente ao Sair (Opcional)',
                 subtitle:
-                    'Desativado por padrão: só salva quando você clicar em Salvar na Sidebar do jogo (ideal para jogos de luta)',
+                    'Desativado por padrão: quando ligado, grava o Quick Save ao sair do jogo E ao mandar o app para segundo plano (recents, tela bloqueada, chamada)',
                 value: s.autoSaveOnExit,
                 onChanged: (v) => _update(s.copyWith(autoSaveOnExit: v)),
               ),

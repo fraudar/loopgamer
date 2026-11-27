@@ -89,29 +89,24 @@ class UpdateService {
     await apkFile.parent.create(recursive: true);
 
     final partial = File('${apkFile.path}.part');
-    try {
-      await _dio.download(
-        apkUrl,
-        partial.path,
-        onReceiveProgress: (received, total) => onProgress?.call(received, total),
-        options: Options(
-          receiveTimeout: const Duration(minutes: 10),
-          sendTimeout: const Duration(seconds: 30),
-          headers: const {'User-Agent': 'LoopGamer-App'},
-        ),
-      );
-      final length = await partial.length();
-      if (length < 1024 * 1024) {
-        throw StateError('APK baixado é pequeno demais ($length bytes).');
-      }
-      if (await apkFile.exists()) await apkFile.delete();
-      await partial.rename(apkFile.path);
-      return apkFile;
-    } finally {
-      try {
-        if (await partial.exists()) await partial.delete();
-      } catch (_) {}
+    await _dio.download(
+      apkUrl,
+      partial.path,
+      onReceiveProgress: (received, total) => onProgress?.call(received, total),
+      options: Options(
+        receiveTimeout: const Duration(minutes: 10),
+        sendTimeout: const Duration(seconds: 30),
+        headers: const {'User-Agent': 'LoopGamer-App'},
+      ),
+    );
+    final length = await partial.length();
+    if (length < 1024 * 1024) {
+      await partial.delete();
+      throw StateError('APK baixado é pequeno demais ($length bytes).');
     }
+    if (await apkFile.exists()) await apkFile.delete();
+    await partial.rename(apkFile.path);
+    return apkFile;
   }
 
   /// Abre o APK com o instalador nativo do Android via FileProvider

@@ -6,7 +6,7 @@ Emulador libretro Android em Flutter. Antes de alterar código, leia [BACKEND.md
 
 ```bash
 flutter analyze     # deve sair "No issues found!" (regras estritas em analysis_options.yaml)
-flutter test        # executa toda a suíte (88 testes: widget, core fixes, regressões e detecção de plataforma)
+flutter test        # executa toda a suíte (121 testes: widget, core fixes, regressões, detecção de plataforma, ports e ISO grande)
 ./build-apk.sh      # gera loopgamer-release.apk (arm64-v8a + R8 minify/shrink, toolchain portátil)
 ```
 

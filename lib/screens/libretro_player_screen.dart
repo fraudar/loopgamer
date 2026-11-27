@@ -55,7 +55,8 @@ class LibretroPlayerScreen extends StatefulWidget {
   State<LibretroPlayerScreen> createState() => _LibretroPlayerScreenState();
 }
 
-class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
+class _LibretroPlayerScreenState extends State<LibretroPlayerScreen>
+    with WidgetsBindingObserver {
   final GlobalKey _viewportRepaintKey = GlobalKey();
   final FocusNode _playerFocusNode = FocusNode(debugLabel: 'LibretroPlayerFocus');
   final SettingsStorageService _settingsStorage = SettingsStorageService();
@@ -113,6 +114,8 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
   final DateTime _sessionStartTime = DateTime.now();
   bool _isGameSpecificProfile = false;
   bool _isFastForwardActive = false;
+  bool _isAutoSavingQuickState = false;
+  DateTime? _lastAutoSaveAt;
 
   bool _shouldShowTouchOverlayFor(AppSettings settings, bool hardwareActive) {
     switch (settings.touchOverlayMode) {
@@ -128,6 +131,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     unawaited(
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
     );
@@ -157,6 +161,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _toastTimer?.cancel();
     _flushPendingOverlaySave(syncNative: false);
     unawaited(_telemetrySub?.cancel());
@@ -181,6 +186,56 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
     _toastNotifier.dispose();
     _hardwareGamepadNotifier.dispose();
     super.dispose();
+  }
+
+  /// Namespace estável de saves por jogo — ISOs/dumps de PS3 resolvem todos
+  /// para `EBOOT.BIN`, então o nome do arquivo não serve como chave.
+  String get _saveKey => 'game_${widget.game.igdbId}';
+
+  bool get _canAutoSaveQuickState =>
+      _settings.autoSaveOnExit &&
+      _textureId != null &&
+      _errorMessage == null &&
+      !_isPreparingCore &&
+      !_isExitDialogOpen;
+
+  /// Salva o Quick Save (slot 0) quando o app vai para segundo plano.
+  ///
+  /// Sem isso, `autoSaveOnExit` só valia para o botão do diálogo de saída —
+  /// fechar o app pelo recents, bloquear a tela ou receber uma chamada perdia
+  /// todo o progresso desde o último save manual.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state != AppLifecycleState.paused &&
+        state != AppLifecycleState.hidden) {
+      return;
+    }
+    unawaited(_autoSaveQuickState());
+  }
+
+  Future<void> _autoSaveQuickState() async {
+    if (!_canAutoSaveQuickState || _isAutoSavingQuickState) return;
+    final now = DateTime.now();
+    final last = _lastAutoSaveAt;
+    if (last != null && now.difference(last) < const Duration(seconds: 5)) {
+      return;
+    }
+    _isAutoSavingQuickState = true;
+    try {
+      _flushPendingOverlaySave(syncNative: false);
+      final saved = await widget.emulatorService.saveState(
+        0,
+        romPath: widget.romPath,
+        saveKey: _saveKey,
+        gameTitle: widget.game.name,
+      );
+      if (saved) _lastAutoSaveAt = now;
+    } catch (_) {
+      // Auto-save é melhor-esforço: falha não interrompe a sessão.
+    } finally {
+      _isAutoSavingQuickState = false;
+    }
   }
 
   void _showToast(String message, {bool isError = false}) {
@@ -295,6 +350,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
     final slots = await widget.emulatorService.listSaveSlots(
       widget.romPath,
       defaultGameTitle: widget.game.name,
+      saveKey: _saveKey,
     );
     if (mounted) {
       setState(() => _saveSlots = slots);
@@ -582,12 +638,14 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
 
     _telemetrySub = widget.emulatorService.telemetryStream.listen((evt) {
       if (!mounted) return;
-      if (!evt.hasRenderedFrame && (evt.coreFatal || evt.coreShutdown)) {
+      if (evt.coreFatal || evt.coreShutdown) {
         final msg = evt.coreError?.trim();
         setState(() {
           _errorMessage = (msg != null && msg.isNotEmpty)
               ? msg
-              : 'O núcleo encerrou a execução antes de exibir vídeo.';
+              : (evt.hasRenderedFrame
+                  ? 'O núcleo encerrou a execução durante a partida.'
+                  : 'O núcleo encerrou a execução antes de exibir vídeo.');
         });
         return;
       }
@@ -608,6 +666,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
         platformSlug: widget.game.platformSlug,
         coreSoName: widget.game.libretroCoreSoName,
         romPath: widget.romPath,
+        saveKey: _saveKey,
         frameSkip: _settings.frameSkip,
         vsyncEnabled: _settings.vsyncEnabled,
         audioEnabled: _settings.audioEnabled,
@@ -655,6 +714,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
       final loaded = await widget.emulatorService.loadState(
         0,
         romPath: widget.romPath,
+        saveKey: _saveKey,
       );
       if (mounted) {
         _showToast(
@@ -674,6 +734,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
     final ok = await widget.emulatorService.saveState(
       slot,
       romPath: widget.romPath,
+      saveKey: _saveKey,
       gameTitle: widget.game.name,
       previewPngBytes: preview,
     );
@@ -694,6 +755,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
     final ok = await widget.emulatorService.loadState(
       slot,
       romPath: widget.romPath,
+      saveKey: _saveKey,
     );
     if (!mounted) return;
     if (ok) {
@@ -715,6 +777,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
     await widget.emulatorService.deleteSaveState(
       slot,
       romPath: widget.romPath,
+      saveKey: _saveKey,
     );
     await _refreshSaveSlots();
     if (mounted) {
@@ -968,6 +1031,7 @@ class _LibretroPlayerScreenState extends State<LibretroPlayerScreen> {
       final saved = await widget.emulatorService.saveState(
         0,
         romPath: widget.romPath,
+        saveKey: _saveKey,
         gameTitle: widget.game.name,
         previewPngBytes: preview,
       );

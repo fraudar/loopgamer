@@ -22,6 +22,7 @@ import 'package:loopgamer/services/settings_storage_service.dart';
 import 'package:loopgamer/theme/hydra_tokens.dart';
 import 'package:loopgamer/widgets/animated_game_logo.dart';
 import 'package:loopgamer/widgets/procedural_cover.dart';
+import 'test_temp_utils.dart';
 
 typedef _AdapterHandler = Future<ResponseBody> Function(
   RequestOptions options,
@@ -86,7 +87,7 @@ Directory _setupTempSupportDir() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(pathProviderChannel, null);
     if (tempDir.existsSync()) {
-      tempDir.deleteSync(recursive: true);
+      deleteTempDirQuietly(tempDir);
     }
   });
   return tempDir;
@@ -533,7 +534,9 @@ void main() {
       await importedZip.writeAsBytes(Uint8List(4096), flush: true);
 
       final resolved = await service.resolveExistingRomPath(77001);
-      expect(resolved, importedZip.path);
+      // Windows devolve separador '\' ao listar diretório; o teste valida o
+      // caminho, não o separador.
+      expect(resolved?.replaceAll('\\', '/'), importedZip.path.replaceAll('\\', '/'));
       expect(await importedZip.exists(), isTrue);
 
       final tinyStub = File('${romsDir.path}/rom_77002_Stub.zip');

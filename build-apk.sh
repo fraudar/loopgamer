@@ -8,6 +8,11 @@ SDK_ROOT="$HOME/.local/share/loopgamer-toolchain"
 JDK_DIR="$SDK_ROOT/jdk-17"
 ANDROID_SDK_DIR="$SDK_ROOT/android-sdk"
 FLUTTER_DIR="$SDK_ROOT/flutter"
+# O toolchain pinado em 3.35.7 fica em flutter35; o 3.50 quebra
+# phosphor_flutter (IconData virou final). Prefere o pinado quando existe.
+if [ -x "$SDK_ROOT/flutter35/flutter/bin/flutter" ]; then
+  FLUTTER_DIR="$SDK_ROOT/flutter35/flutter"
+fi
 
 mkdir -p "$SDK_ROOT"
 

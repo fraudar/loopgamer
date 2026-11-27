@@ -601,7 +601,9 @@ class IgdbSteamGridService {
         }
       }
 
-      _retroApiCache[slug] = merged;
+      if (merged.isNotEmpty) {
+        _retroApiCache[slug] = merged;
+      }
       return merged;
     } on DioException catch (e) {
       if (e.type == DioExceptionType.cancel) rethrow;
@@ -1050,8 +1052,10 @@ class IgdbSteamGridService {
         }
 
         final sizeBytes = _parseByteSize(raw['fs_size_bytes']);
-        final crc =
-            ((raw['crc_hash'] ?? raw['md5_hash'] ?? '') as String).toUpperCase();
+        // RomM expõe MD5 em `md5_hash`. Truncar um MD5 para 8 chars gera um
+        // "CRC32" falso e derruba a verificação em rom_download_service.
+        final rawCrc = (raw['crc_hash'] as String?)?.toUpperCase() ?? '';
+        final crc = RegExp(r'^[0-9A-F]{8}$').hasMatch(rawCrc) ? rawCrc : '';
         final summary = (raw['summary'] as String?)?.trim().isNotEmpty == true
             ? (raw['summary'] as String)
             : 'Jogo sincronizado da sua biblioteca RomM (${mapped.name}).';
@@ -1085,7 +1089,7 @@ class IgdbSteamGridService {
             platformName: mapped.name,
             platformSlug: mapped.slug,
             directRomUrl: directDownloadUrl,
-            crc32: crc.length > 8 ? crc.substring(0, 8) : crc,
+            crc32: crc,
             gridCoverUrl: coverUrl,
             estimatedSizeBytes: sizeBytes,
           ),

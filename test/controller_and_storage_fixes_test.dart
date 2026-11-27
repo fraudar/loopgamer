@@ -20,6 +20,7 @@ import 'package:loopgamer/services/emulator_service.dart';
 import 'package:loopgamer/services/library_storage_service.dart';
 import 'package:loopgamer/services/rom_download_service.dart';
 import 'package:loopgamer/theme/hydra_tokens.dart';
+import 'test_temp_utils.dart';
 
 class _TestHttpAdapter implements HttpClientAdapter {
   _TestHttpAdapter(this._handler);
@@ -50,7 +51,7 @@ Directory _setupIsolatedSupportDir() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(pathChannel, null);
     if (dir.existsSync()) {
-      dir.deleteSync(recursive: true);
+      deleteTempDirQuietly(dir);
     }
   });
   return dir;

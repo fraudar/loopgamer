@@ -1307,8 +1307,7 @@ class _LoopGamerAppState extends State<LoopGamerApp>
         titleController.dispose();
         if (chosenSlug != null && mounted) {
           keepPickedPathForCopy = true;
-          int importId =
-              900000000 + (pickedPath.hashCode.abs() % 90000000);
+          int importId = _stableImportId(pickedPath);
           while (_catalogById.containsKey(importId)) {
             importId++;
           }
@@ -2164,4 +2163,16 @@ class _GameHubLandscapeTopBar extends StatelessWidget {
       ),
     );
   }
+}
+
+/// ID determinístico para ROM importada. `hashCode` não é estável entre
+/// execuções e gerava entrada duplicada na biblioteca após reiniciar o app.
+int _stableImportId(String path) {
+  final normalized = path.replaceAll('\\', '/').toLowerCase();
+  var hash = 0x811c9dc5;
+  for (final codeUnit in normalized.codeUnits) {
+    hash ^= codeUnit;
+    hash = (hash * 0x01000193) & 0xffffffff;
+  }
+  return 900000000 + (hash % 90000000);
 }

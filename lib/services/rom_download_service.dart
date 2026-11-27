@@ -252,6 +252,22 @@ class RomDownloadService {
   final StreamController<RomDownloadEvent> _eventsController =
       StreamController<RomDownloadEvent>.broadcast();
   bool _isDisposed = false;
+  Future<void> _pendingManifestWrite = Future.value();
+
+  /// S serializa read-modify-write do manifesto para não perder entradas
+  /// quando vários downloads são enfileirados no mesmo tick.
+  Future<void> _serializeManifestWrite(Future<void> Function() action) {
+    final previous = _pendingManifestWrite;
+    final gate = Completer<void>();
+    _pendingManifestWrite = gate.future;
+    return previous.whenComplete(() async {
+      try {
+        await action();
+      } finally {
+        if (!gate.isCompleted) gate.complete();
+      }
+    });
+  }
 
   /// Stream global de eventos de download em segundo plano
   Stream<RomDownloadEvent> get downloadEvents => _eventsController.stream;
@@ -2410,61 +2426,84 @@ class RomDownloadService {
 
   Future<void> _persistPendingDownloadEntry(EmulationGame game) async {
     if (_isDisposed) return;
-    try {
-      final file = await _activeDownloadsFile();
-      final Map<String, dynamic> entries = {};
-      if (await file.exists()) {
-        try {
-          final decoded = jsonDecode(await file.readAsString());
-          if (decoded is Map) {
-            for (final e in decoded.entries) {
-              entries[e.key.toString()] = e.value;
+    await _serializeManifestWrite(() async {
+      try {
+        final file = await _activeDownloadsFile();
+        final Map<String, dynamic> entries = {};
+        if (await file.exists()) {
+          try {
+            final decoded = jsonDecode(await file.readAsString());
+            if (decoded is Map) {
+              for (final e in decoded.entries) {
+                entries[e.key.toString()] = e.value;
+              }
             }
-          }
+          } catch (_) {}
+        }
+        entries['${game.igdbId}'] = {
+          'igdbId': game.igdbId,
+          'name': game.name,
+          'canonicalNoIntroName': game.canonicalNoIntroName,
+          'summary': game.summary,
+          'genres': game.genres,
+          'developer': game.developer,
+          'releaseYear': game.releaseYear,
+          'rating': game.rating,
+          'platformName': game.platformName,
+          'platformSlug': game.platformSlug,
+          'directRomUrl': game.directRomUrl,
+          'region': game.region,
+          'crc32': game.crc32,
+          'gridCoverUrl': game.gridCoverUrl,
+          'heroBannerUrl': game.heroBannerUrl,
+          'logoUrl': game.logoUrl,
+          'estimatedSizeBytes': game.estimatedSizeBytes,
+        };
+        if (!await file.parent.exists()) {
+          await file.parent.create(recursive: true);
+        }
+        await _writeActiveDownloadsAtomic(file, entries);
+      } catch (_) {}
+    });
+  }
+
+  Future<void> _writeActiveDownloadsAtomic(
+    File file,
+    Map<String, dynamic> entries,
+  ) async {
+    final tmp = File('${file.path}.tmp');
+    try {
+      await tmp.writeAsString(jsonEncode(entries), flush: true);
+      if (await file.exists()) await file.delete();
+      await tmp.rename(file.path);
+    } catch (_) {
+      if (await tmp.exists()) {
+        try {
+          await tmp.delete();
         } catch (_) {}
       }
-      entries['${game.igdbId}'] = {
-        'igdbId': game.igdbId,
-        'name': game.name,
-        'canonicalNoIntroName': game.canonicalNoIntroName,
-        'summary': game.summary,
-        'genres': game.genres,
-        'developer': game.developer,
-        'releaseYear': game.releaseYear,
-        'rating': game.rating,
-        'platformName': game.platformName,
-        'platformSlug': game.platformSlug,
-        'directRomUrl': game.directRomUrl,
-        'region': game.region,
-        'crc32': game.crc32,
-        'gridCoverUrl': game.gridCoverUrl,
-        'heroBannerUrl': game.heroBannerUrl,
-        'logoUrl': game.logoUrl,
-        'estimatedSizeBytes': game.estimatedSizeBytes,
-      };
-      if (!await file.parent.exists()) {
-        await file.parent.create(recursive: true);
-      }
-      await file.writeAsString(jsonEncode(entries), flush: true);
-    } catch (_) {}
+      rethrow;
+    }
   }
 
   Future<void> _removePendingDownloadEntry(int igdbId) async {
     if (_isDisposed) return;
-    try {
-      final file = await _activeDownloadsFile();
-      if (!await file.exists()) return;
-      final decoded = jsonDecode(await file.readAsString());
-      if (decoded is! Map) return;
-      final key = '$igdbId';
-      if (!decoded.containsKey(key)) return;
-      final updated = Map<String, dynamic>.from(decoded)..remove(key);
-      if (updated.isEmpty) {
-        await file.delete();
-      } else {
-        await file.writeAsString(jsonEncode(updated), flush: true);
-      }
-    } catch (_) {}
+    await _serializeManifestWrite(() async {
+      try {
+        final file = await _activeDownloadsFile();
+        if (!await file.exists()) return;
+        final decoded = jsonDecode(await file.readAsString());
+        if (decoded is! Map) return;
+        final key = '$igdbId';
+        if (!decoded.containsKey(key)) return;
+        final updated = Map<String, dynamic>.from(decoded)..remove(key);
+        if (updated.isEmpty) {
+          await file.delete();
+        } else {
+          await _writeActiveDownloadsAtomic(file, updated);
+        }
+      } catch (_) {}
+    });
   }
 
   /// Acorda downloads aguardando rede e retoma automaticamente downloads
@@ -3204,16 +3243,19 @@ class RomDownloadService {
     }
 
     if (!restoredFromMeta) {
-      final existingLength =
+      var existingLength =
           await partFile.exists() ? await partFile.length() : 0;
-      if (existingLength > totalBytes) {
-        // Tamanho não bate com o servidor: o .part não é confiável.
+      if (existingLength >= totalBytes) {
+        // Metadados inválidos + .part no tamanho total = arquivo pré-alocado
+        // com buracos. Nenhum byte pode ser considerado concluído.
         try {
           if (await partFile.exists()) await partFile.delete();
         } catch (e) {
           debugPrint('[RomDownloadService] Falha ao limpar .part: $e');
         }
-      } else {
+        existingLength = 0;
+      }
+      if (existingLength > 0) {
         // Bytes escritos sequencialmente pelo stream único pertencem ao início
         // da partição e podem ser aproveitados como retome do paralelo.
         for (var i = 0; i < chunkCount; i++) {
@@ -3245,7 +3287,9 @@ class RomDownloadService {
     // confiar nos metadados, evitando aceitar bytes zerados como concluídos.
     writeMeta();
 
-    final raf = partFile.openSync(mode: FileMode.append);
+    // `writeOnly` não trunca (diferente de `write`) e, ao contrário de `append`,
+    // respeita `setPositionSync` — essencial com chunks paralelos.
+    final raf = partFile.openSync(mode: FileMode.writeOnly);
     final chunkCancel = CancelToken();
     var abort = false;
     Object? failure;
@@ -3683,11 +3727,26 @@ class RomDownloadService {
             currentBytes = 0;
           }
 
+          if (isRangeAccepted) {
+            final contentRange = response.headers.value('content-range');
+            final match = contentRange == null
+                ? null
+                : RegExp(r'bytes\s+(\d+)-').firstMatch(contentRange);
+            final rangeStart = match == null ? -1 : int.tryParse(match.group(1)!) ?? -1;
+            if (rangeStart != existingBytes) {
+              throw StateError(
+                'Servidor ignorou Range: esperado $existingBytes, recebido $rangeStart.',
+              );
+            }
+          }
+
           final contentLengthHeader = response.headers.value('content-length');
+          var hasReliableTotal = false;
           if (contentLengthHeader != null) {
             final cl = int.tryParse(contentLengthHeader) ?? 0;
             if (cl > 0) {
               expectedTotalBytes = isRangeAccepted ? existingBytes + cl : cl;
+              hasReliableTotal = true;
               if (!isRangeAccepted && cl < minExpectedBytes) {
                 throw _NonRetryableDownloadException(
                   'Arquivo no servidor é pequeno demais (${(cl / 1024).toStringAsFixed(0)} KB) para ${game.platformName}. Provável manual/patch.',
@@ -3762,6 +3821,15 @@ class RomDownloadService {
               await sink.close();
             } catch (e) {
               debugPrint('[RomDownloadService] Falha ao fechar sink: $e');
+            }
+          }
+
+          if (hasReliableTotal && expectedTotalBytes > 0) {
+            final actualLength = await partFile.length();
+            if (actualLength != expectedTotalBytes) {
+              throw StateError(
+                'Download truncado: $actualLength de $expectedTotalBytes bytes.',
+              );
             }
           }
 
@@ -4498,28 +4566,38 @@ class RomDownloadService {
             if (ebootLba != null) break;
           }
 
-          if (ebootLba != null && ebootSize != null) {
-            final offset = ebootLba * 2048;
-            if (offset + 4 <= totalLen) {
-              raf.setPositionSync(offset);
-              final hdr = raf.readSync(4);
-              final isDecryptedSelf = hdr.length >= 4 &&
-                  ((hdr[0] == 0x53 &&
-                          hdr[1] == 0x43 &&
-                          hdr[2] == 0x45 &&
-                          hdr[3] == 0x00) ||
-                      (hdr[0] == 0x7F &&
-                          hdr[1] == 0x45 &&
-                          hdr[2] == 0x4C &&
-                          hdr[3] == 0x46));
-              if (!isDecryptedSelf) {
-                return const Ps3DumpValidationResult(
-                  isValid: false,
-                  errorMessage:
-                      'Esta ISO de PS3 está criptografada (Redump bruto) e não pode rodar no RPCS3. $ps3DumpTip',
-                );
-              }
-            }
+          if (ebootLba == null || ebootSize == null || ebootLba <= 0) {
+            return const Ps3DumpValidationResult(
+              isValid: false,
+              errorMessage:
+                  'Não foi possível localizar EBOOT.BIN nesta ISO de PS3. $ps3DumpTip',
+            );
+          }
+          final offset = ebootLba * 2048;
+          if (offset + 4 > totalLen) {
+            return const Ps3DumpValidationResult(
+              isValid: false,
+              errorMessage:
+                  'EBOOT.BIN fora dos limites da ISO de PS3. $ps3DumpTip',
+            );
+          }
+          raf.setPositionSync(offset);
+          final hdr = raf.readSync(4);
+          final isDecryptedSelf = hdr.length >= 4 &&
+              ((hdr[0] == 0x53 &&
+                      hdr[1] == 0x43 &&
+                      hdr[2] == 0x45 &&
+                      hdr[3] == 0x00) ||
+                  (hdr[0] == 0x7F &&
+                      hdr[1] == 0x45 &&
+                      hdr[2] == 0x4C &&
+                      hdr[3] == 0x46));
+          if (!isDecryptedSelf) {
+            return const Ps3DumpValidationResult(
+              isValid: false,
+              errorMessage:
+                  'Esta ISO de PS3 está criptografada (Redump bruto) e não pode rodar no RPCS3. $ps3DumpTip',
+            );
           }
 
           return Ps3DumpValidationResult(
