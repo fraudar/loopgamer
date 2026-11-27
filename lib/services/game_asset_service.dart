@@ -938,7 +938,7 @@ class GameAssetService {
           best = item;
         }
       }
-      if (best == null || bestScore < 0.45) return const GameAssets.empty();
+      if (best == null || bestScore < 0.55) return const GameAssets.empty();
 
       final bg = best['background_image'] as String?;
       final additional = best['background_image_additional'] as String?;
@@ -988,8 +988,12 @@ class GameAssetService {
           gameId = (item['id'] as num?)?.toInt();
         }
       }
-      gameId ??= (data.first as Map<String, dynamic>?)?['id'] as int?;
-      if (gameId == null) return const GameAssets.empty();
+      // Nunca usa o primeiro resultado "por padrão": autocomplete devolve
+      // títulos como "F" para buscas sem correspondência exata, e isso já
+      // colocou a capa do jogo errado em Silent Hill.
+      if (gameId == null || bestScore < 0.55) {
+        return const GameAssets.empty();
+      }
 
       final responses = await Future.wait([
         _dio.get<Map<String, dynamic>>(

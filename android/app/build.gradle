@@ -22,8 +22,8 @@ android {
         applicationId "org.loopgamer.emulator"
         minSdk 26
         targetSdk 35
-        versionCode 2281
-        versionName "2.8.1"
+        versionCode 2282
+        versionName "2.8.2"
 
         externalNativeBuild {
             cmake {

@@ -18,12 +18,29 @@ import '../theme/hydra_tokens.dart';
 import '../theme/ps5_hydra_theme.dart';
 import '../widgets/animated_game_logo.dart';
 import '../widgets/loop_common_widgets.dart';
+import '../widgets/port_cover_card.dart';
 import '../widgets/procedural_cover.dart';
 import 'game_detail_screen.dart';
 import 'home_screen.dart';
 import 'pc_ports_screen.dart';
 
 enum _CatalogSortMode { featured, alphaAsc, yearDesc }
+
+class _PortCardModel {
+  const _PortCardModel({
+    required this.title,
+    required this.subtitle,
+    required this.badge,
+    required this.searchTitle,
+    required this.onTap,
+  });
+
+  final String title;
+  final String subtitle;
+  final String badge;
+  final String searchTitle;
+  final VoidCallback onTap;
+}
 
 extension _CatalogSortModeX on _CatalogSortMode {
   String get shortLabel {
@@ -445,7 +462,12 @@ class _ExploreScreenState extends State<ExploreScreen> {
 
   List<PcPortEntry> _matchingPcPorts() {
     final q = EmulationGame.normalizeSearchText(_searchController.text);
+    final isPortsCategory =
+        _selectedCategory == RommPlatformCategory.androidPorts;
     if (q.isEmpty) {
+      if (isPortsCategory) {
+        return PcPortCatalog.entries.toList(growable: false);
+      }
       if (_selectedCategory != RommPlatformCategory.all ||
           _selectedPlatformSlug != 'todos') {
         return const [];
@@ -461,6 +483,9 @@ class _ExploreScreenState extends State<ExploreScreen> {
     }
     final tokens = q.split(' ').where((t) => t.isNotEmpty).toList();
     return PcPortCatalog.entries.where((e) {
+      if (!isPortsCategory && _selectedCategory != RommPlatformCategory.all) {
+        return false;
+      }
       final hay = EmulationGame.normalizeSearchText(
         '${e.title} ${e.developer} ${e.genre} ${e.description}',
       );
@@ -480,6 +505,20 @@ class _ExploreScreenState extends State<ExploreScreen> {
       'super-mario-3d-world-135728',
     };
     final q = EmulationGame.normalizeSearchText(_searchController.text);
+    final isPortsCategory =
+        _selectedCategory == RommPlatformCategory.androidPorts;
+    if (isPortsCategory) {
+      if (q.isEmpty) {
+        return ApkVisionOfflineCatalog.entries.toList(growable: false);
+      }
+      final tokens = q.split(' ').where((t) => t.isNotEmpty).toList();
+      return ApkVisionOfflineCatalog.entries.where((e) {
+        final hay = EmulationGame.normalizeSearchText(
+          '${e.title} ${e.category} ${e.version} ${e.dataLabel}',
+        );
+        return tokens.every(hay.contains);
+      }).toList(growable: false);
+    }
     if (q.isEmpty) {
       return ApkVisionOfflineCatalog.entries
           .where((e) => featuredIds.contains(e.id))
@@ -492,6 +531,66 @@ class _ExploreScreenState extends State<ExploreScreen> {
       );
       return tokens.every(hay.contains);
     }).toList(growable: false);
+  }
+
+  List<_PortCardModel> _portsCategoryCards() {
+    final q = EmulationGame.normalizeSearchText(_searchController.text);
+    final tokens = q.split(' ').where((t) => t.isNotEmpty).toList();
+    bool matches(String haystack) {
+      if (tokens.isEmpty) return true;
+      final norm = EmulationGame.normalizeSearchText(haystack);
+      return tokens.every(norm.contains);
+    }
+
+    final cards = <_PortCardModel>[];
+    for (final entry in _matchingPcPorts()) {
+      if (!matches('${entry.title} ${entry.developer} ${entry.genre}')) {
+        continue;
+      }
+      cards.add(
+        _PortCardModel(
+          title: entry.title,
+          subtitle: entry.genre,
+          badge: entry.minRamMb > 0 ? '${entry.minRamMb} MB' : 'APK',
+          searchTitle: entry.title,
+          onTap: () => unawaited(
+            Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => PcPortsScreen(initialEntryId: entry.id),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    for (final entry in _matchingApkVisionPorts()) {
+      if (!matches('${entry.title} ${entry.category} ${entry.version}')) {
+        continue;
+      }
+      cards.add(
+        _PortCardModel(
+          title: entry.title,
+          subtitle: '${entry.version} · ${entry.dataLabel}',
+          badge: entry.dataLabel,
+          searchTitle: entry.title,
+          onTap: () => unawaited(
+            Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => PcPortsScreen(
+                  initialApkVisionEntryId: entry.id,
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    if (_sortMode == _CatalogSortMode.alphaAsc) {
+      cards.sort(
+        (a, b) => a.title.toLowerCase().compareTo(b.title.toLowerCase()),
+      );
+    }
+    return cards;
   }
 
   Future<void> _loadInitialRealCatalog() async {
@@ -871,6 +970,10 @@ class _ExploreScreenState extends State<ExploreScreen> {
         _visiblePlatforms.any((p) => p.slug == _selectedPlatformSlug)
             ? _selectedPlatformSlug
             : 'todos';
+    final portsCategoryCards =
+        _selectedCategory == RommPlatformCategory.androidPorts
+            ? _portsCategoryCards()
+            : const <_PortCardModel>[];
 
     return Focus(
       focusNode: _screenFocusNode,
@@ -1328,7 +1431,40 @@ class _ExploreScreenState extends State<ExploreScreen> {
                                     ),
                                   ),
                                 ),
-                              if (_matchingPcPorts().isNotEmpty &&
+                              if (portsCategoryCards.isNotEmpty)
+                                SliverPadding(
+                                  padding: const EdgeInsets.fromLTRB(
+                                    20,
+                                    14,
+                                    20,
+                                    20,
+                                  ),
+                                  sliver: SliverGrid(
+                                    gridDelegate:
+                                        const SliverGridDelegateWithMaxCrossAxisExtent(
+                                      maxCrossAxisExtent: 136,
+                                      mainAxisSpacing: 12,
+                                      crossAxisSpacing: 12,
+                                      childAspectRatio: 0.72,
+                                    ),
+                                    delegate: SliverChildBuilderDelegate(
+                                      (context, index) {
+                                        final card = portsCategoryCards[index];
+                                        return PortCoverCard(
+                                          title: card.title,
+                                          subtitle: card.subtitle,
+                                          badge: card.badge,
+                                          searchTitle: card.searchTitle,
+                                          accentColor:
+                                              const Color(0xFFFFB454),
+                                          onTap: card.onTap,
+                                        );
+                                      },
+                                      childCount: portsCategoryCards.length,
+                                    ),
+                                  ),
+                                )
+                              else if (_matchingPcPorts().isNotEmpty &&
                                   (_searchController.text.trim().isNotEmpty ||
                                       (_selectedCategory ==
                                               RommPlatformCategory.all &&
@@ -1349,7 +1485,8 @@ class _ExploreScreenState extends State<ExploreScreen> {
                                     },
                                   ),
                                 ),
-                              if (_matchingApkVisionPorts().isNotEmpty &&
+                              if (portsCategoryCards.isEmpty &&
+                                  _matchingApkVisionPorts().isNotEmpty &&
                                   (_searchController.text.trim().isNotEmpty ||
                                       (_selectedCategory ==
                                               RommPlatformCategory.all &&
@@ -1371,7 +1508,7 @@ class _ExploreScreenState extends State<ExploreScreen> {
                                   ),
                                 ),
                               if (_filteredResults.isEmpty &&
-                                  _matchingPcPorts().isEmpty &&
+                                  portsCategoryCards.isEmpty &&
                                   _matchingApkVisionPorts().isEmpty)
                                 SliverToBoxAdapter(
                                   child: Center(
@@ -1394,7 +1531,8 @@ class _ExploreScreenState extends State<ExploreScreen> {
                                     ),
                                   ),
                                 )
-                              else if (_gridViewMode)
+                              else if (_gridViewMode &&
+                                  portsCategoryCards.isEmpty)
                                 _CatalogStatusesSliver(
                                   listenable: widget.downloadStatusesListenable,
                                   fallback: widget.downloadStatuses,

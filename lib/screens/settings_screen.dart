@@ -6,8 +6,10 @@ import 'package:phosphor_flutter/phosphor_flutter.dart';
 
 import '../models/app_settings.dart';
 import '../services/diagnostic_log_service.dart';
+import '../services/device_profile_service.dart';
 import '../services/emulator_service.dart';
 import '../services/gpu_driver_service.dart';
+import '../services/performance_preset_service.dart';
 import '../services/rom_download_service.dart';
 import '../services/update_service.dart';
 import '../theme/hydra_tokens.dart';
@@ -79,6 +81,10 @@ class _SettingsScreenState extends State<SettingsScreen>
     (
       title: 'Drivers, Firmware & Saves',
       subtitle: 'Turnip GPU, Firmware PS3, Saves e RomM',
+    ),
+    (
+      title: 'Desempenho',
+      subtitle: 'Otimizar FPS para este aparelho',
     ),
   ];
 
@@ -1110,6 +1116,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                   if (_selectedCategory == 0) _buildHudTelemetrySection(s),
                   if (_selectedCategory == 1) _buildGamepadSection(s),
                   if (_selectedCategory == 2) _buildSavesAndStorageSection(s),
+                  if (_selectedCategory == 3) _buildPerformanceSection(s),
                 ],
               ),
             ),
@@ -1199,6 +1206,8 @@ class _SettingsScreenState extends State<SettingsScreen>
                 _buildHudTelemetrySection(s),
                 const SizedBox(height: 22),
                 _buildGamepadSection(s),
+                const SizedBox(height: 22),
+                _buildPerformanceSection(s),
                 const SizedBox(height: 22),
                 _buildSavesAndStorageSection(s),
               ],
@@ -1392,6 +1401,277 @@ class _SettingsScreenState extends State<SettingsScreen>
         ),
         const SizedBox(height: 18),
       ],
+    );
+  }
+
+  Widget _buildPerformanceSection(AppSettings s) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const _SectionHeader(
+          title: 'Desempenho',
+          subtitle: 'Ajuste automático de FPS, resolução e frameskip para este aparelho',
+        ),
+        const SizedBox(height: 10),
+        _SettingsSurfaceCard(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Row(
+                  children: [
+                    Icon(
+                      Icons.speed_rounded,
+                      size: 18,
+                      color: HydraTokens.primaryAurora,
+                    ),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Otimizar para este aparelho',
+                        style: TextStyle(
+                          fontFamily: 'ReadexPro',
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w700,
+                          color: HydraTokens.textPrimary,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  'Lê RAM, núcleos, SoC e fabricante, aplica um preset com média '
+                  'próxima de 60 FPS e mantém fluidez em Samsung, Motorola, '
+                  'Redmi/Xiaomi e aparelhos fracos.',
+                  style: TextStyle(
+                    fontFamily: 'Rubik',
+                    fontSize: 11.5,
+                    height: 1.45,
+                    color: HydraTokens.textSecondary,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    onPressed: _openPerformanceSheet,
+                    icon: const Icon(Icons.bolt_rounded, size: 17),
+                    label: const Text('Otimizar para este aparelho'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: HydraTokens.primaryAurora,
+                      foregroundColor: Colors.black,
+                      textStyle: const TextStyle(
+                        fontFamily: 'ReadexPro',
+                        fontWeight: FontWeight.w700,
+                        fontSize: 12.5,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 18),
+      ],
+    );
+  }
+
+  Future<void> _openPerformanceSheet() async {
+    final profile = await DeviceProfileService.load(refresh: true);
+    if (!mounted) return;
+
+    var tuning = PerformancePresetService.tune(widget.settings, profile: profile);
+    var preferQuality = false;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF111114),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+                child: SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.speed_rounded,
+                            size: 20,
+                            color: HydraTokens.primaryAurora,
+                          ),
+                          const SizedBox(width: 8),
+                          const Expanded(
+                            child: Text(
+                              'Otimizar para este aparelho',
+                              style: TextStyle(
+                                fontFamily: 'ReadexPro',
+                                fontSize: 15,
+                                fontWeight: FontWeight.w700,
+                                color: HydraTokens.textPrimary,
+                              ),
+                            ),
+                          ),
+                          IconButton(
+                            onPressed: () => Navigator.of(sheetContext).pop(),
+                            icon: const Icon(Icons.close_rounded, size: 18),
+                            color: HydraTokens.textSecondary,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        profile.summary,
+                        style: const TextStyle(
+                          fontFamily: 'Rubik',
+                          fontSize: 12,
+                          color: HydraTokens.textSecondary,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        '${tuning.tier.label} · ${profile.tier.hint}',
+                        style: const TextStyle(
+                          fontFamily: 'ReadexPro',
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: HydraTokens.primaryAurora,
+                        ),
+                      ),
+                      if (profile.underMemoryPressure)
+                        const Padding(
+                          padding: EdgeInsets.only(top: 6),
+                          child: Text(
+                            'Memória livre baixa agora — frameskip aumentado em 1.',
+                            style: TextStyle(
+                              fontFamily: 'ReadexPro',
+                              fontSize: 11.5,
+                              color: Color(0xFFFFB454),
+                            ),
+                          ),
+                        ),
+                      const SizedBox(height: 12),
+                      Text(
+                        tuning.headline,
+                        style: const TextStyle(
+                          fontFamily: 'ReadexPro',
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700,
+                          color: HydraTokens.textPrimary,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      ...tuning.changes.map(
+                        (change) => Padding(
+                          padding: const EdgeInsets.only(bottom: 4),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Icon(
+                                Icons.check_rounded,
+                                size: 14,
+                                color: HydraTokens.primaryAurora,
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  change,
+                                  style: const TextStyle(
+                                    fontFamily: 'Rubik',
+                                    fontSize: 11.5,
+                                    height: 1.4,
+                                    color: HydraTokens.textSecondary,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        dense: true,
+                        value: preferQuality,
+                        activeColor: HydraTokens.primaryAurora,
+                        title: const Text(
+                          'Priorizar nitidez',
+                          style: TextStyle(
+                            fontFamily: 'ReadexPro',
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w600,
+                            color: HydraTokens.textPrimary,
+                          ),
+                        ),
+                        subtitle: const Text(
+                          'Sobe a resolução interna. Em aparelho fraco, corta FPS.',
+                          style: TextStyle(
+                            fontFamily: 'Rubik',
+                            fontSize: 11,
+                            color: HydraTokens.textSecondary,
+                          ),
+                        ),
+                        onChanged: (value) {
+                          setSheetState(() {
+                            preferQuality = value;
+                            tuning = PerformancePresetService.tune(
+                              widget.settings,
+                              profile: profile,
+                              preferQuality: value,
+                            );
+                          });
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      SizedBox(
+                        width: double.infinity,
+                        child: FilledButton.icon(
+                          onPressed: () {
+                            final applied = tuning;
+                            _update(applied.settings);
+                            Navigator.of(sheetContext).pop();
+                            if (mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    'Ajustes aplicados: ${applied.headline}',
+                                  ),
+                                ),
+                              );
+                            }
+                          },
+                          icon: const Icon(Icons.bolt_rounded, size: 18),
+                          label: const Text('Aplicar ajustes'),
+                          style: FilledButton.styleFrom(
+                            backgroundColor: HydraTokens.primaryAurora,
+                            foregroundColor: Colors.black,
+                            textStyle: const TextStyle(
+                              fontFamily: 'ReadexPro',
+                              fontWeight: FontWeight.w700,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
     );
   }
 

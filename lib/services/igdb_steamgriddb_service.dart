@@ -13,6 +13,7 @@ import 'dart:isolate';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import '../models/emulation_game.dart';
+import 'game_asset_service.dart';
 import 'rom_download_service.dart';
 
 class _AsyncSemaphore {
@@ -2067,9 +2068,24 @@ class IgdbSteamGridService {
         return emptyArt;
       }
 
-      final firstMatch = searchData.first as Map<String, dynamic>?;
-      final sgdbGameId = (firstMatch?['id'] as num?)?.toInt();
-      if (sgdbGameId == null) {
+      // SteamGridDB não garante ordem relevante. Escolhe o candidato com
+      // maior similaridade e exige casamento real — o primeiro resultado de
+      // "Silent Hill" já foi um jogo chamado "F", com a capa trocada.
+      int? sgdbGameId;
+      double bestScore = 0.0;
+      for (final raw in searchData) {
+        if (raw is! Map<String, dynamic>) continue;
+        final candidateName = '${raw['name'] ?? ''}';
+        final score = GameAssetService.titleSimilarityScore(
+          game.name,
+          candidateName,
+        );
+        if (score > bestScore) {
+          bestScore = score;
+          sgdbGameId = (raw['id'] as num?)?.toInt();
+        }
+      }
+      if (sgdbGameId == null || bestScore < 0.55) {
         const emptyArt = (grid: null, hero: null, logo: null);
         _sgdbArtCache[cacheKey] = emptyArt;
         return emptyArt;

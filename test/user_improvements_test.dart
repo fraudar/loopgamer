@@ -52,6 +52,15 @@ Directory _setupMockEnvironment({bool Function()? isConnected}) {
   return tempDir;
 }
 
+String _coverUrlHash(String url) {
+  int hash = 0x811c9dc5;
+  for (int i = 0; i < url.length; i++) {
+    hash ^= url.codeUnitAt(i);
+    hash = (hash * 0x01000193) & 0xFFFFFFFF;
+  }
+  return '${hash.toRadixString(16)}.img';
+}
+
 Uint8List _buildParamSfo({
   required String title,
   required String titleId,
@@ -597,6 +606,10 @@ void main() {
           ..writeAsBytesSync(pngBytes);
         final bannerFile = File('${cacheDir.path}/game_banner_777001.img')
           ..writeAsBytesSync(pngBytes);
+        File('${coverFile.path}.src')
+            .writeAsStringSync(_coverUrlHash('https://offline.invalid/cover.png'));
+        File('${bannerFile.path}.src')
+            .writeAsStringSync(_coverUrlHash('https://offline.invalid/banner.png'));
 
         final resolvedCover =
             CoverCacheService.instance.getCachedCoverForGame(777001);

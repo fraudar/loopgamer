@@ -86,6 +86,9 @@ class CoverCacheService {
   String _gameMediaFileName(int gameId, {required bool isBanner}) =>
       isBanner ? 'game_banner_$gameId.img' : 'game_cover_$gameId.img';
 
+  String _gameMediaSidecarName(int gameId, {required bool isBanner}) =>
+      '${_gameMediaFileName(gameId, isBanner: isBanner)}.src';
+
   /// Retorna o arquivo de cache em disco para capa associada ao [gameId] ou [imageUrl].
   File? getCachedCoverForGame(int gameId, [String? imageUrl]) =>
       getCachedMediaForGame(gameId, imageUrl: imageUrl, isBanner: false);
@@ -104,6 +107,24 @@ class CoverCacheService {
     if (_cacheDir != null) {
       final gameKey = _gameMediaFileName(gameId, isBanner: isBanner);
       final file = File('${_cacheDir!.path}/$gameKey');
+      // Um aparelho atualizado pode ter alias de gameId de uma versão antiga
+      // do catálogo. O sidecar grava de qual URL veio a imagem; se ela não
+      // corresponder à capa pedida, o alias é descartado em vez de mostrar a
+      // capa de outro jogo (ex.: Silent Hill com a capa de "F").
+      final sidecar = File(
+        '${_cacheDir!.path}/${_gameMediaSidecarName(gameId, isBanner: isBanner)}',
+      );
+      final expected = (imageUrl ?? '').trim();
+      if (sidecar.existsSync() && expected.isNotEmpty) {
+        final recorded = sidecar.readAsStringSync().trim();
+        if (recorded != _hashUrl(expected)) {
+          return null;
+        }
+      } else if (expected.isNotEmpty) {
+        // Alias de versão anterior sem sidecar: não há como provar de qual
+        // título veio a imagem. Descarta e refaz o download com procedência.
+        return null;
+      }
       if (_cachedUrlKeys.contains(gameKey) ||
           (file.existsSync() && file.lengthSync() > 100)) {
         if (file.existsSync() && file.lengthSync() > 100) {
@@ -133,19 +154,37 @@ class CoverCacheService {
     File sourceFile,
     int gameId, {
     required bool isBanner,
+    required String imageUrl,
   }) async {
     try {
       final aliasKey = _gameMediaFileName(gameId, isBanner: isBanner);
       final aliasFile = File('${dir.path}/$aliasKey');
-      if (!await aliasFile.exists() || await aliasFile.length() <= 100) {
+      final srcFile = File(
+        '${dir.path}/${_gameMediaSidecarName(gameId, isBanner: isBanner)}',
+      );
+      final recordedHash = imageUrl.trim().isEmpty
+          ? ''
+          : _hashUrl(imageUrl.trim());
+      final alreadyCorrect = await aliasFile.exists() &&
+          await aliasFile.length() > 100 &&
+          await srcFile.exists() &&
+          await srcFile.readAsString() == recordedHash;
+
+      if (!alreadyCorrect) {
         final tmp = File('${aliasFile.path}.tmp_${DateTime.now().microsecondsSinceEpoch}');
         try {
           await sourceFile.copy(tmp.path);
           if (await tmp.length() > 100) {
+            if (await aliasFile.exists()) await aliasFile.delete();
             await tmp.rename(aliasFile.path);
           }
         } finally {
           await _safeDeleteTemp(tmp);
+        }
+        if (recordedHash.isNotEmpty) {
+          await srcFile.writeAsString(recordedHash, flush: true);
+        } else if (await srcFile.exists()) {
+          await srcFile.delete();
         }
       }
       if (await aliasFile.exists() && await aliasFile.length() > 100) {
@@ -176,6 +215,7 @@ class CoverCacheService {
           cachedFast,
           gameId,
           isBanner: isBanner,
+          imageUrl: url,
         );
       }
       return cachedFast;
@@ -190,6 +230,7 @@ class CoverCacheService {
           file,
           gameId,
           isBanner: isBanner,
+          imageUrl: url,
         );
       }
       return file;
@@ -218,6 +259,7 @@ class CoverCacheService {
             targetFile,
             gameId,
             isBanner: isBanner,
+            imageUrl: url,
           );
         }
         if (!completer.isCompleted) completer.complete(targetFile);
@@ -256,6 +298,7 @@ class CoverCacheService {
               targetFile,
               gameId,
               isBanner: isBanner,
+              imageUrl: url,
             );
           }
           if (!completer.isCompleted) completer.complete(targetFile);

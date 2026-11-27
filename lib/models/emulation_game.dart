@@ -8,6 +8,8 @@ enum RommPlatformCategory {
   handhelds,
   classics,
   arcade,
+  /// Ports Android instaláveis (APK + dados), curados e do APKVision.
+  androidPorts,
 }
 
 extension RommPlatformCategoryX on RommPlatformCategory {
@@ -23,6 +25,8 @@ extension RommPlatformCategoryX on RommPlatformCategory {
         return 'Clássicos';
       case RommPlatformCategory.arcade:
         return 'Arcade';
+      case RommPlatformCategory.androidPorts:
+        return 'Ports Android';
     }
   }
 }
@@ -358,6 +362,19 @@ const List<RommPlatformSpec> kRommPlatforms = [
     accentColor: Color(0xFFF87171),
     retroApiSlug: 'mastersystem',
     category: RommPlatformCategory.classics,
+  ),
+  RommPlatformSpec(
+    slug: 'android-port',
+    shortName: 'PORTS ANDROID',
+    fullName: 'Ports de PC para Android',
+    manufacturer: 'APK / Comunidade',
+    releaseYear: 2026,
+    defaultExtension: 'APK',
+    accentColor: Color(0xFFFFB454),
+    category: RommPlatformCategory.androidPorts,
+    coreNote:
+        'Ports Android: baixe o APK e o pacote de dados, extraia quando necessário '
+        'e use o guia "Onde está / como instalar" dentro de cada port.',
   ),
 ];
 
