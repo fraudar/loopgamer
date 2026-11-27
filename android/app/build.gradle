@@ -22,8 +22,8 @@ android {
         applicationId "org.loopgamer.emulator"
         minSdk 26
         targetSdk 35
-        versionCode 2280
-        versionName "2.8.0"
+        versionCode 2281
+        versionName "2.8.1"
 
         externalNativeBuild {
             cmake {
@@ -66,6 +66,13 @@ android {
             useLegacyPackaging = true
         }
     }
+}
+
+dependencies {
+    // Extração nativa de pacotes de dados dos ports (.7z, .zip, .rar, .tar.xz).
+    implementation("org.apache.commons:commons-compress:1.26.2")
+    implementation("org.tukaani:xz:1.10")
+    implementation("com.github.junrar:junrar:7.5.5")
 }
 
 flutter {

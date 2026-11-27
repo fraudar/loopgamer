@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
 
 import '../data/apkvision_offline_catalog.dart';
@@ -9,8 +10,13 @@ import '../data/pc_port_catalog.dart';
 import '../models/apkvision_port.dart';
 import '../models/pc_port.dart';
 import '../services/apkvision_port_service.dart';
+import '../services/archive_extract_service.dart';
+import '../services/device_profile_service.dart';
+import '../services/performance_preset_service.dart';
 import '../services/pc_port_service.dart';
+import '../services/settings_storage_service.dart';
 import '../theme/ps5_hydra_theme.dart';
+import '../widgets/port_install_guide_sheet.dart';
 
 enum _PortSource { curated, apkVision }
 
@@ -46,6 +52,7 @@ class _PcPortsScreenState extends State<PcPortsScreen> {
   String _query = '';
   _PortSource _source = _PortSource.curated;
   _ArchiveFilter _archiveFilter = _ArchiveFilter.all;
+  String? _portRootPath;
 
   @override
   void initState() {
@@ -104,14 +111,24 @@ class _PcPortsScreenState extends State<PcPortsScreen> {
             ? await ApkVisionPortService.findDownloadedApk(entry)
             : null;
         final data = await ApkVisionPortService.findDownloadedData(entry);
+        final extracted = await ApkVisionPortService.hasExtractedData(entry);
         if (!mounted) return;
         final state = _apkVisionStateFor(entry.id);
         state.apkReady = apk != null;
         state.dataPath = data?.path;
+        state.extracted = extracted;
         setState(() {});
       } catch (_) {
         // Arquivo inacessível não impede o download normal.
       }
+    }
+    try {
+      final root = await ApkVisionPortService.root();
+      if (!mounted) return;
+      _portRootPath = root.path;
+      setState(() {});
+    } catch (_) {
+      // Sem raiz resolvida, a UI mostra o caminho padrão mesmo assim.
     }
   }
 
@@ -358,6 +375,305 @@ class _PcPortsScreenState extends State<PcPortsScreen> {
     }
   }
 
+  /// Extrai o pacote `.7z`/`.zip`/`.rar`/`.tar.xz` para `.../<id>/game/`.
+  Future<void> _extractApkVisionData(
+    ApkVisionPortEntry entry, {
+    bool deleteSource = false,
+  }) async {
+    final state = _apkVisionStateFor(entry.id);
+    if (state.extractBusy) return;
+    if (!ArchiveExtractService.canExtract(entry)) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '${entry.dataLabel} não é compactado. Copie o arquivo para a '
+              'pasta do jogo — não precisa extrair.',
+            ),
+          ),
+        );
+      }
+      return;
+    }
+
+    state
+      ..extractBusy = true
+      ..error = null
+      ..extractProgress = 0
+      ..extractEntry = 'Preparando…';
+    setState(() {});
+
+    final sub = ArchiveExtractService.progress.listen((p) {
+      if (!mounted) return;
+      // Só consome o progresso do arquivo desta entrada.
+      if (state.dataPath != null && p.archivePath != state.dataPath) return;
+      state.extractProgress = p.fraction;
+      state.extractEntry = p.entry;
+      setState(() {});
+    });
+
+    try {
+      final result = await ApkVisionPortService.extractData(
+        entry,
+        deleteSource: deleteSource,
+      );
+      state.extracted = !result.isEmpty && !result.cancelled;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              result.sourceDeleted
+                  ? '${result.files} arquivo(s) extraído(s). Pacote apagado.'
+                  : '${result.files} arquivo(s) extraído(s) em ${result.destDir}',
+            ),
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+      if (state.extracted && mounted) {
+        unawaited(_showPortGuide(entry));
+      }
+    } catch (e) {
+      debugPrint('[ApkVision] Falha ao extrair ${entry.id}: $e');
+      state.error = e.toString().replaceFirst('Bad state: ', '');
+    } finally {
+      await sub.cancel();
+      state
+        ..extractBusy = false
+        ..extractEntry = null;
+      if (mounted) setState(() {});
+    }
+  }
+
+  Future<void> _showPortGuide(ApkVisionPortEntry entry) async {
+    final state = _apkVisionStateFor(entry.id);
+    final root = state.rootPath ?? _portRootPath ?? ApkVisionPortService.publicRootPath;
+    final portPath = '$root/${entry.id}';
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF111114),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetContext) => PortInstallGuideSheet(
+        entry: entry,
+        portPath: portPath,
+        extracted: state.extracted,
+        onOpenFolder: () async {
+          await ApkVisionPortService.openDocumentRoot();
+        },
+        onCopyPath: () async {
+          await Clipboard.setData(ClipboardData(text: portPath));
+          if (sheetContext.mounted) {
+            ScaffoldMessenger.of(sheetContext).showSnackBar(
+              const SnackBar(content: Text('Caminho copiado.')),
+            );
+          }
+        },
+      ),
+    );
+  }
+
+  Future<void> _openPerformanceSheet() async {
+    final profile = await DeviceProfileService.load(refresh: true);
+    final storage = SettingsStorageService();
+    final current = await storage.loadSettings();
+    if (!mounted) return;
+
+    var tuning = PerformancePresetService.tune(current, profile: profile);
+    var preferQuality = false;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF111114),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+                child: SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.speed_rounded,
+                            size: 20,
+                            color: PS5HydraTheme.auroraSpringMint,
+                          ),
+                          const SizedBox(width: 8),
+                          const Expanded(
+                            child: Text(
+                              'Otimizar para este aparelho',
+                              style: TextStyle(
+                                fontFamily: 'ReadexPro',
+                                fontSize: 15,
+                                fontWeight: FontWeight.w700,
+                                color: PS5HydraTheme.textPrimary,
+                              ),
+                            ),
+                          ),
+                          IconButton(
+                            onPressed: () => Navigator.of(sheetContext).pop(),
+                            icon: const Icon(Icons.close_rounded, size: 18),
+                            color: PS5HydraTheme.textSecondary,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        profile.summary,
+                        style: const TextStyle(
+                          fontFamily: 'Rubik',
+                          fontSize: 12,
+                          color: PS5HydraTheme.textSecondary,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        '${tuning.tier.label} · ${profile.tier.hint}',
+                        style: const TextStyle(
+                          fontFamily: 'ReadexPro',
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: PS5HydraTheme.auroraSpringMint,
+                        ),
+                      ),
+                      if (profile.underMemoryPressure)
+                        const Padding(
+                          padding: EdgeInsets.only(top: 6),
+                          child: Text(
+                            'Memória livre baixa agora — frameskip aumentado em 1.',
+                            style: TextStyle(
+                              fontFamily: 'ReadexPro',
+                              fontSize: 11.5,
+                              color: Color(0xFFFFB454),
+                            ),
+                          ),
+                        ),
+                      const SizedBox(height: 12),
+                      Text(
+                        tuning.headline,
+                        style: const TextStyle(
+                          fontFamily: 'ReadexPro',
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700,
+                          color: PS5HydraTheme.textPrimary,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      ...tuning.changes.map(
+                        (change) => Padding(
+                          padding: const EdgeInsets.only(bottom: 4),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Icon(
+                                Icons.check_rounded,
+                                size: 14,
+                                color: PS5HydraTheme.auroraSpringMint,
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  change,
+                                  style: const TextStyle(
+                                    fontFamily: 'Rubik',
+                                    fontSize: 11.5,
+                                    height: 1.4,
+                                    color: PS5HydraTheme.textSecondary,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        dense: true,
+                        value: preferQuality,
+                        activeColor: PS5HydraTheme.auroraSpringMint,
+                        title: const Text(
+                          'Priorizar nitidez',
+                          style: TextStyle(
+                            fontFamily: 'ReadexPro',
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w600,
+                            color: PS5HydraTheme.textPrimary,
+                          ),
+                        ),
+                        subtitle: const Text(
+                          'Sobe a resolução interna. Em aparelho fraco, corta FPS.',
+                          style: TextStyle(
+                            fontFamily: 'Rubik',
+                            fontSize: 11,
+                            color: PS5HydraTheme.textSecondary,
+                          ),
+                        ),
+                        onChanged: (value) {
+                          setSheetState(() {
+                            preferQuality = value;
+                            tuning = PerformancePresetService.tune(
+                              current,
+                              profile: profile,
+                              preferQuality: value,
+                            );
+                          });
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      SizedBox(
+                        width: double.infinity,
+                        child: FilledButton.icon(
+                          onPressed: () async {
+                            final messenger = ScaffoldMessenger.of(context);
+                            final applied = tuning;
+                            await storage.saveSettings(applied.settings);
+                            if (sheetContext.mounted) {
+                              Navigator.of(sheetContext).pop();
+                            }
+                            messenger.showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  'Ajustes aplicados: ${applied.headline}',
+                                ),
+                              ),
+                            );
+                          },
+                          icon: const Icon(Icons.bolt_rounded, size: 18),
+                          label: const Text('Aplicar ajustes'),
+                          style: FilledButton.styleFrom(
+                            backgroundColor: PS5HydraTheme.auroraSpringMint,
+                            foregroundColor: Colors.black,
+                            textStyle: const TextStyle(
+                              fontFamily: 'ReadexPro',
+                              fontWeight: FontWeight.w700,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
   Future<void> _openExternal(String url) async {
     final ok = await PcPortService.openExternal(url);
     if (!ok && mounted) {
@@ -385,6 +701,16 @@ class _PcPortsScreenState extends State<PcPortsScreen> {
             color: PS5HydraTheme.textPrimary,
           ),
         ),
+        actions: [
+          IconButton(
+            tooltip: 'Otimizar FPS para este aparelho',
+            onPressed: _openPerformanceSheet,
+            icon: const Icon(
+              Icons.speed_rounded,
+              color: PS5HydraTheme.auroraSpringMint,
+            ),
+          ),
+        ],
       ),
       body: SafeArea(
         child: Column(
@@ -525,7 +851,9 @@ class _PcPortsScreenState extends State<PcPortsScreen> {
                                   _downloadApkVisionApk(entry),
                               onDownloadData: () =>
                                   _downloadApkVisionData(entry),
+                              onExtract: () => _extractApkVisionData(entry),
                               onOpenArchive: () => _openApkVisionArchive(entry),
+                              onShowGuide: () => _showPortGuide(entry),
                               onOpenExternal: (url) => _openExternal(url),
                             );
                           },
@@ -613,6 +941,13 @@ class _ApkVisionRuntimeState {
   double? dataProgress;
   String? dataLabel;
   String? dataPath;
+
+  bool extractBusy = false;
+  double? extractProgress;
+  String? extractEntry;
+  bool extracted = false;
+  String? rootPath;
+
   String? error;
 }
 
@@ -931,7 +1266,9 @@ class _ApkVisionCard extends StatelessWidget {
     required this.state,
     required this.onDownloadApk,
     required this.onDownloadData,
+    required this.onExtract,
     required this.onOpenArchive,
+    required this.onShowGuide,
     required this.onOpenExternal,
   });
 
@@ -939,7 +1276,9 @@ class _ApkVisionCard extends StatelessWidget {
   final _ApkVisionRuntimeState state;
   final VoidCallback onDownloadApk;
   final VoidCallback onDownloadData;
+  final VoidCallback onExtract;
   final VoidCallback onOpenArchive;
+  final VoidCallback onShowGuide;
   final ValueChanged<String> onOpenExternal;
 
   @override
@@ -1056,6 +1395,14 @@ class _ApkVisionCard extends StatelessWidget {
             '${((state.dataProgress ?? 0) * 100).toStringAsFixed(0)}%',
       );
     }
+    if (state.extractBusy) {
+      return _progressRow(
+        value: state.extractProgress,
+        color: PS5HydraTheme.auroraSpringMint,
+        label: 'Extraindo ${((state.extractProgress ?? 0) * 100).toStringAsFixed(0)}%'
+            '${state.extractEntry == null ? '' : ' · ${state.extractEntry}'}',
+      );
+    }
 
     final buttons = <Widget>[];
     if (entry.hasApk) {
@@ -1118,8 +1465,51 @@ class _ApkVisionCard extends StatelessWidget {
             ),
           ),
         );
+        if (ArchiveExtractService.canExtract(entry)) {
+          buttons.add(
+            FilledButton.icon(
+              onPressed: onExtract,
+              icon: Icon(
+                state.extracted
+                    ? Icons.check_circle_rounded
+                    : Icons.unarchive_rounded,
+                size: 16,
+              ),
+              label: Text(
+                state.extracted ? 'Extraído' : 'Extrair ${entry.dataLabel}',
+              ),
+              style: FilledButton.styleFrom(
+                backgroundColor: state.extracted
+                    ? PS5HydraTheme.obsidianGlass
+                    : const Color(0xFFFFB454),
+                foregroundColor: state.extracted
+                    ? PS5HydraTheme.textPrimary
+                    : Colors.black,
+                side: state.extracted
+                    ? const BorderSide(color: PS5HydraTheme.borderSubtle)
+                    : BorderSide.none,
+                textStyle: const TextStyle(
+                  fontFamily: 'ReadexPro',
+                  fontWeight: FontWeight.w700,
+                  fontSize: 12,
+                ),
+              ),
+            ),
+          );
+        }
       }
     }
+    buttons.add(
+      OutlinedButton.icon(
+        onPressed: onShowGuide,
+        icon: const Icon(Icons.help_outline_rounded, size: 16),
+        label: const Text('Onde está / como instalar'),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: PS5HydraTheme.textPrimary,
+          side: const BorderSide(color: PS5HydraTheme.borderSubtle),
+        ),
+      ),
+    );
     buttons.add(
       OutlinedButton.icon(
         onPressed: () => onOpenExternal(entry.pageUrl),
