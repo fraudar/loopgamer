@@ -9,8 +9,10 @@ import '../services/diagnostic_log_service.dart';
 import '../services/emulator_service.dart';
 import '../services/gpu_driver_service.dart';
 import '../services/rom_download_service.dart';
+import '../services/update_service.dart';
 import '../theme/hydra_tokens.dart';
 import '../widgets/loop_common_widgets.dart';
+import '../widgets/update_dialog.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({
@@ -21,6 +23,7 @@ class SettingsScreen extends StatefulWidget {
     this.emulatorService,
     this.isActive = true,
     this.libraryCount,
+    this.onCheckForUpdates,
   });
 
   final AppSettings settings;
@@ -29,6 +32,7 @@ class SettingsScreen extends StatefulWidget {
   final EmulatorService? emulatorService;
   final bool isActive;
   final int? libraryCount;
+  final Future<void> Function()? onCheckForUpdates;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -62,6 +66,7 @@ class _SettingsScreenState extends State<SettingsScreen>
   bool _isCleaningStorage = false;
   bool _isCleaningSavesAndCovers = false;
   bool _isSavingErrorReport = false;
+  bool _checkingUpdates = false;
   int _selectedCategory = 0;
   int _focusedCategoryIndex = -1;
 
@@ -1310,10 +1315,91 @@ class _SettingsScreenState extends State<SettingsScreen>
     );
   }
 
+  Future<void> _handleCheckForUpdates() async {
+    final callback = widget.onCheckForUpdates;
+    if (callback != null) {
+      await callback();
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _checkingUpdates = true);
+    try {
+      final result = await UpdateService.instance.checkForUpdate(force: true);
+      if (!mounted) return;
+      if (result.error != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Falha: ${result.error}')),
+        );
+      } else if (!result.hasUpdate) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              result.currentVersion.isEmpty
+                  ? 'Você já está na versão mais recente.'
+                  : 'LoopGamer ${result.currentVersion} é a versão mais recente.',
+            ),
+          ),
+        );
+      } else {
+        await showUpdateDialog(context: context, result: result);
+      }
+    } finally {
+      if (mounted) setState(() => _checkingUpdates = false);
+    }
+  }
+
+  Widget _buildUpdateSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const _SectionHeader(
+          title: 'Atualizações do LoopGamer',
+          subtitle: 'Verifica releases oficiais no GitHub e instala o APK novo',
+        ),
+        const SizedBox(height: 10),
+        _SettingsSurfaceCard(
+          child: SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: _checkingUpdates
+                  ? null
+                  : () => unawaited(_handleCheckForUpdates()),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: HydraTokens.primaryAurora,
+                minimumSize: const Size(48, 48),
+                side: const BorderSide(color: HydraTokens.borderSubtle10),
+              ),
+              icon: _checkingUpdates
+                  ? const SizedBox(
+                      width: 15,
+                      height: 15,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: HydraTokens.primaryAurora,
+                      ),
+                    )
+                  : PhosphorIcon(
+                      PhosphorIcons.arrowClockwise(PhosphorIconsStyle.bold),
+                      size: 17,
+                    ),
+              label: Text(
+                _checkingUpdates
+                    ? 'Verificando...'
+                    : 'Verificar atualizações agora',
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 18),
+      ],
+    );
+  }
+
   Widget _buildSavesAndStorageSection(AppSettings s) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        _buildUpdateSection(),
         const _SectionHeader(
           title: 'Save States (PPSSPP) e Armazenamento',
           subtitle: 'Gerencie salvamento manual de onde parou e espaço de ROMs',
