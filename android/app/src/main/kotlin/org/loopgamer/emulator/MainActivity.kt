@@ -47,7 +47,18 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
+import org.apache.commons.compress.archivers.sevenz.SevenZFile
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
+import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
+import com.github.junrar.Junrar
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -166,6 +177,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private var pendingStoragePermissionResult: MethodChannel.Result? = null
     private var pendingPickRomResult: MethodChannel.Result? = null
     private var pendingPickRomDirResult: MethodChannel.Result? = null
+
+    // Extração de pacotes de dados dos ports (roda fora da main thread).
+    private val archiveExecutor = Executors.newSingleThreadExecutor()
+    private val archiveRunning = AtomicBoolean(false)
+    private val archiveCancelled = AtomicBoolean(false)
+    @Volatile private var archiveLastEmitMs: Long = 0L
 
     private fun currentNetworkStatusMap(): Map<String, Any> {
         val cm = connectivityManager
@@ -764,6 +781,23 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
             "hasDirectStorageAccess" -> {
                 result.success(hasDirectStorageAccessInternal())
+            }
+
+            "getDeviceProfile" -> {
+                result.success(deviceProfileInternal())
+            }
+
+            "extractArchive" -> {
+                extractArchiveInternal(call, result)
+            }
+
+            "cancelArchiveExtract" -> {
+                archiveCancelled.set(true)
+                result.success(true)
+            }
+
+            "openDocumentRoot" -> {
+                result.success(openDocumentRootInternal())
             }
 
             "requestDirectStorageAccess" -> {
@@ -1877,6 +1911,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             stopLibretroLoopInternal()
         }
         nativeExecutor.shutdown()
+        archiveExecutor.shutdown()
         super.onDestroy()
     }
 
@@ -1889,6 +1924,303 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 Manifest.permission.READ_EXTERNAL_STORAGE
             ) == PackageManager.PERMISSION_GRANTED
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Perfil do aparelho (RAM, núcleos, SoC) para o auto-ajuste de FPS.
+    // ------------------------------------------------------------------
+    private fun deviceProfileInternal(): Map<String, Any> {
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        val memInfo = android.app.ActivityManager.MemoryInfo()
+        am.getMemoryInfo(memInfo)
+        val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Build.SOC_MODEL
+        } else {
+            Build.HARDWARE
+        }
+        return mapOf(
+            "totalMemMb" to (memInfo.totalMem / (1024L * 1024L)).toInt(),
+            "availMemMb" to (memInfo.availMem / (1024L * 1024L)).toInt(),
+            "lowRam" to am.isLowRamDevice,
+            "cores" to Runtime.getRuntime().availableProcessors(),
+            "sdkInt" to Build.VERSION.SDK_INT,
+            "manufacturer" to Build.MANUFACTURER,
+            "model" to Build.MODEL,
+            "device" to Build.DEVICE,
+            "soc" to soc,
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // Extração de pacotes de dados dos ports (.7z, .zip, .rar, .tar.*).
+    // Roda fora da main thread e reporta progresso pelo canal de métodos.
+    // ------------------------------------------------------------------
+    private fun extractArchiveInternal(call: MethodCall, result: MethodChannel.Result) {
+        val path = call.argument<String>("path")
+        val dest = call.argument<String>("dest")
+        val deleteSource = call.argument<Boolean>("deleteSource") ?: false
+        if (path.isNullOrBlank() || dest.isNullOrBlank()) {
+            result.error("bad_args", "path e dest são obrigatórios", null)
+            return
+        }
+        val source = File(path)
+        if (!source.exists() || !source.isFile) {
+            result.error("missing", "Arquivo não encontrado: $path", null)
+            return
+        }
+        if (archiveRunning.get()) {
+            result.error("busy", "Já existe uma extração em andamento", null)
+            return
+        }
+        archiveRunning.set(true)
+        archiveCancelled.set(false)
+
+        archiveExecutor.execute {
+            var files = 0
+            var bytes = 0L
+            var cancelled = false
+            try {
+                val target = File(dest)
+                if (!target.exists() && !target.mkdirs()) {
+                    throw IllegalStateException("Não foi possível criar $dest")
+                }
+                bytes = extractInto(source, target) { name, copied, count ->
+                    files = count
+                    emitArchiveProgress(path, name, count, copied, source.length())
+                }
+                files = archiveLastFileCount
+                cancelled = archiveCancelled.get()
+            } catch (t: Throwable) {
+                val message = t.message ?: t.javaClass.simpleName
+                Log.e(TAG, "Falha ao extrair $path: $message", t)
+                runOnUiThread {
+                    result.error("extract_failed", message, null)
+                }
+                archiveRunning.set(false)
+                return@execute
+            }
+
+            if (deleteSource && !cancelled) {
+                try {
+                    source.delete()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Não foi possível apagar $path: ${t.message}")
+                }
+            }
+
+            runOnUiThread {
+                result.success(
+                    mapOf(
+                        "files" to files,
+                        "bytes" to bytes,
+                        "dest" to dest,
+                        "cancelled" to cancelled,
+                        "sourceDeleted" to (deleteSource && !source.exists()),
+                    )
+                )
+            }
+            archiveRunning.set(false)
+        }
+    }
+
+    private var archiveLastFileCount: Int = 0
+
+    private fun emitArchiveProgress(
+        path: String,
+        entryName: String,
+        files: Int,
+        writtenBytes: Long,
+        totalBytes: Long
+    ) {
+        archiveLastFileCount = files
+        val now = SystemClock.elapsedRealtime()
+        if (now - archiveLastEmitMs < 200L) return
+        archiveLastEmitMs = now
+        val fraction = if (totalBytes > 0) {
+            (writtenBytes.toDouble() / totalBytes.toDouble()).coerceIn(0.0, 1.0)
+        } else {
+            0.0
+        }
+        runOnUiThread {
+            methodChannel?.invokeMethod(
+                "archiveProgress",
+                mapOf(
+                    "path" to path,
+                    "entry" to entryName,
+                    "files" to files,
+                    "bytes" to writtenBytes,
+                    "totalBytes" to totalBytes,
+                    "fraction" to fraction,
+                )
+            )
+        }
+    }
+
+    private fun extractInto(
+        source: File,
+        target: File,
+        onEntry: (String, Long, Int) -> Unit
+    ): Long {
+        val name = source.name.lowercase()
+        var written = 0L
+        var count = 0
+        fun tick(entryName: String, added: Long) {
+            written += added
+            count += 1
+            onEntry(entryName, written, count)
+        }
+        when {
+            name.endsWith(".7z") -> {
+                SevenZFile.builder().setFile(source).get().use { sevenZ ->
+                    while (true) {
+                        if (archiveCancelled.get()) break
+                        val entry = sevenZ.nextEntry ?: break
+                        val out = safeTarget(target, entry.name)
+                        if (entry.isDirectory) {
+                            out.mkdirs()
+                            continue
+                        }
+                        out.parentFile?.mkdirs()
+                        val added = sevenZ.getInputStream(entry).use { input ->
+                            FileOutputStream(out).use { output -> copyStream(input, output) }
+                        }
+                        tick(entry.name, added)
+                    }
+                }
+            }
+
+            name.endsWith(".zip") || name.endsWith(".apks") -> {
+                java.util.zip.ZipFile(source).use { zip ->
+                    val entries = zip.entries()
+                    while (entries.hasMoreElements()) {
+                        if (archiveCancelled.get()) break
+                        val entry = entries.nextElement()
+                        val out = safeTarget(target, entry.name)
+                        if (entry.isDirectory) {
+                            out.mkdirs()
+                            continue
+                        }
+                        out.parentFile?.mkdirs()
+                        val added = zip.getInputStream(entry).use { input ->
+                            FileOutputStream(out).use { output -> copyStream(input, output) }
+                        }
+                        tick(entry.name, added)
+                    }
+                }
+            }
+
+            name.endsWith(".rar") -> {
+                // Junrar não expõe callback por entrada; reporta no fim.
+                Junrar.extract(source, target)
+                target.walkTopDown().forEach { f ->
+                    if (f.isFile) {
+                        written += f.length()
+                        count += 1
+                    }
+                }
+                onEntry("rar", written, count)
+            }
+
+            name.endsWith(".tar") ||
+                name.endsWith(".tar.gz") ||
+                name.endsWith(".tgz") ||
+                name.endsWith(".tar.xz") ||
+                name.endsWith(".txz") -> {
+                openTarStream(source, name).use { tar ->
+                    while (true) {
+                        if (archiveCancelled.get()) break
+                        val entry = tar.nextEntry ?: break
+                        val out = safeTarget(target, entry.name)
+                        if (entry.isDirectory) {
+                            out.mkdirs()
+                            continue
+                        }
+                        out.parentFile?.mkdirs()
+                        val added = FileOutputStream(out).use { output ->
+                            copyStream(tar, output)
+                        }
+                        tick(entry.name, added)
+                    }
+                }
+            }
+
+            else -> throw IllegalArgumentException(
+                "Formato não suportado para extração: ${source.extension}"
+            )
+        }
+        return written
+    }
+
+    private fun openTarStream(source: File, lowerName: String): TarArchiveInputStream {
+        val base: InputStream = BufferedInputStream(FileInputStream(source), 64 * 1024)
+        val decoded: InputStream = when {
+            lowerName.endsWith(".tar.xz") || lowerName.endsWith(".txz") ->
+                XZCompressorInputStream(base)
+            lowerName.endsWith(".tar.gz") || lowerName.endsWith(".tgz") ->
+                GzipCompressorInputStream(base)
+            else -> base
+        }
+        return TarArchiveInputStream(decoded)
+    }
+
+    /// Impede "zip slip": toda entrada precisa cair dentro de `root`.
+    private fun safeTarget(root: File, entryName: String): File {
+        val normalized = entryName.replace('\\', '/').trimStart('/')
+        val out = File(root, normalized)
+        val rootPath = root.canonicalPath + File.separator
+        val outPath = out.canonicalPath
+        if (outPath != root.canonicalPath && !outPath.startsWith(rootPath)) {
+            throw SecurityException("Entrada fora do destino: $entryName")
+        }
+        return out
+    }
+
+    private fun copyStream(input: InputStream, output: OutputStream): Long {
+        val buffer = ByteArray(64 * 1024)
+        var total = 0L
+        while (true) {
+            if (archiveCancelled.get()) break
+            val read = input.read(buffer)
+            if (read <= 0) break
+            output.write(buffer, 0, read)
+            total += read
+        }
+        output.flush()
+        return total
+    }
+
+    /// Abre o gerenciador de arquivos na raiz do armazenamento interno.
+    private fun openDocumentRootInternal(): Boolean {
+        val attempts = listOf(
+            Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(
+                    Uri.parse("content://com.android.externalstorage.documents/root/primary"),
+                    "vnd.android.document/root"
+                )
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            },
+            Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(
+                    Uri.parse("content://com.android.externalstorage.documents/root/primary"),
+                    "resource/folder"
+                )
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            },
+            Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            },
+        )
+        for (intent in attempts) {
+            try {
+                startActivity(intent)
+                return true
+            } catch (_: ActivityNotFoundException) {
+                continue
+            } catch (t: Throwable) {
+                Log.w(TAG, "Intent de pasta falhou: ${t.message}")
+            }
+        }
+        return false
     }
 
     private fun requestDirectStorageAccessInternal(result: MethodChannel.Result) {

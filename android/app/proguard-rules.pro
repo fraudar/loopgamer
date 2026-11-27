@@ -30,3 +30,12 @@
 -dontwarn android.**
 -dontwarn javax.**
 -dontwarn org.codehaus.**
+
+# Extração de pacotes de dados (commons-compress / xz / junrar)
+-keep class org.apache.commons.compress.** { *; }
+-keep class org.tukaani.xz.** { *; }
+-keep class com.github.junrar.** { *; }
+-dontwarn org.apache.commons.compress.**
+-dontwarn org.tukaani.xz.**
+-dontwarn com.github.junrar.**
+-dontwarn org.slf4j.**
