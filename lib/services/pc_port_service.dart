@@ -200,6 +200,16 @@ class PcPortService {
     throw StateError('Falha ao baixar $url após retry.');
   }
 
+  /// Baixa uma URL arbitrária para [partial] com retomada por `Range`.
+  /// Usado pelos ports APKVision, cujos URLs não vêm da API do GitHub.
+  static Future<int> downloadRawFile(
+    File partial,
+    String url, {
+    void Function(int received, int total)? onProgress,
+  }) {
+    return _downloadTo(partial, url, onProgress: onProgress);
+  }
+
   /// Baixa o APK e retorna o [File] pronto para instalação.
   static Future<File> downloadApk(
     PcPortEntry entry, {

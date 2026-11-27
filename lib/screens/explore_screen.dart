@@ -5,8 +5,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:phosphor_flutter/phosphor_flutter.dart';
+import '../data/apkvision_offline_catalog.dart';
 import '../data/pc_port_catalog.dart';
 import '../models/app_settings.dart';
+import '../models/apkvision_port.dart';
 import '../models/emulation_game.dart';
 import '../models/pc_port.dart';
 import '../services/game_asset_service.dart';
@@ -461,6 +463,32 @@ class _ExploreScreenState extends State<ExploreScreen> {
     return PcPortCatalog.entries.where((e) {
       final hay = EmulationGame.normalizeSearchText(
         '${e.title} ${e.developer} ${e.genre} ${e.description}',
+      );
+      return tokens.every(hay.contains);
+    }).toList(growable: false);
+  }
+
+  List<ApkVisionPortEntry> _matchingApkVisionPorts() {
+    const featuredIds = <String>{
+      'nier-136096',
+      'hollow-knight-silksong-130787',
+      'hollow-knight-mobile-97647',
+      'dark-souls-2-scholar-of-the-first-sin-135960',
+      'bioshock-136029',
+      'persona-4-golden-135508',
+      'south-park-the-stick-of-truth-136091',
+      'super-mario-3d-world-135728',
+    };
+    final q = EmulationGame.normalizeSearchText(_searchController.text);
+    if (q.isEmpty) {
+      return ApkVisionOfflineCatalog.entries
+          .where((e) => featuredIds.contains(e.id))
+          .toList(growable: false);
+    }
+    final tokens = q.split(' ').where((t) => t.isNotEmpty).toList();
+    return ApkVisionOfflineCatalog.entries.where((e) {
+      final hay = EmulationGame.normalizeSearchText(
+        '${e.title} ${e.category} ${e.version} ${e.dataLabel}',
       );
       return tokens.every(hay.contains);
     }).toList(growable: false);
@@ -1321,8 +1349,30 @@ class _ExploreScreenState extends State<ExploreScreen> {
                                     },
                                   ),
                                 ),
+                              if (_matchingApkVisionPorts().isNotEmpty &&
+                                  (_searchController.text.trim().isNotEmpty ||
+                                      (_selectedCategory ==
+                                              RommPlatformCategory.all &&
+                                          _selectedPlatformSlug == 'todos')))
+                                SliverToBoxAdapter(
+                                  child: _ApkVisionSearchStrip(
+                                    ports: _matchingApkVisionPorts(),
+                                    onTapPort: (entry) {
+                                      unawaited(
+                                        Navigator.of(context).push(
+                                          MaterialPageRoute<void>(
+                                            builder: (_) => PcPortsScreen(
+                                              initialApkVisionEntryId: entry.id,
+                                            ),
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                ),
                               if (_filteredResults.isEmpty &&
-                                  _matchingPcPorts().isEmpty)
+                                  _matchingPcPorts().isEmpty &&
+                                  _matchingApkVisionPorts().isEmpty)
                                 SliverToBoxAdapter(
                                   child: Center(
                                     child: Padding(
@@ -2562,6 +2612,121 @@ class _PcPortsSearchStrip extends StatelessWidget {
                                 fontSize: 10.5,
                                 fontWeight: FontWeight.w700,
                                 color: PS5HydraTheme.auroraSpringMint,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ApkVisionSearchStrip extends StatelessWidget {
+  const _ApkVisionSearchStrip({
+    required this.ports,
+    required this.onTapPort,
+  });
+
+  final List<ApkVisionPortEntry> ports;
+  final ValueChanged<ApkVisionPortEntry> onTapPort;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 2),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(
+                Icons.archive_outlined,
+                size: 14,
+                color: Color(0xFFFFB454),
+              ),
+              SizedBox(width: 6),
+              Text(
+                'APKVision offline · APK + 7Z/ZIP',
+                style: TextStyle(
+                  fontFamily: 'ReadexPro',
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: PS5HydraTheme.textPrimary,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 70,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: ports.length,
+              separatorBuilder: (_, __) => const SizedBox(width: 8),
+              itemBuilder: (context, index) {
+                final entry = ports[index];
+                return InkWell(
+                  onTap: () => onTapPort(entry),
+                  borderRadius: BorderRadius.circular(10),
+                  child: Container(
+                    width: 240,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 11,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: HydraTokens.surfaceElevated1,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: const Color(0xFFFFB454).withOpacity(0.35),
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          entry.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontFamily: 'ReadexPro',
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w700,
+                            color: HydraTokens.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                '${entry.version} · ${entry.dataLabel}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontFamily: 'Rubik',
+                                  fontSize: 10.5,
+                                  color: HydraTokens.textSecondary,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            const Text(
+                              'Ver dados',
+                              style: TextStyle(
+                                fontFamily: 'ReadexPro',
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w700,
+                                color: Color(0xFFFFB454),
                               ),
                             ),
                           ],

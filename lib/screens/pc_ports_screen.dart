@@ -1,19 +1,35 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:open_filex/open_filex.dart';
 
+import '../data/apkvision_offline_catalog.dart';
 import '../data/pc_port_catalog.dart';
+import '../models/apkvision_port.dart';
 import '../models/pc_port.dart';
+import '../services/apkvision_port_service.dart';
 import '../services/pc_port_service.dart';
 import '../theme/ps5_hydra_theme.dart';
+
+enum _PortSource { curated, apkVision }
+
+enum _ArchiveFilter { all, sevenZ, zip, rar, iso, other, none }
 
 /// Catálogo de ports de PC gratuitos/legalmente distribuíveis para Android.
 /// Permite baixar o APK oficial direto no app e instalar via sistema.
 class PcPortsScreen extends StatefulWidget {
-  const PcPortsScreen({super.key, this.initialEntryId});
+  const PcPortsScreen({
+    super.key,
+    this.initialEntryId,
+    this.initialApkVisionEntryId,
+  });
 
-  /// Quando informado, rola até o item correspondente.
+  /// Quando informado, rola até o item correspondente no catálogo curado.
   final String? initialEntryId;
+
+  /// Quando informado, abre a aba APKVision e rola até o item correspondente.
+  final String? initialApkVisionEntryId;
 
   @override
   State<PcPortsScreen> createState() => _PcPortsScreenState();
@@ -22,29 +38,38 @@ class PcPortsScreen extends StatefulWidget {
 class _PcPortsScreenState extends State<PcPortsScreen> {
   final Map<String, _PortRuntimeState> _states = {};
   final Map<String, GlobalKey> _itemKeys = {};
+  final Map<String, _ApkVisionRuntimeState> _apkVisionStates = {};
+  final Map<String, GlobalKey> _apkVisionKeys = {};
   final ScrollController _scrollController = ScrollController();
   final TextEditingController _searchController = TextEditingController();
 
   String _query = '';
+  _PortSource _source = _PortSource.curated;
+  _ArchiveFilter _archiveFilter = _ArchiveFilter.all;
 
   @override
   void initState() {
     super.initState();
-    unawaited(_detectExistingDownloads());
-    if (widget.initialEntryId != null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        final key = _itemKeys[widget.initialEntryId];
-        final target = key?.currentContext;
-        if (target != null) {
-          Scrollable.ensureVisible(
-            target,
-            duration: const Duration(milliseconds: 350),
-            curve: Curves.easeOut,
-            alignment: 0.05,
-          );
-        }
-      });
+    if (widget.initialApkVisionEntryId != null) {
+      _source = _PortSource.apkVision;
     }
+    unawaited(_detectExistingDownloads());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final id = widget.initialApkVisionEntryId ?? widget.initialEntryId;
+      if (id == null) return;
+      final key = widget.initialApkVisionEntryId != null
+          ? _apkVisionKeys[id]
+          : _itemKeys[id];
+      final target = key?.currentContext;
+      if (target != null) {
+        Scrollable.ensureVisible(
+          target,
+          duration: const Duration(milliseconds: 350),
+          curve: Curves.easeOut,
+          alignment: 0.05,
+        );
+      }
+    });
   }
 
   @override
@@ -73,12 +98,33 @@ class _PcPortsScreenState extends State<PcPortsScreen> {
         // Arquivo inacessível não impede o download normal.
       }
     }
+    for (final entry in ApkVisionOfflineCatalog.entries) {
+      try {
+        final apk = entry.hasApk
+            ? await ApkVisionPortService.findDownloadedApk(entry)
+            : null;
+        final data = await ApkVisionPortService.findDownloadedData(entry);
+        if (!mounted) return;
+        final state = _apkVisionStateFor(entry.id);
+        state.apkReady = apk != null;
+        state.dataPath = data?.path;
+        setState(() {});
+      } catch (_) {
+        // Arquivo inacessível não impede o download normal.
+      }
+    }
   }
 
   _PortRuntimeState _stateFor(String id) =>
       _states.putIfAbsent(id, () => _PortRuntimeState());
 
   GlobalKey _keyFor(String id) => _itemKeys.putIfAbsent(id, () => GlobalKey());
+
+  _ApkVisionRuntimeState _apkVisionStateFor(String id) =>
+      _apkVisionStates.putIfAbsent(id, () => _ApkVisionRuntimeState());
+
+  GlobalKey _apkVisionKeyFor(String id) =>
+      _apkVisionKeys.putIfAbsent(id, () => GlobalKey());
 
   List<PcPortEntry> get _visibleEntries {
     final q = _query.trim().toLowerCase();
@@ -88,6 +134,42 @@ class _PcPortsScreenState extends State<PcPortsScreen> {
           e.developer.toLowerCase().contains(q) ||
           e.genre.toLowerCase().contains(q) ||
           e.description.toLowerCase().contains(q);
+    }).toList(growable: false);
+  }
+
+  List<ApkVisionPortEntry> get _visibleApkVisionEntries {
+    final q = _query.trim().toLowerCase();
+    return ApkVisionOfflineCatalog.entries.where((e) {
+      if (_archiveFilter == _ArchiveFilter.sevenZ &&
+          e.dataKind != ApkVisionArchiveKind.sevenZ) {
+        return false;
+      }
+      if (_archiveFilter == _ArchiveFilter.zip &&
+          e.dataKind != ApkVisionArchiveKind.zip) {
+        return false;
+      }
+      if (_archiveFilter == _ArchiveFilter.rar &&
+          e.dataKind != ApkVisionArchiveKind.rar) {
+        return false;
+      }
+      if (_archiveFilter == _ArchiveFilter.iso &&
+          e.dataKind != ApkVisionArchiveKind.iso &&
+          e.dataKind != ApkVisionArchiveKind.rvz) {
+        return false;
+      }
+      if (_archiveFilter == _ArchiveFilter.other &&
+          (e.dataKind != ApkVisionArchiveKind.obb &&
+              e.dataKind != ApkVisionArchiveKind.romfs &&
+              e.dataKind != ApkVisionArchiveKind.tarXz &&
+              e.dataKind != ApkVisionArchiveKind.exe)) {
+        return false;
+      }
+      if (_archiveFilter == _ArchiveFilter.none && e.hasData) return false;
+      if (q.isEmpty) return true;
+      return e.title.toLowerCase().contains(q) ||
+          e.category.toLowerCase().contains(q) ||
+          e.version.toLowerCase().contains(q) ||
+          e.dataLabel.toLowerCase().contains(q);
     }).toList(growable: false);
   }
 
@@ -169,6 +251,113 @@ class _PcPortsScreenState extends State<PcPortsScreen> {
     }
   }
 
+  Future<void> _downloadApkVisionApk(ApkVisionPortEntry entry) async {
+    final state = _apkVisionStateFor(entry.id);
+    if (state.busy) return;
+    state
+      ..busy = true
+      ..error = null
+      ..progress = 0
+      ..phase = PcPortDownloadState.downloading;
+    setState(() {});
+
+    try {
+      final existing = state.apkReady
+          ? await ApkVisionPortService.findDownloadedApk(entry)
+          : null;
+      final file = existing ??
+          await ApkVisionPortService.downloadApk(
+        entry,
+        onProgress: (received, total) {
+          state.progress = total > 0 ? received / total : null;
+          if (mounted) setState(() {});
+        },
+      );
+      state.phase = PcPortDownloadState.installing;
+      if (mounted) setState(() {});
+      final installed = await ApkVisionPortService.installApk(file);
+      if (installed) {
+        state.apkReady = true;
+      } else if (mounted) {
+        state.error = 'Não foi possível abrir o instalador do Android.';
+      }
+    } catch (e) {
+      debugPrint('[ApkVision] Falha ao baixar APK ${entry.id}: $e');
+      state.error = e.toString().replaceFirst('Bad state: ', '');
+    } finally {
+      state.busy = false;
+      if (mounted) setState(() {});
+    }
+  }
+
+  Future<void> _downloadApkVisionData(ApkVisionPortEntry entry) async {
+    final state = _apkVisionStateFor(entry.id);
+    if (state.dataBusy) return;
+    state
+      ..dataBusy = true
+      ..error = null
+      ..dataProgress = 0
+      ..dataLabel = 'Preparando ${entry.dataLabel}…';
+    setState(() {});
+
+    try {
+      final file = await ApkVisionPortService.downloadData(
+        entry,
+        onProgress: (received, total) {
+          state.dataProgress =
+              total > 0 ? (received / total).clamp(0, 1).toDouble() : null;
+          if (mounted) setState(() {});
+        },
+      );
+      state.dataPath = file.path;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Arquivo pronto: ${file.uri.pathSegments.last}'),
+            duration: const Duration(seconds: 6),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('[ApkVision] Falha ao baixar dados ${entry.id}: $e');
+      state.error = e.toString().replaceFirst('Bad state: ', '');
+    } finally {
+      state.dataBusy = false;
+      if (mounted) setState(() {});
+    }
+  }
+
+  Future<void> _openApkVisionArchive(ApkVisionPortEntry entry) async {
+    final state = _apkVisionStateFor(entry.id);
+    File? file;
+    if (state.dataPath != null) {
+      final cached = File(state.dataPath!);
+      if (await cached.exists()) file = cached;
+    }
+    file ??= await ApkVisionPortService.findDownloadedData(entry);
+    if (file == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Baixe o pacote de dados antes de abrir.'),
+          ),
+        );
+      }
+      return;
+    }
+    final result = await ApkVisionPortService.openArchive(file);
+    if (result.type == ResultType.done) return;
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Nenhum app abriu o arquivo. Instale um gerenciador de arquivos.',
+          ),
+        ),
+      );
+    }
+  }
+
   Future<void> _openExternal(String url) async {
     final ok = await PcPortService.openExternal(url);
     if (!ok && mounted) {
@@ -181,6 +370,8 @@ class _PcPortsScreenState extends State<PcPortsScreen> {
   @override
   Widget build(BuildContext context) {
     final entries = _visibleEntries;
+    final apkVisionEntries = _visibleApkVisionEntries;
+    final isApkVision = _source == _PortSource.apkVision;
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
@@ -214,7 +405,9 @@ class _PcPortsScreenState extends State<PcPortsScreen> {
                   color: PS5HydraTheme.textPrimary,
                 ),
                 decoration: InputDecoration(
-                  hintText: 'Buscar port, jogo ou gênero…',
+                  hintText: isApkVision
+                      ? 'Buscar NieR, Silksong, 7z, ZIP...'
+                      : 'Buscar port, jogo ou gênero…',
                   hintStyle: TextStyle(
                     fontFamily: 'ReadexPro',
                     fontSize: 13.5,
@@ -258,39 +451,140 @@ class _PcPortsScreenState extends State<PcPortsScreen> {
                 ),
               ),
             ),
+            Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: PS5HydraTheme.space16,
+              ),
+              child: SegmentedButton<_PortSource>(
+                segments: const [
+                  ButtonSegment(
+                    value: _PortSource.curated,
+                    label: Text('Catálogo'),
+                    icon: Icon(Icons.verified_rounded, size: 16),
+                  ),
+                  ButtonSegment(
+                    value: _PortSource.apkVision,
+                    label: Text('APKVision'),
+                    icon: Icon(Icons.archive_outlined, size: 16),
+                  ),
+                ],
+                selected: {_source},
+                onSelectionChanged: (selection) {
+                  setState(() => _source = selection.first);
+                },
+              ),
+            ),
+            if (isApkVision)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(
+                  PS5HydraTheme.space16,
+                  PS5HydraTheme.space8,
+                  PS5HydraTheme.space16,
+                  0,
+                ),
+                child: Wrap(
+                  spacing: 6,
+                  runSpacing: 2,
+                  children: [
+                    _archiveChip(_ArchiveFilter.all, 'Todos'),
+                    _archiveChip(_ArchiveFilter.sevenZ, '7Z'),
+                    _archiveChip(_ArchiveFilter.zip, 'ZIP'),
+                    _archiveChip(_ArchiveFilter.rar, 'RAR'),
+                    _archiveChip(_ArchiveFilter.iso, 'ISO'),
+                    _archiveChip(_ArchiveFilter.other, 'OBB/EXE'),
+                    _archiveChip(_ArchiveFilter.none, 'Só APK'),
+                  ],
+                ),
+              ),
             Expanded(
-              child: entries.isEmpty
-                  ? const Center(
-                      child: Text(
-                        'Nenhum port encontrado.',
-                        style: TextStyle(
-                          fontFamily: 'ReadexPro',
-                          color: PS5HydraTheme.textSecondary,
+              child: isApkVision
+                  ? apkVisionEntries.isEmpty
+                      ? const Center(
+                          child: Text(
+                            'Nenhum port APKVision para este filtro.',
+                            style: TextStyle(
+                              fontFamily: 'ReadexPro',
+                              color: PS5HydraTheme.textSecondary,
+                            ),
+                          ),
+                        )
+                      : ListView.separated(
+                          controller: _scrollController,
+                          padding: const EdgeInsets.all(PS5HydraTheme.space16),
+                          itemCount: apkVisionEntries.length,
+                          separatorBuilder: (_, __) => const SizedBox(
+                            height: PS5HydraTheme.space12,
+                          ),
+                          itemBuilder: (context, index) {
+                            final entry = apkVisionEntries[index];
+                            return _ApkVisionCard(
+                              key: _apkVisionKeyFor(entry.id),
+                              entry: entry,
+                              state: _apkVisionStateFor(entry.id),
+                              onDownloadApk: () =>
+                                  _downloadApkVisionApk(entry),
+                              onDownloadData: () =>
+                                  _downloadApkVisionData(entry),
+                              onOpenArchive: () => _openApkVisionArchive(entry),
+                              onOpenExternal: (url) => _openExternal(url),
+                            );
+                          },
+                        )
+                  : entries.isEmpty
+                      ? const Center(
+                          child: Text(
+                            'Nenhum port encontrado.',
+                            style: TextStyle(
+                              fontFamily: 'ReadexPro',
+                              color: PS5HydraTheme.textSecondary,
+                            ),
+                          ),
+                        )
+                      : ListView.separated(
+                          controller: _scrollController,
+                          padding: const EdgeInsets.all(PS5HydraTheme.space16),
+                          itemCount: entries.length,
+                          separatorBuilder: (_, __) =>
+                              const SizedBox(height: PS5HydraTheme.space12),
+                          itemBuilder: (context, index) {
+                            final entry = entries[index];
+                            return _PortCard(
+                              key: _keyFor(entry.id),
+                              entry: entry,
+                              state: _stateFor(entry.id),
+                              onDownload: () => _downloadAndInstall(entry),
+                              onDownloadData: () => _downloadData(entry),
+                              onOpenExternal: (url) => _openExternal(url),
+                            );
+                          },
                         ),
-                      ),
-                    )
-                  : ListView.separated(
-                      controller: _scrollController,
-                      padding: const EdgeInsets.all(PS5HydraTheme.space16),
-                      itemCount: entries.length,
-                      separatorBuilder: (_, __) =>
-                          const SizedBox(height: PS5HydraTheme.space12),
-                      itemBuilder: (context, index) {
-                        final entry = entries[index];
-                        return _PortCard(
-                          key: _keyFor(entry.id),
-                          entry: entry,
-                          state: _stateFor(entry.id),
-                          onDownload: () => _downloadAndInstall(entry),
-                          onDownloadData: () => _downloadData(entry),
-                          onOpenExternal: (url) => _openExternal(url),
-                        );
-                      },
-                    ),
             ),
           ],
         ),
       ),
+    );
+  }
+
+  Widget _archiveChip(_ArchiveFilter filter, String label) {
+    return ChoiceChip(
+      label: Text(
+        label,
+        style: TextStyle(
+          fontFamily: 'ReadexPro',
+          fontSize: 11.5,
+          color: _archiveFilter == filter ? Colors.black : PS5HydraTheme.textSecondary,
+        ),
+      ),
+      selected: _archiveFilter == filter,
+      onSelected: (_) => setState(() => _archiveFilter = filter),
+      selectedColor: PS5HydraTheme.auroraSpringMint,
+      backgroundColor: PS5HydraTheme.obsidianGlass,
+      side: BorderSide(
+        color: _archiveFilter == filter
+            ? PS5HydraTheme.auroraSpringMint
+            : PS5HydraTheme.borderSubtle,
+      ),
+      visualDensity: VisualDensity.compact,
     );
   }
 }
@@ -307,6 +601,19 @@ class _PortRuntimeState {
   double? dataProgress;
   String? dataLabel;
   String? dataDonePath;
+}
+
+class _ApkVisionRuntimeState {
+  bool busy = false;
+  double? progress;
+  PcPortDownloadState phase = PcPortDownloadState.idle;
+  bool apkReady = false;
+
+  bool dataBusy = false;
+  double? dataProgress;
+  String? dataLabel;
+  String? dataPath;
+  String? error;
 }
 
 class _PortCard extends StatelessWidget {
@@ -617,6 +924,248 @@ class _PortCard extends StatelessWidget {
   }
 }
 
+class _ApkVisionCard extends StatelessWidget {
+  const _ApkVisionCard({
+    super.key,
+    required this.entry,
+    required this.state,
+    required this.onDownloadApk,
+    required this.onDownloadData,
+    required this.onOpenArchive,
+    required this.onOpenExternal,
+  });
+
+  final ApkVisionPortEntry entry;
+  final _ApkVisionRuntimeState state;
+  final VoidCallback onDownloadApk;
+  final VoidCallback onDownloadData;
+  final VoidCallback onOpenArchive;
+  final ValueChanged<String> onOpenExternal;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(PS5HydraTheme.space16),
+      decoration: BoxDecoration(
+        color: PS5HydraTheme.obsidianGlass,
+        borderRadius: BorderRadius.circular(PS5HydraTheme.radiusCard),
+        border: Border.all(color: PS5HydraTheme.borderSubtle),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFFB454).withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Icon(
+                  Icons.archive_outlined,
+                  color: Color(0xFFFFB454),
+                ),
+              ),
+              const SizedBox(width: PS5HydraTheme.space12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      entry.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontFamily: 'ReadexPro',
+                        fontWeight: FontWeight.w700,
+                        fontSize: 15,
+                        color: PS5HydraTheme.textPrimary,
+                      ),
+                    ),
+                    Text(
+                      '${entry.version} · ${entry.category}',
+                      style: PS5HydraTheme.metaMonoStyle.copyWith(
+                        color: PS5HydraTheme.textSecondary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              _Badge(label: entry.dataLabel),
+            ],
+          ),
+          const SizedBox(height: PS5HydraTheme.space12),
+          Text(
+            entry.note,
+            style: const TextStyle(
+              fontFamily: 'ReadexPro',
+              fontSize: 12.5,
+              height: 1.4,
+              color: PS5HydraTheme.textSecondary,
+            ),
+          ),
+          if (entry.hasData) ...[
+            const SizedBox(height: PS5HydraTheme.space8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              children: [
+                _InfoChip(
+                  icon: Icons.folder_zip_rounded,
+                  label: entry.dataFileName,
+                ),
+                if (state.dataPath != null)
+                  const _InfoChip(
+                    icon: Icons.check_circle_outline,
+                    label: 'Arquivo pronto',
+                  ),
+              ],
+            ),
+          ],
+          if (state.error != null) ...[
+            const SizedBox(height: PS5HydraTheme.space8),
+            Text(
+              state.error!,
+              style: const TextStyle(fontSize: 11, color: Colors.redAccent),
+            ),
+          ],
+          const SizedBox(height: PS5HydraTheme.space12),
+          _buildActions(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildActions() {
+    if (state.busy) {
+      return _progressRow(
+        value: state.progress,
+        color: PS5HydraTheme.auroraSpringMint,
+        label: state.phase == PcPortDownloadState.installing
+            ? 'Abrindo instalador...'
+            : 'Baixando APK... ${((state.progress ?? 0) * 100).toStringAsFixed(0)}%',
+      );
+    }
+    if (state.dataBusy) {
+      return _progressRow(
+        value: state.dataProgress,
+        color: const Color(0xFFFFB454),
+        label: '${state.dataLabel ?? 'Baixando dados'} '
+            '${((state.dataProgress ?? 0) * 100).toStringAsFixed(0)}%',
+      );
+    }
+
+    final buttons = <Widget>[];
+    if (entry.hasApk) {
+      buttons.add(
+        SizedBox(
+          width: 180,
+          child: FilledButton.icon(
+            onPressed: onDownloadApk,
+            icon: Icon(
+              state.apkReady ? Icons.install_mobile_rounded : Icons.download_rounded,
+              size: 17,
+            ),
+            label: Text(state.apkReady ? 'Instalar APK' : 'Baixar APK'),
+            style: FilledButton.styleFrom(
+              backgroundColor: PS5HydraTheme.auroraSpringMint,
+              foregroundColor: Colors.black,
+              textStyle: const TextStyle(
+                fontFamily: 'ReadexPro',
+                fontWeight: FontWeight.w700,
+                fontSize: 12.5,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    if (entry.hasData) {
+      buttons.add(
+        SizedBox(
+          width: 180,
+          child: OutlinedButton.icon(
+            onPressed: onDownloadData,
+            icon: const Icon(Icons.archive_outlined, size: 16),
+            label: Text(
+              state.dataPath != null
+                  ? 'Dados prontos'
+                  : 'Baixar dados ${entry.dataLabel}',
+            ),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: const Color(0xFFFFB454),
+              side: const BorderSide(color: Color(0xFFFFB454)),
+              textStyle: const TextStyle(
+                fontFamily: 'ReadexPro',
+                fontWeight: FontWeight.w600,
+                fontSize: 12,
+              ),
+            ),
+          ),
+        ),
+      );
+      if (state.dataPath != null) {
+        buttons.add(
+          OutlinedButton.icon(
+            onPressed: onOpenArchive,
+            icon: const Icon(Icons.folder_open_rounded, size: 16),
+            label: const Text('Abrir'),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: PS5HydraTheme.textPrimary,
+              side: const BorderSide(color: PS5HydraTheme.borderSubtle),
+            ),
+          ),
+        );
+      }
+    }
+    buttons.add(
+      OutlinedButton.icon(
+        onPressed: () => onOpenExternal(entry.pageUrl),
+        icon: const Icon(Icons.open_in_new_rounded, size: 16),
+        label: const Text('Página'),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: PS5HydraTheme.textPrimary,
+          side: const BorderSide(color: PS5HydraTheme.borderSubtle),
+        ),
+      ),
+    );
+    return Wrap(spacing: 8, runSpacing: 8, children: buttons);
+  }
+
+  Widget _progressRow({
+    required double? value,
+    required Color color,
+    required String label,
+  }) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 20,
+          height: 20,
+          child: CircularProgressIndicator(
+            strokeWidth: 2.4,
+            value: value,
+            color: color,
+          ),
+        ),
+        const SizedBox(width: PS5HydraTheme.space12),
+        Expanded(
+          child: Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: PS5HydraTheme.metaMonoStyle.copyWith(
+              color: PS5HydraTheme.textSecondary,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 class _Badge extends StatelessWidget {
   const _Badge({required this.label});
 
@@ -667,12 +1216,17 @@ class _InfoChip extends StatelessWidget {
         children: [
           Icon(icon, size: 12, color: PS5HydraTheme.textSecondary),
           const SizedBox(width: 5),
-          Text(
-            label,
-            style: const TextStyle(
-              fontSize: 10.5,
-              fontWeight: FontWeight.w600,
-              color: PS5HydraTheme.textSecondary,
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 190),
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontSize: 10.5,
+                fontWeight: FontWeight.w600,
+                color: PS5HydraTheme.textSecondary,
+              ),
             ),
           ),
         ],
