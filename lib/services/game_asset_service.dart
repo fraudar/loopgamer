@@ -35,7 +35,7 @@ class SessionMemoryCacheManager extends BaseCacheManager
                     status != null && status >= 200 && status < 300,
                 headers: const {
                   'User-Agent':
-                      'LoopGamer/2.3 (https://github.com/fraudar/loopgamer)',
+                      'LoopGamer/2.3 (https://github.com/bugaram/loopgamer)',
                 },
               ),
             );
@@ -460,7 +460,7 @@ class GameAssetService {
                 validateStatus: (status) => status != null && status < 500,
                 headers: const {
                   'User-Agent':
-                      'LoopGamer/2.3 (https://github.com/fraudar/loopgamer)',
+                      'LoopGamer/2.3 (https://github.com/bugaram/loopgamer)',
                 },
               ),
             );

@@ -117,4 +117,4 @@ flutter test      # 121/121
 ```
 
 ---
-<sub>readkit.project/v1 · MIT · fraudar · <a href="https://github.com/fraudar/loopgamer">repo</a></sub>
+<sub>readkit.project/v1 · MIT · bugaram · <a href="https://github.com/bugaram/loopgamer">repo</a></sub>

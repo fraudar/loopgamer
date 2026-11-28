@@ -15,9 +15,9 @@
   </circle>
   <circle cx="42" cy="17" r="5" fill="#FFFFFF" opacity="0.22"/>
   <circle cx="60" cy="17" r="5" fill="#FFFFFF" opacity="0.12"/>
-  <text x="700" y="22" fill="rgba(245,245,245,0.28)" font-size="11">github.com/fraudar/loopgamer</text>
+  <text x="700" y="22" fill="rgba(245,245,245,0.28)" font-size="11">github.com/bugaram/loopgamer</text>
   <text x="28" y="76" fill="rgba(245,245,245,0.28)">$</text>
-  <text x="50" y="76" fill="#FFFFFF" clip-path="url(#tc1)">git clone https://github.com/fraudar/loopgamer.git</text>
+  <text x="50" y="76" fill="#FFFFFF" clip-path="url(#tc1)">git clone https://github.com/bugaram/loopgamer.git</text>
   <text x="28" y="112" fill="rgba(245,245,245,0.28)">$</text>
   <text x="50" y="112" fill="#FFFFFF" clip-path="url(#tc2)">cd loopgamer</text>
   <text x="28" y="148" fill="rgba(245,245,245,0.28)">$</text>

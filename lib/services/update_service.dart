@@ -18,7 +18,7 @@ class UpdateService {
 
   static final UpdateService instance = UpdateService._();
 
-  static const String repoOwner = 'fraudar';
+  static const String repoOwner = 'bugaram';
   static const String repoName = 'loopgamer';
   static const String _repoApiUrl =
       'https://api.github.com/repos/$repoOwner/$repoName/releases/latest';
